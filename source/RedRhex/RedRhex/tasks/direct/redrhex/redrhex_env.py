@@ -1,9 +1,19 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RedRhex hexapod robot environment with tripod gait locomotion."""
+"""
+RedRhex hexapod robot environment with RHex-style wheg locomotion.
+
+RHex 機器人的核心運動原理：
+1. 主驅動關節持續旋轉（類似輪子），不是傳統的步行
+2. 使用交替三足步態（alternating tripod gait）
+3. 半圓形 C 型腿在旋轉時產生前進位移
+
+控制架構：
+- 主驅動關節 (15, 7, 12, 18, 23, 24): 速度控制，持續旋轉
+- ABAD 關節 (14, 6, 11, 17, 22, 21): 位置控制，RL 探索最佳使用方式
+- 避震關節 (5, 8, 13, 25, 26, 27): 被動高阻尼，吸收衝擊
+"""
 
 from __future__ import annotations
 
@@ -21,18 +31,12 @@ from .redrhex_env_cfg import RedrhexEnvCfg
 
 class RedrhexEnv(DirectRLEnv):
     """
-    RedRhex 六足機器人三足步態環境
-
-    這個環境訓練 RedRhex 六足機器人使用三足步態 (Tripod Gait) 進行移動。
-    三足步態是六足機器人最常見且高效的步態，特點是：
-    - Tripod A (Leg 1, 3, 5) 和 Tripod B (Leg 2, 4, 6) 交替接觸地面
-    - 任何時刻都有三隻腳支撐，提供穩定的三角形支撐基底
-
-    你們的創新點 - ABAD (外展/內收) 自由度可以用於：
-    1. 動態平衡調整
-    2. 地形適應
-    3. 轉向輔助
-    4. 側向移動
+    RedRhex 六足機器人 RHex 風格運動環境
+    
+    這個環境訓練機器人使用「旋轉步態」前進：
+    - 主驅動關節像輪子一樣連續旋轉
+    - Tripod A 和 Tripod B 以 180° 相位差交替
+    - ABAD 關節用於穩定性和轉向（由 RL 探索）
     """
 
     cfg: RedrhexEnvCfg
@@ -40,55 +44,114 @@ class RedrhexEnv(DirectRLEnv):
     def __init__(self, cfg: RedrhexEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # ===================
+        # 獲取關節索引
+        self._setup_joint_indices()
+        
         # 初始化緩衝區
-        # ===================
         self._setup_buffers()
 
-        # ===================
         # 初始化速度命令
-        # ===================
         self._setup_commands()
 
-        # ===================
         # 初始化步態相位
-        # ===================
         self._setup_gait()
 
-        # Tripod 分組索引
-        self._tripod_a_ids = torch.tensor(self.cfg.tripod_group_a, device=self.device)
-        self._tripod_b_ids = torch.tensor(self.cfg.tripod_group_b, device=self.device)
+        # 打印診斷信息
+        self._debug_print_info()
 
-        # 打印物理診斷信息
-        self._debug_print_physics_info()
-
-        print(f"[RedrhexEnv] 環境初始化完成，共 {self.num_envs} 個環境")
-        print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space}")
+        print(f"[RedrhexEnv] 環境初始化完成")
+        print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space} (6 main_drive + 6 ABAD)")
         print(f"[RedrhexEnv] 觀測空間: {self.cfg.observation_space}")
+
+    def _setup_joint_indices(self):
+        """設置關節索引映射"""
+        # 獲取所有關節名稱
+        joint_names = self.robot.data.joint_names
+        
+        # 主驅動關節索引
+        self._main_drive_indices = []
+        for name in self.cfg.main_drive_joint_names:
+            if name in joint_names:
+                self._main_drive_indices.append(joint_names.index(name))
+            else:
+                print(f"⚠️ 警告: 找不到主驅動關節 {name}")
+        self._main_drive_indices = torch.tensor(
+            self._main_drive_indices, device=self.device, dtype=torch.long
+        )
+        
+        # ABAD 關節索引
+        self._abad_indices = []
+        for name in self.cfg.abad_joint_names:
+            if name in joint_names:
+                self._abad_indices.append(joint_names.index(name))
+            else:
+                print(f"⚠️ 警告: 找不到 ABAD 關節 {name}")
+        self._abad_indices = torch.tensor(
+            self._abad_indices, device=self.device, dtype=torch.long
+        )
+        
+        # 避震關節索引
+        self._damper_indices = []
+        for name in self.cfg.damper_joint_names:
+            if name in joint_names:
+                self._damper_indices.append(joint_names.index(name))
+            else:
+                print(f"⚠️ 警告: 找不到避震關節 {name}")
+        self._damper_indices = torch.tensor(
+            self._damper_indices, device=self.device, dtype=torch.long
+        )
+        
+        # Tripod 分組
+        self._tripod_a_indices = torch.tensor(
+            self.cfg.tripod_a_leg_indices, device=self.device, dtype=torch.long
+        )
+        self._tripod_b_indices = torch.tensor(
+            self.cfg.tripod_b_leg_indices, device=self.device, dtype=torch.long
+        )
+        
+        # 方向乘數 - 從配置讀取
+        # 右側腿 (idx 0,1,2) → -1, 左側腿 (idx 3,4,5) → +1
+        self._direction_multiplier = torch.tensor(
+            self.cfg.leg_direction_multiplier, device=self.device
+        ).unsqueeze(0)  # Shape: [1, 6]
+        
+        print(f"[關節索引] 主驅動: {self._main_drive_indices.tolist()}")
+        print(f"[關節索引] ABAD: {self._abad_indices.tolist()}")
+        print(f"[關節索引] 避震: {self._damper_indices.tolist()}")
+        print(f"[方向乘數] {self.cfg.leg_direction_multiplier}")
+        print(f"[Tripod A] indices: {self._tripod_a_indices.tolist()} (joints 15, 18, 24)")
+        print(f"[Tripod B] indices: {self._tripod_b_indices.tolist()} (joints 7, 12, 23)")
 
     def _setup_buffers(self):
         """設置內部緩衝區"""
         # 關節狀態
         self.joint_pos = self.robot.data.joint_pos.clone()
         self.joint_vel = self.robot.data.joint_vel.clone()
-        self.joint_pos_default = self.robot.data.default_joint_pos.clone()
-
-        # 動作緩衝
+        
+        # 動作緩衝 (12 維: 6 main_drive + 6 ABAD)
         self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self.last_actions = torch.zeros_like(self.actions)
+        
+        # 主驅動上一次速度 (用於計算加速度)
+        self.last_main_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
+
+        # 避震關節的初始位置（從 config 中讀取）
+        # 這些關節需要保持在初始角度，不能被拉直
+        # 順序要匹配 damper_joint_names: ["Revolute_5", "Revolute_13", "Revolute_25", "Revolute_26", "Revolute_27", "Revolute_8"]
+        damper_init_angles = []
+        for joint_name in self.cfg.damper_joint_names:
+            angle = self.cfg.robot_cfg.init_state.joint_pos.get(joint_name, 0.0)
+            damper_init_angles.append(angle)
+        self._damper_initial_pos = torch.tensor(damper_init_angles, device=self.device).unsqueeze(0)
+        print(f"[避震關節初始角度] {[f'{a*180/3.14159:.1f}°' for a in damper_init_angles]}")
 
         # 基座狀態
         self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # 腳接觸狀態 (6 隻腳)
-        self.feet_contact = torch.ones(self.num_envs, 6, dtype=torch.bool, device=self.device)
-
-        # 計算初始姿態的投影重力作為參考 (用於傾斜終止判斷)
-        # 使用配置中的初始旋轉四元數，而不是從 robot 數據讀取
-        # 這樣即使機器人初始時有旋轉，也不會被誤判為傾斜
-        init_rot = self.cfg.robot_cfg.init_state.rot  # (w, x, y, z)
+        # 計算初始參考重力方向
+        init_rot = self.cfg.robot_cfg.init_state.rot
         init_quat = torch.tensor(
             [init_rot[0], init_rot[1], init_rot[2], init_rot[3]],
             device=self.device
@@ -96,175 +159,213 @@ class RedrhexEnv(DirectRLEnv):
         gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(self.num_envs, 3)
         self.reference_projected_gravity = quat_apply_inverse(init_quat, gravity_vec)
 
-        # 獎勵追蹤
+        # 獎勵追蹤 - 追蹤所有獎勵分量以便在 TensorBoard 中查看
         self.episode_sums = {
-            "lin_vel_xy": torch.zeros(self.num_envs, device=self.device),
-            "ang_vel_z": torch.zeros(self.num_envs, device=self.device),
-            "tripod_contact": torch.zeros(self.num_envs, device=self.device),
-            "abad_usage": torch.zeros(self.num_envs, device=self.device),
+            # 核心獎勵
+            "rew_alive": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_vel": torch.zeros(self.num_envs, device=self.device),
+            "rew_vel_tracking": torch.zeros(self.num_envs, device=self.device),
+            # 步態獎勵
+            "rew_gait_sync": torch.zeros(self.num_envs, device=self.device),
+            "rew_rotation_dir": torch.zeros(self.num_envs, device=self.device),
+            "rew_correct_dir": torch.zeros(self.num_envs, device=self.device),  # 新增
+            "rew_all_legs": torch.zeros(self.num_envs, device=self.device),
+            "rew_tripod_sync": torch.zeros(self.num_envs, device=self.device),
+            "rew_mean_vel": torch.zeros(self.num_envs, device=self.device),
+            "rew_min_vel": torch.zeros(self.num_envs, device=self.device),
+            "rew_continuous_support": torch.zeros(self.num_envs, device=self.device),
+            "rew_smooth_rotation": torch.zeros(self.num_envs, device=self.device),
+            # 穩定性懲罰
+            "rew_orientation": torch.zeros(self.num_envs, device=self.device),
+            "rew_base_height": torch.zeros(self.num_envs, device=self.device),
+            "rew_lin_vel_z": torch.zeros(self.num_envs, device=self.device),
+            "rew_ang_vel_xy": torch.zeros(self.num_envs, device=self.device),
+            # ABAD 獎勵
+            "rew_abad_action": torch.zeros(self.num_envs, device=self.device),
+            "rew_abad_stability": torch.zeros(self.num_envs, device=self.device),
+            # 平滑性
+            "rew_action_rate": torch.zeros(self.num_envs, device=self.device),
+            # 診斷指標 (非獎勵)
+            "diag_forward_vel": torch.zeros(self.num_envs, device=self.device),
+            "diag_base_height": torch.zeros(self.num_envs, device=self.device),
+            "diag_tilt": torch.zeros(self.num_envs, device=self.device),
+            "diag_drive_vel_mean": torch.zeros(self.num_envs, device=self.device),
+            "diag_rotating_legs": torch.zeros(self.num_envs, device=self.device),
+            "diag_min_leg_vel": torch.zeros(self.num_envs, device=self.device),
         }
 
     def _setup_commands(self):
         """設置速度命令"""
-        # commands[:, 0] = x 速度 (前進)
-        # commands[:, 1] = y 速度 (側向)
-        # commands[:, 2] = yaw 角速度 (轉向)
         self.commands = torch.zeros(self.num_envs, 3, device=self.device)
 
     def _setup_gait(self):
-        """設置步態相位追蹤"""
-        # 步態相位: 0 到 2*pi
+        """設置步態相位"""
+        # 全局步態相位計數器
         self.gait_phase = torch.zeros(self.num_envs, device=self.device)
-
-        # 每條腿的相位偏移 (三足步態)
-        # Tripod A (legs 0, 2, 4): 相位 0
-        # Tripod B (legs 1, 3, 5): 相位 π
-        self.leg_phase_offsets = torch.tensor(
-            [0.0, math.pi, 0.0, math.pi, 0.0, math.pi],
-            device=self.device
-        )
+        
+        # 每條腿的目標相位偏移
+        # Tripod A (legs 0, 3, 5): 相位 0
+        # Tripod B (legs 1, 2, 4): 相位 π
+        self.leg_phase_offsets = torch.zeros(6, device=self.device)
+        self.leg_phase_offsets[self._tripod_a_indices] = 0.0
+        self.leg_phase_offsets[self._tripod_b_indices] = math.pi
 
     def _setup_scene(self):
         """設置模擬場景"""
-        # 添加機器人
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
 
-        # 添加地形 - 使用 TerrainImporter (成功案例方式)
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
-        # 複製環境
         self.scene.clone_environments(copy_from_source=False)
 
-        # CPU 模擬需要過濾碰撞
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        # 添加燈光
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _debug_print_physics_info(self):
-        """診斷：打印物理參數幫助調試重力問題"""
-        print("\n" + "="*60)
-        print("🔍 物理參數診斷 (Physics Diagnostics)")
-        print("="*60)
+    def _debug_print_info(self):
+        """打印診斷信息"""
+        print("\n" + "=" * 70)
+        print("🤖 RedRhex RHex-style Wheg Locomotion Environment")
+        print("=" * 70)
+        print(f"⚙️  控制頻率: {1 / (self.cfg.sim.dt * self.cfg.decimation):.1f} Hz")
+        print(f"⚙️  基礎步態頻率: {self.cfg.base_gait_frequency} Hz")
+        print(f"⚙️  基礎角速度: {self.cfg.base_gait_angular_vel:.2f} rad/s")
         
-        # 打印重力設置
-        print(f"⚙️  重力設置: {self.cfg.sim.gravity}")
-        print(f"⚙️  物理 dt: {self.cfg.sim.dt} s ({1/self.cfg.sim.dt:.0f} Hz)")
-        print(f"⚙️  Decimation: {self.cfg.decimation}")
-        print(f"⚙️  控制頻率: {1/(self.cfg.sim.dt * self.cfg.decimation):.1f} Hz")
+        print(f"\n📐 腿部配置:")
+        print(f"   主驅動關節順序: {self.cfg.main_drive_joint_names}")
+        print(f"   方向乘數: {self.cfg.leg_direction_multiplier}")
+        print(f"   (右側腿 idx 0,1,2 = -1, 左側腿 idx 3,4,5 = +1)")
         
-        # 嘗試獲取機器人質量信息
-        try:
-            # 獲取總質量
-            body_masses = self.robot.root_physx_view.get_masses()
-            total_mass = body_masses.sum(dim=-1)
-            print(f"\n📊 機器人質量信息:")
-            print(f"   總質量: {total_mass[0].item():.4f} kg")
-            print(f"   各剛體質量: {body_masses[0].cpu().numpy()}")
-            
-            # 檢查質量是否異常
-            if total_mass[0].item() < 0.1:
-                print(f"\n⚠️  警告: 總質量非常小 ({total_mass[0].item():.6f} kg)!")
-                print(f"   這可能是導致『重力很小』現象的原因！")
-                print(f"   請檢查 USD 文件中的質量/密度設置。")
-            elif total_mass[0].item() > 100:
-                print(f"\n⚠️  警告: 總質量非常大 ({total_mass[0].item():.2f} kg)!")
-                
-        except Exception as e:
-            print(f"\n❌ 無法獲取質量信息: {e}")
+        print(f"\n🦿 Tripod 分組:")
+        print(f"   Tripod A (idx {self._tripod_a_indices.tolist()}): 關節 15, 18, 24")
+        print(f"   Tripod B (idx {self._tripod_b_indices.tolist()}): 關節 7, 12, 23")
         
-        # 計算預期自由落體時間
-        print(f"\n📐 自由落體參考:")
-        g = abs(self.cfg.sim.gravity[2])
-        h = 0.1  # 假設從 10cm 高度落下
-        t_expected = (2 * h / g) ** 0.5
-        print(f"   從 {h*100:.0f}cm 高度自由落體到地面的理論時間: {t_expected:.3f} 秒")
+        print(f"\n🎮 動作空間 ({self.cfg.action_space}):")
+        print(f"   [0:6] 主驅動速度 (scale: ±{self.cfg.main_drive_vel_scale} rad/s)")
+        print(f"   [6:12] ABAD 位置 (scale: ±{self.cfg.abad_pos_scale} rad)")
         
-        print("="*60 + "\n")
+        print(f"\n💡 RHex 步態原理:")
+        print(f"   - C型腿持續旋轉（非擺動），像輪子一樣推進")
+        print(f"   - Stance phase (0~π): 腿接觸地面，穩定推進")
+        print(f"   - Swing phase (π~2π): 腿離地，快速轉到落地位置")
+        print(f"   - 兩組 Tripod 交替支撐，確保持續接地")
+        print("=" * 70 + "\n")
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """物理步之前處理動作"""
-        # 保存上一次動作
         self.last_actions = self.actions.clone()
-
-        # 裁剪並存儲新動作
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
-        """將動作應用到機器人關節"""
-        # 為不同類型的關節應用不同的縮放
-        scaled_actions = torch.zeros_like(self.actions)
-
-        # 每條腿有 3 個關節，按順序是 hip, knee, foot
-        for leg_idx in range(6):
-            base_idx = leg_idx * 3
-            # Hip (ABAD) - 較小的動作範圍
-            scaled_actions[:, base_idx] = self.actions[:, base_idx] * self.cfg.hip_action_scale
-            # Knee
-            scaled_actions[:, base_idx + 1] = self.actions[:, base_idx + 1] * self.cfg.knee_action_scale
-            # Foot
-            scaled_actions[:, base_idx + 2] = self.actions[:, base_idx + 2] * self.cfg.foot_action_scale
-
-        # 計算目標關節位置 (相對於默認位置的偏移)
-        target_joint_pos = self.joint_pos_default + scaled_actions
-
-        # 應用到機器人
-        self.robot.set_joint_position_target(target_joint_pos)
+        """
+        將動作應用到機器人關節
+        
+        動作格式 (12 維):
+        - [0:6]: 主驅動目標角速度 (相對於基礎速度的調整)
+        - [6:12]: ABAD 目標位置
+        
+        注意：左右側腿需要相反的旋轉方向才能前進！
+        - 右側 (Legs 1,2,3): 負向旋轉
+        - 左側 (Legs 4,5,6): 正向旋轉
+        """
+        # ===== 主驅動關節：速度控制 =====
+        # 動作 [-1, 1] 映射到速度調整
+        drive_actions = self.actions[:, :6]
+        
+        # 基礎速度
+        base_vel = self.cfg.base_gait_angular_vel
+        
+        # 使用配置中的方向乘數（已在 _setup_joint_indices 中初始化）
+        # 右側 (idx 0,1,2) → -1, 左側 (idx 3,4,5) → +1
+        
+        # 計算目標速度：基礎速度 * 方向 + 動作調整 * 方向
+        target_drive_vel = (base_vel + drive_actions * self.cfg.main_drive_vel_scale) * self._direction_multiplier
+        
+        # 限制速度範圍以防止物理爆炸
+        target_drive_vel = torch.clamp(target_drive_vel, min=-10.0, max=10.0)
+        
+        # 應用速度目標到主驅動關節
+        # 注意：當指定 joint_ids 時，target 的形狀應該是 [num_envs, len(joint_ids)]
+        self.robot.set_joint_velocity_target(target_drive_vel, joint_ids=self._main_drive_indices)
+        
+        # ===== ABAD 關節：位置控制 =====
+        abad_actions = self.actions[:, 6:12]
+        target_abad_pos = abad_actions * self.cfg.abad_pos_scale
+        
+        # 限制位置範圍
+        target_abad_pos = torch.clamp(target_abad_pos, min=-0.5, max=0.5)
+        
+        # 應用位置目標到 ABAD 關節
+        self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
+        
+        # ===== 避震關節：保持在初始角度 =====
+        # 重要：ImplicitActuator 的 stiffness 會把關節拉向位置目標
+        # 如果不設置目標，默認是 0（拉直），這是錯誤的！
+        # 必須設置位置目標為初始角度，讓關節保持形狀
+        self.robot.set_joint_position_target(
+            self._damper_initial_pos.expand(self.num_envs, -1), 
+            joint_ids=self._damper_indices
+        )
 
     def _get_observations(self) -> dict:
         """計算觀測"""
-        # 更新內部狀態
         self._update_state()
+
+        # 主驅動關節狀態
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]
+        main_drive_vel = self.joint_vel[:, self._main_drive_indices]
+        
+        # 用 sin/cos 表示主驅動位置（因為是循環的）
+        main_drive_pos_sin = torch.sin(main_drive_pos)
+        main_drive_pos_cos = torch.cos(main_drive_pos)
+        
+        # ABAD 關節狀態
+        abad_pos = self.joint_pos[:, self._abad_indices]
+        abad_vel = self.joint_vel[:, self._abad_indices]
 
         # 構建觀測向量
         obs = torch.cat([
-            # 基座線速度 (3)
-            self.base_lin_vel,
-            # 基座角速度 (3)
-            self.base_ang_vel,
-            # 投影重力向量 (3)
-            self.projected_gravity,
-            # 關節位置 (相對於默認) (18)
-            self.joint_pos - self.joint_pos_default,
-            # 關節速度 (18)
-            torch.clamp(self.joint_vel, min=-20.0, max=20.0),
-            # 速度命令 (3)
-            self.commands,
-            # 步態相位 (sin 和 cos 表示) (2)
-            torch.sin(self.gait_phase).unsqueeze(-1),
-            torch.cos(self.gait_phase).unsqueeze(-1),
-            # 上一次動作 (18)
-            self.last_actions,
+            self.base_lin_vel,                              # (3)
+            self.base_ang_vel,                              # (3)
+            self.projected_gravity,                         # (3)
+            main_drive_pos_sin,                             # (6)
+            main_drive_pos_cos,                             # (6)
+            main_drive_vel / self.cfg.base_gait_angular_vel,  # (6) 正規化
+            abad_pos / self.cfg.abad_pos_scale,             # (6) 正規化
+            abad_vel,                                       # (6)
+            self.commands,                                  # (3)
+            torch.sin(self.gait_phase).unsqueeze(-1),       # (1)
+            torch.cos(self.gait_phase).unsqueeze(-1),       # (1)
+            self.last_actions,                              # (12)
         ], dim=-1)
 
-        # 添加噪聲
+        # 噪聲
         if self.cfg.add_noise:
             noise = torch.randn_like(obs) * 0.01 * self.cfg.noise_level
             obs = obs + noise
 
-        # NaN/Inf 保護 (關鍵！)
+        # NaN/Inf 保護
         obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
         obs = torch.clamp(obs, min=-100.0, max=100.0)
 
         return {"policy": obs}
 
     def _update_state(self):
-        """更新內部狀態緩衝區"""
-        # 獲取關節狀態 (添加 NaN 保護)
+        """更新內部狀態"""
+        # 關節狀態
         self.joint_pos = torch.nan_to_num(self.robot.data.joint_pos.clone(), nan=0.0)
         self.joint_vel = torch.nan_to_num(self.robot.data.joint_vel.clone(), nan=0.0)
 
-        # 獲取基座狀態
+        # 基座狀態
         root_quat = self.robot.data.root_quat_w
         root_lin_vel_w = self.robot.data.root_lin_vel_w
         root_ang_vel_w = self.robot.data.root_ang_vel_w
 
-        # 轉換速度到基座坐標系 (添加 clamp 防止極端值)
         self.base_lin_vel = torch.clamp(
             quat_apply_inverse(root_quat, root_lin_vel_w), min=-10.0, max=10.0
         )
@@ -272,239 +373,242 @@ class RedrhexEnv(DirectRLEnv):
             quat_apply_inverse(root_quat, root_ang_vel_w), min=-10.0, max=10.0
         )
         
-        # NaN 保護
         self.base_lin_vel = torch.nan_to_num(self.base_lin_vel, nan=0.0)
         self.base_ang_vel = torch.nan_to_num(self.base_ang_vel, nan=0.0)
 
-        # 計算投影重力
+        # 投影重力
         gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(self.num_envs, 3)
         self.projected_gravity = quat_apply_inverse(root_quat, gravity_vec)
         self.projected_gravity = torch.nan_to_num(self.projected_gravity, nan=0.0)
 
         # 更新步態相位
         dt = self.cfg.sim.dt * self.cfg.decimation
-        self.gait_phase = (self.gait_phase + 2 * math.pi * self.cfg.gait_frequency * dt) % (2 * math.pi)
-
-
-        # 更新腳接觸狀態 (簡化版本)
-        self.feet_contact = torch.ones(self.num_envs, 6, dtype=torch.bool, device=self.device)
+        self.gait_phase = (self.gait_phase + 2 * math.pi * self.cfg.base_gait_frequency * dt) % (2 * math.pi)
 
     def _get_rewards(self) -> torch.Tensor:
-        """計算獎勵 - 簡化版本，專注於基本行走"""
+        """
+        ===== RHex 機器人運動原理（極簡版）=====
+        
+        【機構】
+        RHex 是六足機器人，每隻腳是半圓形的 C 型腿。
+        
+        腿的驅動方式：
+        - 主驅動關節（持續 360° 旋轉）：15, 12, 7（右側）; 18, 23, 24（左側）
+        - 腿通過連續旋轉向前移動（像輪子，不是走路）
+        - 旋轉方向：右腿負向，左腿正向 → 都是往後踩地推動機器人前進
+        
+        Tripod 分組（交替三足步態）：
+        - Tripod A：腿 0, 3, 5（關節 15, 18, 24）
+        - Tripod B：腿 1, 2, 4（關節 7, 12, 23）
+        
+        【動態步態核心】
+        不是簡單的 180° 相位差！而是速度調節：
+        
+        1. 當腿在地面（Stance）：較慢、穩定的速度旋轉
+           → 提供推進力，避免打滑
+        
+        2. 當腿離地（Swing）：快速旋轉
+           → 迅速轉到即將落地位置，準備接力
+        
+        這樣確保永遠有腿在支撐，不會有滯空期。
+        
+        【獎勵設計原則】
+        極度簡化！只獎勵：
+        1. 前進（最重要）
+        2. 腿在旋轉
+        3. 不翻車
+        """
         rewards = torch.zeros(self.num_envs, device=self.device)
 
-        # ===================
-        # 存活獎勵 (最基本 - 鼓勵保持站立)
-        # ===================
-        rewards += self.cfg.rew_scale_alive
-
-        # ===================
-        # 前進獎勵 (核心獎勵)
-        # ===================
-        # 直接獎勵 x 方向的位移速度 (限制範圍避免 NaN)
-        forward_vel = torch.clamp(self.base_lin_vel[:, 0], min=-5.0, max=5.0)
+        # ===== 獲取狀態 =====
+        main_drive_vel = self.joint_vel[:, self._main_drive_indices]  # [N, 6]
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
         
-        # 速度追蹤獎勵 - 使用命令的前進速度作為目標
+        # 有效速度（考慮旋轉方向）
+        # 正值 = 往前進方向旋轉
+        effective_vel = main_drive_vel * self._direction_multiplier  # [N, 6]
+        vel_magnitude = torch.abs(effective_vel)  # [N, 6]
+        mean_vel = vel_magnitude.mean(dim=1)
+        min_vel = vel_magnitude.min(dim=1).values
+        num_active_legs = (vel_magnitude > 0.3).float().sum(dim=1)
+        
+        # ===== 1. 前進速度（最重要！）=====
+        forward_vel = self.base_lin_vel[:, 0]
+        
+        # 簡單直接：前進 = 獎勵，後退 = 懲罰
+        rew_forward_vel = forward_vel * 10.0  # 大權重
+        rewards += rew_forward_vel
+        
+        # 達到目標速度的獎勵
         target_vel = self.commands[:, 0]
         vel_error = torch.abs(forward_vel - target_vel)
-        lin_vel_xy_reward = torch.exp(-vel_error / 0.5) * self.cfg.rew_scale_lin_vel_xy
-        rewards += lin_vel_xy_reward
+        rew_vel_tracking = torch.exp(-vel_error * 2.0) * 2.0
+        rewards += rew_vel_tracking
 
-        # 額外獎勵：直接獎勵正向前進 (限制上限避免過大獎勵)
-        forward_progress_reward = torch.clamp(forward_vel, min=0.0, max=1.0) * self.cfg.rew_scale_forward_progress
-        rewards += forward_progress_reward
+        # ===== 2. 腿旋轉獎勵（簡化）=====
+        
+        # 2.1 正確方向旋轉
+        correct_direction = effective_vel > 0.5  # 往前進方向轉
+        rew_rotation_dir = correct_direction.float().sum(dim=1) * 0.5  # 每條腿 0.5
+        rewards += rew_rotation_dir
+        
+        # 2.2 所有腿都要動
+        rew_all_legs = num_active_legs * 0.3  # 每條活動的腿 0.3
+        rewards += rew_all_legs
+        
+        # 2.3 最慢的腿也要動（防止罷工）
+        rew_min_vel = torch.clamp(min_vel, max=3.0) * 0.5
+        rewards += rew_min_vel
+        
+        # 2.4 平均旋轉速度
+        rew_mean_vel = torch.clamp(mean_vel, max=5.0) * 0.3
+        rewards += rew_mean_vel
+        
+        # 為了 TensorBoard 相容性
+        rew_correct_dir = rew_mean_vel  # 合併
 
-        # 角速度追蹤 (yaw) - 當前目標是 0
-        ang_vel_z_reward = self.cfg.rew_scale_ang_vel_z  # 直接給滿分，因為目標是 0
-        rewards += ang_vel_z_reward
+        # ===== 3. 簡單的穩定性（輕微懲罰）=====
+        
+        # 3.1 不要翻車（傾斜懲罰）
+        grav_xy = self.projected_gravity[:, :2]
+        tilt = torch.norm(grav_xy, dim=1)
+        rew_orientation = -tilt * 0.5  # 輕微懲罰
+        rewards += rew_orientation
+        
+        # 3.2 保持高度
+        base_height = self.robot.data.root_pos_w[:, 2]
+        target_height = 0.12
+        height_error = torch.abs(base_height - target_height)
+        rew_base_height = -height_error * 0.5
+        rewards += rew_base_height
+        
+        # 3.3 不要亂跳（垂直速度懲罰）
+        z_vel = self.base_lin_vel[:, 2]
+        rew_lin_vel_z = -torch.abs(z_vel) * 0.2
+        rewards += rew_lin_vel_z
+        
+        # 3.4 不要亂轉（角速度懲罰）
+        ang_vel_xy = self.base_ang_vel[:, :2]
+        rew_ang_vel_xy = -torch.norm(ang_vel_xy, dim=1) * 0.1
+        rewards += rew_ang_vel_xy
 
-        # 懲罰垂直速度 (減少跳躍) - 限制範圍
-        z_vel = torch.clamp(self.base_lin_vel[:, 2], min=-5.0, max=5.0)
-        lin_vel_z_penalty = torch.square(z_vel) * self.cfg.rew_scale_lin_vel_z
-        rewards += lin_vel_z_penalty
+        # ===== 4. 存活獎勵（小）=====
+        rew_alive = torch.ones(self.num_envs, device=self.device) * 0.2
+        rewards += rew_alive
 
-        # ===================
-        # 穩定性獎勵
-        # ===================
-        # 姿態懲罰 - 只懲罰極端傾斜 (限制範圍)
-        grav_xy = torch.clamp(self.projected_gravity[:, :2], min=-2.0, max=2.0)
-        orientation_penalty = torch.sum(torch.square(grav_xy), dim=1)
-        rewards += orientation_penalty * self.cfg.rew_scale_orientation
+        # ===== 5. 步態協調（可選，權重很低）=====
+        # Tripod 相位
+        effective_pos = main_drive_pos * self._direction_multiplier
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)
+        
+        phase_a = leg_phase[:, self._tripod_a_indices]  # [N, 3]
+        phase_b = leg_phase[:, self._tripod_b_indices]  # [N, 3]
+        
+        # 同組腿相位一致性
+        def phase_coherence(phases):
+            sin_mean = torch.sin(phases).mean(dim=1)
+            cos_mean = torch.cos(phases).mean(dim=1)
+            return torch.sqrt(sin_mean**2 + cos_mean**2)
+        
+        coherence_a = phase_coherence(phase_a)
+        coherence_b = phase_coherence(phase_b)
+        rew_tripod_sync = (coherence_a + coherence_b) * 0.2  # 低權重
+        rewards += rew_tripod_sync
+        
+        # 兩組相位差
+        mean_phase_a = torch.atan2(torch.sin(phase_a).mean(dim=1), torch.cos(phase_a).mean(dim=1))
+        mean_phase_b = torch.atan2(torch.sin(phase_b).mean(dim=1), torch.cos(phase_b).mean(dim=1))
+        phase_diff = torch.abs(mean_phase_a - mean_phase_b)
+        phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)
+        phase_diff_error = torch.abs(phase_diff - math.pi)
+        rew_gait_sync = torch.exp(-phase_diff_error) * 0.1  # 很低權重
+        rewards += rew_gait_sync
+        
+        # 持續支撐（有腿在地面）
+        in_stance = leg_phase < math.pi
+        stance_a = in_stance[:, self._tripod_a_indices].float().sum(dim=1)
+        stance_b = in_stance[:, self._tripod_b_indices].float().sum(dim=1)
+        has_support = ((stance_a >= 1) | (stance_b >= 1)).float()
+        rew_continuous_support = has_support * 0.2
+        rewards += rew_continuous_support
 
-        # 高度維持 - 只懲罰極端高度偏差
-        base_height = torch.clamp(self.robot.data.root_pos_w[:, 2], min=-1.0, max=2.0)
-        target_height = 0.1  # 目標高度
-        height_error = torch.square(base_height - target_height)
-        rewards += height_error * self.cfg.rew_scale_base_height
+        # 佔位符（為了 TensorBoard 相容）
+        rew_abad_action = torch.zeros(self.num_envs, device=self.device)
+        rew_abad_stability = torch.zeros(self.num_envs, device=self.device)
+        rew_action_rate = torch.zeros(self.num_envs, device=self.device)
+        rew_smooth_rotation = torch.zeros(self.num_envs, device=self.device)
 
-        # ===================
-        # 平滑性懲罰 (降低權重)
-        # ===================
-        action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-        rewards += action_rate * self.cfg.rew_scale_action_rate
-
-        # 確保獎勵不是 NaN 或 Inf
+        # NaN 保護
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # ===================
-        # 步態獎勵 (簡化 - 只在學會走路後再啟用)
-        # ===================
-        if self.cfg.rew_scale_tripod_contact > 0:
-            tripod_reward = self._compute_tripod_gait_reward()
-            rewards += tripod_reward * self.cfg.rew_scale_tripod_contact
-
-        # ===================
-        # ABAD 獎勵 (暫時禁用 - 讓機器人先學會走路)
-        # ===================
-        if self.cfg.rew_scale_abad_usage > 0:
-            abad_reward = self._compute_abad_reward()
-            rewards += abad_reward * self.cfg.rew_scale_abad_usage
-
-        if self.cfg.rew_scale_abad_symmetry > 0:
-            abad_symmetry_reward = self._compute_abad_symmetry_reward()
-            rewards += abad_symmetry_reward * self.cfg.rew_scale_abad_symmetry
-
-        # 更新追蹤
-        self.episode_sums["lin_vel_xy"] += lin_vel_xy_reward
-        self.episode_sums["ang_vel_z"] += ang_vel_z_reward
+        # ===== 更新 TensorBoard =====
+        self.episode_sums["rew_alive"] += rew_alive
+        self.episode_sums["rew_forward_vel"] += rew_forward_vel
+        self.episode_sums["rew_vel_tracking"] += rew_vel_tracking
+        self.episode_sums["rew_gait_sync"] += rew_gait_sync
+        self.episode_sums["rew_rotation_dir"] += rew_rotation_dir
+        self.episode_sums["rew_all_legs"] += rew_all_legs
+        self.episode_sums["rew_correct_dir"] += rew_correct_dir
+        self.episode_sums["rew_tripod_sync"] += rew_tripod_sync
+        self.episode_sums["rew_mean_vel"] += rew_mean_vel
+        self.episode_sums["rew_min_vel"] += rew_min_vel
+        self.episode_sums["rew_continuous_support"] += rew_continuous_support
+        self.episode_sums["rew_smooth_rotation"] += rew_smooth_rotation
+        self.episode_sums["rew_orientation"] += rew_orientation
+        self.episode_sums["rew_base_height"] += rew_base_height
+        self.episode_sums["rew_lin_vel_z"] += rew_lin_vel_z
+        self.episode_sums["rew_ang_vel_xy"] += rew_ang_vel_xy
+        self.episode_sums["rew_abad_action"] += rew_abad_action
+        self.episode_sums["rew_abad_stability"] += rew_abad_stability
+        self.episode_sums["rew_action_rate"] += rew_action_rate
+        
+        # 診斷
+        self.episode_sums["diag_forward_vel"] += forward_vel
+        self.episode_sums["diag_base_height"] += base_height
+        self.episode_sums["diag_tilt"] += tilt
+        self.episode_sums["diag_drive_vel_mean"] += mean_vel
+        self.episode_sums["diag_rotating_legs"] += num_active_legs
+        self.episode_sums["diag_min_leg_vel"] += min_vel
+        
+        self.last_main_drive_vel = main_drive_vel.clone()
 
         return rewards
 
-    def _compute_tripod_gait_reward(self) -> torch.Tensor:
-        """
-        計算三足步態獎勵
-
-        三足步態的關鍵：
-        - 當 gait_phase 在 [0, π) 時，Tripod A (legs 0,2,4) 應該接觸地面
-        - 當 gait_phase 在 [π, 2π) 時，Tripod B (legs 1,3,5) 應該接觸地面
-        """
-        # 判斷當前應該是哪個 tripod 接觸地面
-        tripod_a_should_contact = (self.gait_phase < math.pi)
-
-        # 獲取各 tripod 的接觸狀態
-        tripod_a_contact = self.feet_contact[:, self._tripod_a_ids]
-        tripod_b_contact = self.feet_contact[:, self._tripod_b_ids]
-
-        # 計算接觸數量
-        tripod_a_count = tripod_a_contact.sum(dim=1).float()
-        tripod_b_count = tripod_b_contact.sum(dim=1).float()
-
-        # 獎勵正確的接觸模式
-        reward = torch.zeros(self.num_envs, device=self.device)
-
-        # 當 tripod A 應該接觸時
-        mask_a = tripod_a_should_contact
-        reward[mask_a] = (tripod_a_count[mask_a] / 3.0) - (tripod_b_count[mask_a] / 3.0)
-
-        # 當 tripod B 應該接觸時
-        mask_b = ~tripod_a_should_contact
-        reward[mask_b] = (tripod_b_count[mask_b] / 3.0) - (tripod_a_count[mask_b] / 3.0)
-
-        return reward
-
-    def _compute_gait_phase_reward(self) -> torch.Tensor:
-        """計算步態相位獎勵"""
-        # 計算每條腿的相位
-        leg_phases = (self.gait_phase.unsqueeze(-1) + self.leg_phase_offsets) % (2 * math.pi)
-
-        # 理想情況：相位在 [0, π] 時腳應該在地面
-        should_be_in_stance = (leg_phases < math.pi)
-
-        # 比較實際接觸狀態與理想狀態
-        correct_phase = (should_be_in_stance == self.feet_contact).float()
-
-        return correct_phase.mean(dim=1)
-
-    def _compute_abad_reward(self) -> torch.Tensor:
-        """
-        計算 ABAD (外展/內收) 關節使用獎勵
-
-        這是你們的創新點！ABAD 關節可以用於：
-        1. 側向移動時擴大支撐基底
-        2. 轉向時輔助方向控制
-        3. 不平地形時調整腳的位置
-        """
-        # 獲取 ABAD (hip) 關節的動作
-        hip_actions = torch.zeros(self.num_envs, 6, device=self.device)
-        for i in range(6):
-            hip_actions[:, i] = self.actions[:, i * 3]
-
-        # 計算 ABAD 使用量
-        hip_usage = torch.abs(hip_actions).mean(dim=1)
-
-        # 獎勵適度使用 (目標 20% 的動作範圍)
-        target_usage = 0.2
-        usage_error = torch.abs(hip_usage - target_usage)
-        reward = torch.exp(-usage_error / 0.1)
-
-        return reward
-
-    def _compute_abad_symmetry_reward(self) -> torch.Tensor:
-        """計算 ABAD 左右對稱獎勵"""
-        hip_actions = torch.zeros(self.num_envs, 6, device=self.device)
-        for i in range(6):
-            hip_actions[:, i] = self.actions[:, i * 3]
-
-        # 左右腿配對：(0,1), (2,3), (4,5)
-        symmetry_error = (
-            torch.abs(hip_actions[:, 0] + hip_actions[:, 1]) +
-            torch.abs(hip_actions[:, 2] + hip_actions[:, 3]) +
-            torch.abs(hip_actions[:, 4] + hip_actions[:, 5])
-        ) / 3.0
-
-        # 只在直線行走時獎勵對稱
-        is_straight = (torch.abs(self.commands[:, 1]) < 0.1) & (torch.abs(self.commands[:, 2]) < 0.1)
-        reward = torch.exp(-symmetry_error / 0.1) * is_straight.float()
-
-        return reward
-
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """計算終止條件"""
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-
+        """計算終止條件 - 大幅放寬以允許探索"""
         # 超時
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        # 終止條件
+        # 終止條件 - 只在真正壞掉時終止
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # 0. 物理爆炸檢測 (最重要！) - 防止位置飛到無限遠
         root_pos = self.robot.data.root_pos_w
         root_vel = self.robot.data.root_lin_vel_w
         
-        # 檢查 NaN 或 Inf
+        # 1. 物理爆炸檢測（NaN/Inf）
         pos_invalid = torch.any(torch.isnan(root_pos) | torch.isinf(root_pos), dim=1)
         vel_invalid = torch.any(torch.isnan(root_vel) | torch.isinf(root_vel), dim=1)
         terminated = terminated | pos_invalid | vel_invalid
         
-        # 檢查位置是否飛太遠 (超過 100 米就算爆炸)
-        pos_too_far = torch.any(torch.abs(root_pos[:, :2]) > 100.0, dim=1)  # XY 平面
+        # 2. 位置過遠（跑到仿真邊界外）
+        pos_too_far = torch.any(torch.abs(root_pos[:, :2]) > 50.0, dim=1)
         terminated = terminated | pos_too_far
         
-        # 檢查速度是否太快 (超過 50 m/s 就算爆炸)
-        vel_too_fast = torch.any(torch.abs(root_vel) > 50.0, dim=1)
+        # 3. 速度過快（物理失控）- 放寬閾值
+        vel_too_fast = torch.any(torch.abs(root_vel) > 30.0, dim=1)
         terminated = terminated | vel_too_fast
 
-        # 1. 姿態過差 (傾斜太多)
-        # 計算相對於初始姿態的傾斜角度，而不是相對於世界座標
-        # 這樣即使機器人初始有旋轉也不會被誤殺
-        gravity_diff = self.projected_gravity - self.reference_projected_gravity
-        tilt_magnitude = torch.norm(gravity_diff, dim=1)
-        # tilt_magnitude ≈ 0 表示與初始姿態相同
-        # tilt_magnitude ≈ 2 表示完全翻轉 (180度)
-        # 對應關係: sin(angle/2) * 2 ≈ tilt_magnitude for small angles
-        bad_orientation = tilt_magnitude > self.cfg.max_tilt_magnitude
-        terminated = terminated | bad_orientation
+        # 4. 翻車檢測 - 只在完全翻過來時終止
+        # projected_gravity 的 z 分量：正立時約 -1，完全翻轉時約 +1
+        # 當 z > 0.5 表示翻過來超過 60°
+        flipped_over = self.projected_gravity[:, 2] > 0.5
+        terminated = terminated | flipped_over
 
-        # 2. 高度過低
+        # 5. 高度終止 - 放寬範圍
         base_height = root_pos[:, 2]
-        too_low = base_height < self.cfg.min_base_height
-        terminated = terminated | too_low
-
-        # 3. 高度過高
-        too_high = base_height > self.cfg.max_base_height
-        terminated = terminated | too_high
+        too_low = base_height < 0.01  # 只有地面以下才終止
+        too_high = base_height > 1.0   # 只有飛太高才終止
+        terminated = terminated | too_low | too_high
 
         return terminated, time_out
 
@@ -516,22 +620,27 @@ class RedrhexEnv(DirectRLEnv):
 
         num_reset = len(env_ids)
 
-        # 重置關節狀態
+        # 重置關節狀態 - 使用配置文件中定義的默認位置
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = torch.zeros((num_reset, self.robot.num_joints), device=self.device)
+        
+        # Debug: 打印第一次重置時的初始關節位置
+        if not hasattr(self, '_printed_init_pos'):
+            self._printed_init_pos = True
+            print("\n[DEBUG] Initial joint positions from config:")
+            joint_names = self.robot.data.joint_names
+            for i, name in enumerate(joint_names):
+                pos_deg = joint_pos[0, i].item() * 180 / math.pi
+                print(f"  {name}: {joint_pos[0, i].item():.3f} rad ({pos_deg:.1f}°)")
+            print("")
 
-        # 添加小的隨機擾動
-        joint_pos += sample_uniform(
-            -0.1, 0.1,
-            joint_pos.shape,
-            device=self.device
-        )
+        # 減少隨機擾動
+        joint_pos += sample_uniform(-0.02, 0.02, joint_pos.shape, device=self.device)
 
         # 重置根狀態
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
 
-        # 添加小的隨機位置擾動
         default_root_state[:, 0] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
         default_root_state[:, 1] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
 
@@ -543,21 +652,39 @@ class RedrhexEnv(DirectRLEnv):
         # 重置內部緩衝
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel
-        self.joint_pos_default[env_ids] = self.robot.data.default_joint_pos[env_ids]
 
         self.actions[env_ids] = 0.0
         self.last_actions[env_ids] = 0.0
+        self.last_main_drive_vel[env_ids] = 0.0  # 從零開始
 
         # 隨機化步態相位
         self.gait_phase[env_ids] = sample_uniform(0, 2 * math.pi, (num_reset,), device=self.device)
 
-        # 重置腳接觸
-        self.feet_contact[env_ids] = True
-
         # 採樣新的速度命令
         self._resample_commands(env_ids)
 
-        # 重置獎勵追蹤
+        # ===== TensorBoard Logging =====
+        # 計算並記錄 episode 獎勵總和到 extras["log"]
+        # RSL-RL 的 Logger 會自動從 extras["log"] 讀取並寫入 TensorBoard
+        extras = dict()
+        for key in self.episode_sums.keys():
+            # 計算被重置環境的平均 episode 獎勵
+            episodic_sum_avg = torch.mean(self.episode_sums[key][env_ids])
+            # 使用 "/" 前綴讓 RSL-RL 直接記錄到 TensorBoard
+            # 格式: "Episode_Reward/rew_forward_vel" -> TensorBoard 會顯示在 Episode_Reward 分類下
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+        
+        # 初始化 extras["log"] 並更新
+        self.extras["log"] = dict()
+        self.extras["log"].update(extras)
+        
+        # 記錄終止原因統計
+        termination_extras = dict()
+        termination_extras["Episode_Termination/terminated"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
+        termination_extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
+        self.extras["log"].update(termination_extras)
+        
+        # 重置獎勵追蹤 (在記錄後重置)
         for key in self.episode_sums:
             self.episode_sums[key][env_ids] = 0.0
 
@@ -565,7 +692,6 @@ class RedrhexEnv(DirectRLEnv):
         """為指定環境採樣新的速度命令"""
         num_cmds = len(env_ids)
 
-        # 採樣前進速度
         self.commands[env_ids, 0] = sample_uniform(
             self.cfg.lin_vel_x_range[0],
             self.cfg.lin_vel_x_range[1],
@@ -573,7 +699,6 @@ class RedrhexEnv(DirectRLEnv):
             device=self.device
         )
 
-        # 採樣側向速度
         self.commands[env_ids, 1] = sample_uniform(
             self.cfg.lin_vel_y_range[0],
             self.cfg.lin_vel_y_range[1],
@@ -581,13 +706,9 @@ class RedrhexEnv(DirectRLEnv):
             device=self.device
         )
 
-        # 採樣 yaw 速度
         self.commands[env_ids, 2] = sample_uniform(
             self.cfg.ang_vel_z_range[0],
             self.cfg.ang_vel_z_range[1],
             (num_cmds,),
             device=self.device
         )
-
-        # 移除死區 - 讓機器人始終有目標速度
-        # (命令範圍已設置為 [0.15, 0.3]，不需要死區)
