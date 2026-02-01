@@ -20,7 +20,15 @@ RHex 機器人核心概念：
 from __future__ import annotations
 
 import math
+import os
 import isaaclab.sim as sim_utils
+
+# Get the USD path - config file is at source/RedRhex/RedRhex/tasks/direct/redrhex/
+# USD file is at project root: /home/jasonliao/RedRhex/RedRhex/RedRhex.usd
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REDRHEX_USD_PATH = os.path.normpath(os.path.join(
+    _THIS_DIR, "..", "..", "..", "..", "..", "..", "RedRhex.usd"
+))
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -35,7 +43,7 @@ from isaaclab.utils import configclass
 
 REDRHEX_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="${ISAACLAB_PATH}/../RedRhex/source/RedRhex/RedRhex/RedRhex.usd",
+        usd_path=_REDRHEX_USD_PATH,
         activate_contact_sensors=True,
         mass_props=sim_utils.MassPropertiesCfg(
             # 整機目標質量約 13.5-15 kg：機身 12 kg + 6 腿各 ~0.35 kg
