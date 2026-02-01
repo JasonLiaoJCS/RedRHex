@@ -22,6 +22,12 @@ REDRHEX_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path="/home/jasonliao/RedRhex/RedRhex.usd",
         activate_contact_sensors=True,
+        # 質量覆蓋 - 如果 USD 中的質量設置不正確，可以在這裡強制設定
+        # 取消下面的註解來啟用質量覆蓋
+        mass_props=sim_utils.MassPropertiesCfg(
+            density=1000.0,  # kg/m³ - 水的密度是 1000，金屬約 2700-7800
+            # mass=2.0,  # 或者直接設定總質量 (kg) - 取消註解此行並註解 density
+        ),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,

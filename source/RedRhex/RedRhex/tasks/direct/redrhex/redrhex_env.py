@@ -59,6 +59,9 @@ class RedrhexEnv(DirectRLEnv):
         self._tripod_a_ids = torch.tensor(self.cfg.tripod_group_a, device=self.device)
         self._tripod_b_ids = torch.tensor(self.cfg.tripod_group_b, device=self.device)
 
+        # 打印物理診斷信息
+        self._debug_print_physics_info()
+
         print(f"[RedrhexEnv] 環境初始化完成，共 {self.num_envs} 個環境")
         print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space}")
         print(f"[RedrhexEnv] 觀測空間: {self.cfg.observation_space}")
@@ -142,6 +145,47 @@ class RedrhexEnv(DirectRLEnv):
         # 添加燈光
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _debug_print_physics_info(self):
+        """診斷：打印物理參數幫助調試重力問題"""
+        print("\n" + "="*60)
+        print("🔍 物理參數診斷 (Physics Diagnostics)")
+        print("="*60)
+        
+        # 打印重力設置
+        print(f"⚙️  重力設置: {self.cfg.sim.gravity}")
+        print(f"⚙️  物理 dt: {self.cfg.sim.dt} s ({1/self.cfg.sim.dt:.0f} Hz)")
+        print(f"⚙️  Decimation: {self.cfg.decimation}")
+        print(f"⚙️  控制頻率: {1/(self.cfg.sim.dt * self.cfg.decimation):.1f} Hz")
+        
+        # 嘗試獲取機器人質量信息
+        try:
+            # 獲取總質量
+            body_masses = self.robot.root_physx_view.get_masses()
+            total_mass = body_masses.sum(dim=-1)
+            print(f"\n📊 機器人質量信息:")
+            print(f"   總質量: {total_mass[0].item():.4f} kg")
+            print(f"   各剛體質量: {body_masses[0].cpu().numpy()}")
+            
+            # 檢查質量是否異常
+            if total_mass[0].item() < 0.1:
+                print(f"\n⚠️  警告: 總質量非常小 ({total_mass[0].item():.6f} kg)!")
+                print(f"   這可能是導致『重力很小』現象的原因！")
+                print(f"   請檢查 USD 文件中的質量/密度設置。")
+            elif total_mass[0].item() > 100:
+                print(f"\n⚠️  警告: 總質量非常大 ({total_mass[0].item():.2f} kg)!")
+                
+        except Exception as e:
+            print(f"\n❌ 無法獲取質量信息: {e}")
+        
+        # 計算預期自由落體時間
+        print(f"\n📐 自由落體參考:")
+        g = abs(self.cfg.sim.gravity[2])
+        h = 0.1  # 假設從 10cm 高度落下
+        t_expected = (2 * h / g) ** 0.5
+        print(f"   從 {h*100:.0f}cm 高度自由落體到地面的理論時間: {t_expected:.3f} 秒")
+        
+        print("="*60 + "\n")
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """物理步之前處理動作"""
