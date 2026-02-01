@@ -69,3 +69,5 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+.vscode/browse.vc.db
+.vscode/*.db
