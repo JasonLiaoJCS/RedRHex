@@ -8,11 +8,13 @@
 **/*.dmp
 **/.thumbs
 
-# No USD files allowed in the repo
+# No USD files allowed in the repo (except RedRhex.usd)
 **/*.usd
 **/*.usda
 **/*.usdc
 **/*.usdz
+# Allow main robot model
+!/RedRhex.usd
 
 # Python
 .DS_Store
