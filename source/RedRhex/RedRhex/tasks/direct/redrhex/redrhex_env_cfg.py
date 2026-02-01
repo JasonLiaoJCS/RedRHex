@@ -35,7 +35,7 @@ from isaaclab.utils import configclass
 
 REDRHEX_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="/home/jasonliao/RedRhex/RedRhex.usd",
+        usd_path="${ISAACLAB_PATH}/../RedRhex/source/RedRhex/RedRhex/RedRhex.usd",
         activate_contact_sensors=True,
         mass_props=sim_utils.MassPropertiesCfg(
             # 整機目標質量約 13.5-15 kg：機身 12 kg + 6 腿各 ~0.35 kg
