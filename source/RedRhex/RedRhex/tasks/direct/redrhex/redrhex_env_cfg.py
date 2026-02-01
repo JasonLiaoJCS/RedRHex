@@ -20,7 +20,7 @@ from isaaclab.utils import configclass
 
 REDRHEX_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="/home/jasonliao/RedRhex/RedRhex.usd",
+        usd_path="/home/jasonliao/RedRhex/RedRhex.usd",#dd
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
