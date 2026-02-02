@@ -2,17 +2,49 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-RedRhex hexapod robot environment with RHex-style wheg locomotion.
+=============================================================================
+RedRhex 六足機器人環境 - 使用 RHex 風格的「旋轉步態」運動方式
+=============================================================================
 
-RHex 機器人的核心運動原理：
-1. 主驅動關節持續旋轉（類似輪子），不是傳統的步行
-2. 使用交替三足步態（alternating tripod gait）
-3. 半圓形 C 型腿在旋轉時產生前進位移
+【給初學者的說明】
+這個檔案定義了機器人如何在虛擬環境中「學習走路」。
+想像你在教一隻機器狗學走路：
+- 你給它一個「訓練場」（這個環境）
+- 告訴它「往前走」的命令（速度指令）
+- 當它做對了就給「獎勵」，做錯就「扣分」（獎勵函數）
+- 機器人透過不斷嘗試，學會如何走得又快又穩
 
-控制架構：
-- 主驅動關節 (15, 7, 12, 18, 23, 24): 速度控制，持續旋轉
-- ABAD 關節 (14, 6, 11, 17, 22, 21): 位置控制，RL 探索最佳使用方式
-- 避震關節 (5, 8, 13, 25, 26, 27): 被動高阻尼，吸收衝擊
+【RHex 機器人的特殊之處】
+一般機器人的腿是「擺動」的（像人走路），但 RHex 的腿是「旋轉」的！
+
+想像這樣：
+┌────────────────────────────────────────────────────────────────┐
+│ 普通走路機器人：腿前後擺動 ← → ← →                            │
+│ RHex 機器人：腿像輪子一樣旋轉 ↻ ↻ ↻                          │
+│                                                                │
+│ RHex 的 C 型腿（半圓形）旋轉時：                              │
+│   1. 腿的底部接觸地面 → 把身體往前推                          │
+│   2. 腿的頂部離開地面 → 快速轉到下一個位置                    │
+│   3. 重複這個過程 → 機器人就前進了！                          │
+└────────────────────────────────────────────────────────────────┘
+
+【三種關節的功能】
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 主驅動關節 (Main Drive)                                     │
+│    - 編號: 15, 7, 12, 18, 23, 24                               │
+│    - 功能: 讓腿持續旋轉，像馬達帶動輪子                        │
+│    - 控制方式: 速度控制（告訴它轉多快）                        │
+│                                                                 │
+│ 2. ABAD 關節 (外展/內收)                                        │
+│    - 編號: 14, 6, 11, 17, 22, 21                               │
+│    - 功能: 讓腿往外或往內擺，用於轉彎和保持平衡                │
+│    - 控制方式: 位置控制（告訴它擺到什麼角度）                  │
+│                                                                 │
+│ 3. 避震關節 (Damper)                                           │
+│    - 編號: 5, 8, 13, 25, 26, 27                                │
+│    - 功能: 吸收衝擊，保護機身（像汽車的避震器）                │
+│    - 控制方式: 被動式（不用控制，自動吸震）                    │
+└─────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -21,29 +53,56 @@ import math
 import torch
 from collections.abc import Sequence
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
-from isaaclab.envs import DirectRLEnv
-# ContactSensor 暫時禁用，等待 USD 檔案添加 contact reporter API
-# from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply_inverse, quat_apply, sample_uniform
-import isaaclab.utils.math as math_utils
+# =============================================================================
+# 【匯入模組說明】
+# =============================================================================
+# Isaac Lab 是 NVIDIA 開發的機器人模擬平台，以下是各模組的功能：
 
-# Visualization Markers for debug arrows
+import isaaclab.sim as sim_utils                    # 模擬工具（設定物理環境）
+from isaaclab.assets import Articulation            # 關節式機器人（有關節可動的機器人）
+from isaaclab.envs import DirectRLEnv               # 強化學習環境基礎類別
+# ContactSensor 暫時禁用，等待 USD 檔案添加 contact reporter API
+# from isaaclab.sensors import ContactSensor        # 接觸感測器（偵測碰撞）
+from isaaclab.utils.math import quat_apply_inverse, quat_apply, sample_uniform  # 數學工具
+import isaaclab.utils.math as math_utils           # 更多數學工具（四元數、旋轉等）
+
+# 可視化工具：用來在畫面上畫箭頭，顯示速度方向
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG, RED_ARROW_X_MARKER_CFG
 
+# 從同目錄匯入配置檔案（定義了機器人的各種參數）
 from .redrhex_env_cfg import RedrhexEnvCfg
 
 
 class RedrhexEnv(DirectRLEnv):
     """
-    RedRhex 六足機器人 RHex 風格運動環境
+    ==========================================================================
+    RedRhex 六足機器人強化學習環境
+    ==========================================================================
     
-    這個環境訓練機器人使用「旋轉步態」前進：
-    - 主驅動關節像輪子一樣連續旋轉
-    - Tripod A 和 Tripod B 以 180° 相位差交替
-    - ABAD 關節用於穩定性和轉向（由 RL 探索）
+    【這個類別是什麼？】
+    這是機器人的「訓練場」！它定義了：
+    1. 機器人能「看到」什麼（觀測空間）
+    2. 機器人能「做」什麼（動作空間）
+    3. 什麼是「好」的行為（獎勵函數）
+    4. 什麼時候「遊戲結束」（終止條件）
+    
+    【運動方式說明】
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ RHex 旋轉步態的工作原理：                                       │
+    │                                                                 │
+    │ 六隻腳分成兩組，交替運動：                                      │
+    │ • Tripod A（三角支撐組 A）：Leg 1, 4, 6 一起動                  │
+    │ • Tripod B（三角支撐組 B）：Leg 2, 3, 5 一起動                  │
+    │                                                                 │
+    │ 當 A 組的腳著地時，B 組的腳在空中旋轉（相位差 180°）           │
+    │ 這樣任何時刻都有三隻腳支撐，非常穩定！                          │
+    │                                                                 │
+    │ ABAD 關節的作用：                                               │
+    │ • 直走時：不需要動                                              │
+    │ • 轉彎時：調整腿的角度來改變方向                                │
+    │ • 側移時：讓腿往外擺，產生側向推力                              │
+    └─────────────────────────────────────────────────────────────────┘
     """
 
     cfg: RedrhexEnvCfg
@@ -84,8 +143,18 @@ class RedrhexEnv(DirectRLEnv):
                 print("[RedrhexEnv] 無 GUI 模式，跳過 debug visualization")
 
     def _setup_joint_indices(self):
-        """設置關節索引映射"""
-        # 獲取所有關節名稱
+        """
+        【設置關節索引映射】
+        
+        這個函數的目的：找出每個關節在「關節列表」中的位置（索引）
+        
+        為什麼需要索引？
+        想像機器人有 18 個關節，程式需要知道「主驅動關節」是第幾個，
+        才能正確地讀取它的狀態或發送控制命令。
+        
+        比喻：就像點名簿，我們需要知道「小明」是第幾號，才能找到他的資料。
+        """
+        # 獲取所有關節名稱（像是拿到一份點名簿）
         joint_names = self.robot.data.joint_names
         
         # 主驅動關節索引
@@ -143,21 +212,40 @@ class RedrhexEnv(DirectRLEnv):
         print(f"[Tripod B] indices: {self._tripod_b_indices.tolist()} (joints 7, 12, 23)")
 
     def _setup_buffers(self):
-        """設置內部緩衝區"""
-        # 關節狀態
-        self.joint_pos = self.robot.data.joint_pos.clone()
+        """
+        【設置內部緩衝區】
+        
+        緩衝區（Buffer）= 用來暫時存放資料的「記憶空間」
+        
+        為什麼需要緩衝區？
+        1. 儲存機器人的當前狀態（位置、速度等）
+        2. 記住上一次的動作（讓動作更平滑）
+        3. 追蹤各種獎勵的累積值（用於訓練分析）
+        
+        這就像是機器人的「短期記憶」，讓它知道自己現在是什麼狀態。
+        """
+        # 關節位置和速度（機器人現在各個關節的狀態）
+        self.joint_pos = self.robot.data.joint_pos.clone()  # clone() = 複製一份
         self.joint_vel = self.robot.data.joint_vel.clone()
         
-        # 動作緩衝 (12 維: 6 main_drive + 6 ABAD)
+        # =================================================================
+        # 動作緩衝區（儲存 AI 輸出的控制指令）
+        # =================================================================
+        # actions 是 AI 神經網路輸出的動作，總共 12 個數值：
+        # - 前 6 個: 控制 6 個主驅動關節的旋轉速度
+        # - 後 6 個: 控制 6 個 ABAD 關節的位置
         self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        # last_actions = 上一次的動作（用來計算動作變化率，讓動作更平滑）
         self.last_actions = torch.zeros_like(self.actions)
         
-        # 主驅動上一次速度 (用於計算加速度)
+        # 主驅動關節上一次的速度（用來計算加速度，避免動作太劇烈）
         self.last_main_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
 
-        # 避震關節的初始位置（從 config 中讀取）
-        # 這些關節需要保持在初始角度，不能被拉直
-        # 順序要匹配 damper_joint_names: ["Revolute_5", "Revolute_13", "Revolute_25", "Revolute_26", "Revolute_27", "Revolute_8"]
+        # =================================================================
+        # 避震關節的初始位置
+        # =================================================================
+        # 避震關節不被 AI 控制，需要保持在初始角度
+        # 這就像汽車的避震器，你不需要操控它，它自己會吸收震動
         damper_init_angles = []
         for joint_name in self.cfg.damper_joint_names:
             angle = self.cfg.robot_cfg.init_state.joint_pos.get(joint_name, 0.0)
@@ -165,12 +253,22 @@ class RedrhexEnv(DirectRLEnv):
         self._damper_initial_pos = torch.tensor(damper_init_angles, device=self.device).unsqueeze(0)
         print(f"[避震關節初始角度] {[f'{a*180/3.14159:.1f}°' for a in damper_init_angles]}")
 
-        # 基座狀態
+        # =================================================================
+        # 機身狀態緩衝區
+        # =================================================================
+        # base_lin_vel = 機身的線速度（移動速度），3 維向量 [vx, vy, vz]
+        #   vx = 前後速度，vy = 左右速度，vz = 上下速度
         self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # base_ang_vel = 機身的角速度（旋轉速度），3 維向量 [wx, wy, wz]
+        #   wx = 繞 X 軸旋轉（側滾），wy = 繞 Y 軸旋轉（俯仰），wz = 繞 Z 軸旋轉（偏航）
         self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # projected_gravity = 投影重力方向
+        # 用來判斷機器人有沒有傾斜（如果傾斜，重力方向就不是正下方）
         self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # 計算初始參考重力方向
+        # 計算初始狀態下的參考重力方向（用來比較現在傾斜了多少）
         init_rot = self.cfg.robot_cfg.init_state.rot
         init_quat = torch.tensor(
             [init_rot[0], init_rot[1], init_rot[2], init_rot[3]],
@@ -179,7 +277,15 @@ class RedrhexEnv(DirectRLEnv):
         gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(self.num_envs, 3)
         self.reference_projected_gravity = quat_apply_inverse(init_quat, gravity_vec)
 
-        # 獎勵追蹤 - 追蹤所有獎勵分量以便在 TensorBoard 中查看
+        # =================================================================
+        # 獎勵追蹤緩衝區（用於訓練監控和分析）
+        # =================================================================
+        # TensorBoard 是一個視覺化工具，可以畫出訓練過程中各種數值的變化曲線
+        # 這裡追蹤各種獎勵和診斷數據，方便我們了解機器人學得怎麼樣
+        # 
+        # 命名規則：
+        # - rew_xxx = 獎勵項目（正值是獎勵，負值是懲罰）
+        # - diag_xxx = 診斷數據（不是獎勵，只是用來觀察的）
         self.episode_sums = {
             # 核心獎勵
             "rew_alive": torch.zeros(self.num_envs, device=self.device),
@@ -230,8 +336,24 @@ class RedrhexEnv(DirectRLEnv):
         self._target_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
 
     def _setup_commands(self):
-        """設置多方向速度命令系統"""
-        # 速度命令 [vx, vy, wz]
+        """
+        【設置速度命令系統】
+        
+        這個系統負責「告訴機器人要往哪裡走」。
+        
+        訓練過程中，系統會隨機給機器人不同的移動命令：
+        - 「往前走」
+        - 「往左走」
+        - 「原地轉圈」
+        - 等等...
+        
+        機器人必須學會「聽命令」，這樣訓練完成後，
+        我們才能用命令控制機器人去任何地方！
+        """
+        # 速度命令向量 [vx, vy, wz]：
+        # - vx = 前後速度（正值向前，負值向後）
+        # - vy = 左右速度（正值向左，負值向右）
+        # - wz = 旋轉速度（正值逆時針，負值順時針）
         self.commands = torch.zeros(self.num_envs, 3, device=self.device)
         
         # 命令切換計時器
@@ -265,7 +387,18 @@ class RedrhexEnv(DirectRLEnv):
         self._resample_commands(torch.arange(self.num_envs, device=self.device))
 
     def _resample_commands(self, env_ids: torch.Tensor):
-        """重新採樣速度命令"""
+        """
+        【重新採樣速度命令】
+        
+        功能：隨機給指定的環境一個新的移動命令
+        
+        參數：
+            env_ids: 需要更換命令的環境編號列表
+            （訓練時會同時跑很多個環境，每個環境有自己的編號）
+        
+        這就像教練隨機喊口令：「往前跑！」「往左移！」「原地轉！」
+        機器人必須學會正確執行每個口令。
+        """
         if len(env_ids) == 0:
             return
             
@@ -319,24 +452,50 @@ class RedrhexEnv(DirectRLEnv):
             self._resample_commands(resample_ids)
 
     def _setup_gait(self):
-        """設置步態相位"""
-        # 全局步態相位計數器
+        """
+        【設置步態相位】
+        
+        什麼是「相位」？
+        想像六隻腳是六個時鐘的秒針，都在轉圈：
+        - 「相位」就是秒針現在指向幾點鐘的位置
+        - 「相位 0」= 12 點鐘方向
+        - 「相位 π」= 6 點鐘方向（相差 180 度）
+        
+        為什麼需要相位？
+        交替三足步態要求：
+        - Tripod A 的三隻腳同步（相位都是 0）
+        - Tripod B 的三隻腳同步（相位都是 π）
+        - A 和 B 剛好相反（一組著地時，另一組在空中）
+        """
+        # 全局步態相位計數器（像一個主時鐘，從 0 到 2π 循環）
         self.gait_phase = torch.zeros(self.num_envs, device=self.device)
         
-        # 每條腿的目標相位偏移
-        # Tripod A (legs 0, 3, 5): 相位 0
-        # Tripod B (legs 1, 2, 4): 相位 π
+        # 每條腿相對於主時鐘的偏移量
+        # Tripod A (腿 0, 3, 5): 跟著主時鐘走（偏移 0）
+        # Tripod B (腿 1, 2, 4): 比主時鐘慢半圈（偏移 π = 180°）
         self.leg_phase_offsets = torch.zeros(6, device=self.device)
         self.leg_phase_offsets[self._tripod_a_indices] = 0.0
         self.leg_phase_offsets[self._tripod_b_indices] = math.pi
 
     def _setup_scene(self):
-        """設置模擬場景"""
+        """
+        【設置模擬場景】
+        
+        這個函數創建虛擬世界中的所有東西：
+        1. 機器人本身
+        2. 地面
+        3. 燈光
+        4. 感測器（目前禁用）
+        
+        就像在遊戲裡「生成」角色和地圖一樣！
+        """
+        # 創建機器人並加入場景
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
         
-        # 注意：ContactSensor 暫時禁用，因為 USD 檔案缺少 contact reporter API
-        # 用高度和姿態檢測來代替
+        # 注意：ContactSensor（接觸感測器）暫時禁用
+        # 原本用來偵測「機器人有沒有碰到東西」
+        # 但 USD 模型檔案還沒設定好，所以改用高度和姿態來判斷
         # self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         # self.scene.sensors["contact_sensor"] = self._contact_sensor
 
@@ -387,80 +546,154 @@ class RedrhexEnv(DirectRLEnv):
         print("=" * 70 + "\n")
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """物理步之前處理動作"""
-        self.last_actions = self.actions.clone()
-        self.actions = actions.clone().clamp(-1.0, 1.0)
+        """
+        【物理模擬前的準備工作】
+        
+        這個函數在每次物理計算之前被呼叫。
+        
+        做兩件事：
+        1. 記住上一次的動作（之後用來計算「動作變化率」）
+        2. 接收新的動作，並確保數值在合理範圍內 [-1, 1]
+        
+        為什麼要 clamp（限制範圍）？
+        神經網路有時候會輸出很大或很小的數值，
+        限制在 [-1, 1] 可以防止失控。
+        """
+        self.last_actions = self.actions.clone()           # 記住舊動作
+        self.actions = actions.clone().clamp(-1.0, 1.0)    # 接收並限制新動作
 
     def _apply_action(self) -> None:
         """
-        將動作應用到機器人關節
+        【將 AI 的動作指令轉換成實際的關節控制】
         
-        動作格式 (12 維):
-        - [0:6]: 主驅動目標角速度 (相對於基礎速度的調整)
-        - [6:12]: ABAD 目標位置
+        這是控制機器人運動的核心函數！
         
-        注意：左右側腿需要相反的旋轉方向才能前進！
-        - 右側 (Legs 1,2,3): 負向旋轉
-        - 左側 (Legs 4,5,6): 正向旋轉
+        AI 輸出的動作是 12 個數字（範圍 -1 到 +1）：
+        ┌──────────────────────────────────────────────────────────┐
+        │ 動作 [0:6]  → 控制 6 個主驅動關節的旋轉速度             │
+        │              （數字越大，腿轉得越快）                   │
+        │                                                          │
+        │ 動作 [6:12] → 控制 6 個 ABAD 關節的角度位置             │
+        │              （數字越大，腿往外擺越多）                 │
+        └──────────────────────────────────────────────────────────┘
+        
+        【重要概念：左右腿的旋轉方向】
+        想像你站在機器人上方往下看：
+        - 右側的腿要「逆時針」轉，才能把機器人往前推
+        - 左側的腿要「順時針」轉，才能把機器人往前推
+        - 所以同樣的「前進」命令，左右腿的旋轉方向是相反的！
+        
+            前方 →
+           ↺ ↻     （左右腿轉向相反）
+           ↺ ↻
+           ↺ ↻
         """
-        # ===== 主驅動關節：速度控制 =====
-        # 動作 [-1, 1] 映射到速度調整
+        # =====================================================================
+        # 主驅動關節控制：速度控制模式
+        # =====================================================================
+        # 取出動作向量的前 6 個數值（控制 6 個主驅動關節）
         drive_actions = self.actions[:, :6]
         
-        # 基礎速度
+        # 基礎旋轉速度（弧度/秒）
+        # 6.28 rad/s ≈ 每秒轉 1 圈（因為 2π ≈ 6.28）
         base_vel = self.cfg.base_gait_angular_vel  # 6.28 rad/s
         
-        # ★★★ 重新設計動作解釋 ★★★
-        # 動作應該只調整速度大小，不能完全停止腿！
-        # 動作 -1 → 最低速度 (base_vel * 0.5)
-        # 動作  0 → 基礎速度 (base_vel)
-        # 動作 +1 → 最高速度 (base_vel * 1.5)
-        # 這樣腿永遠在轉，RL 只能調整快慢
-        speed_scale = 1.0 + drive_actions * 0.5  # [0.5, 1.5]
-        target_speed = base_vel * speed_scale  # [3.14, 9.42] rad/s
+        # 【動作到速度的轉換邏輯】
+        # 
+        # 設計原則：腿不能完全停下來！
+        # 因為 RHex 的運動原理就是靠腿持續旋轉，停下來就不能動了。
+        # 
+        # 轉換規則：
+        # • 動作 = -1 → 速度 = 基礎速度 × 0.5（最慢，但還是在轉）
+        # • 動作 =  0 → 速度 = 基礎速度 × 1.0（正常速度）
+        # • 動作 = +1 → 速度 = 基礎速度 × 1.5（最快）
+        # 
+        # 這樣 AI 只能調整「轉多快」，不能讓腿停下來偷懶
+        speed_scale = 1.0 + drive_actions * 0.5  # 範圍 [0.5, 1.5]
+        target_speed = base_vel * speed_scale    # 範圍 [3.14, 9.42] rad/s
         
-        # 應用方向乘數
-        # 右側 (idx 0,1,2) → -1, 左側 (idx 3,4,5) → +1
+        # 【應用方向乘數：讓左右腿往正確的方向轉】
+        # 右側腿（索引 0,1,2）乘以 -1 → 逆時針轉
+        # 左側腿（索引 3,4,5）乘以 +1 → 順時針轉
         target_drive_vel = target_speed * self._direction_multiplier
         
-        # 限制速度範圍
+        # 安全限制：防止速度過快（最大 15 rad/s ≈ 每秒 2.4 圈）
         target_drive_vel = torch.clamp(target_drive_vel, min=-15.0, max=15.0)
         
-        # 保存目標速度用於診斷
+        # 保存目標速度（之後用來計算「目標 vs 實際」的差距）
         self._target_drive_vel = target_drive_vel.clone()
         
-        # 應用速度目標到主驅動關節
-        # 注意：當指定 joint_ids 時，target 的形狀應該是 [num_envs, len(joint_ids)]
+        # 【發送速度指令給主驅動關節】
+        # set_joint_velocity_target = 告訴關節「請以這個速度旋轉」
+        # 模擬器會嘗試讓關節達到這個速度（但可能因為負載而達不到）
         self.robot.set_joint_velocity_target(target_drive_vel, joint_ids=self._main_drive_indices)
         
-        # ===== ABAD 關節：位置控制 =====
+        # =====================================================================
+        # ABAD 關節控制：位置控制模式
+        # =====================================================================
+        # 取出動作向量的後 6 個數值（控制 6 個 ABAD 關節）
         abad_actions = self.actions[:, 6:12]
+        
+        # 將動作值轉換成實際角度
+        # 動作範圍 [-1, 1]，乘以 scale 後變成實際角度（弧度）
         target_abad_pos = abad_actions * self.cfg.abad_pos_scale
         
-        # 限制位置範圍
+        # 安全限制：最大擺動角度 ±0.5 弧度（約 ±29 度）
         target_abad_pos = torch.clamp(target_abad_pos, min=-0.5, max=0.5)
         
-        # 應用位置目標到 ABAD 關節
+        # 【發送位置指令給 ABAD 關節】
+        # set_joint_position_target = 告訴關節「請移動到這個角度」
         self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
         
-        # ===== 避震關節：保持在初始角度 =====
-        # 重要：ImplicitActuator 的 stiffness 會把關節拉向位置目標
-        # 如果不設置目標，默認是 0（拉直），這是錯誤的！
-        # 必須設置位置目標為初始角度，讓關節保持形狀
+        # =====================================================================
+        # 避震關節控制：保持固定（被動式）
+        # =====================================================================
+        # 避震關節不被 AI 控制，但我們仍然要告訴它「保持在初始位置」
+        # 
+        # 為什麼？
+        # 模擬器使用「彈簧」來控制關節位置。如果不設定目標，
+        # 彈簧會把關節拉到 0 度（拉直），這樣腿的形狀就壞掉了！
+        # 所以我們要持續告訴它「請保持初始角度」。
         self.robot.set_joint_position_target(
             self._damper_initial_pos.expand(self.num_envs, -1), 
             joint_ids=self._damper_indices
         )
 
     def _get_observations(self) -> dict:
-        """計算觀測"""
+        """
+        【計算觀測值】
+        
+        觀測值 = 機器人能「感知」到的所有資訊
+        
+        這就像機器人的「眼睛」和「感覺」：
+        - 它知道自己在動還是靜止（速度）
+        - 它知道自己有沒有傾斜（重力方向）
+        - 它知道腿現在轉到哪裡（關節位置）
+        - 它知道上一次做了什麼動作（用於預測）
+        
+        AI 神經網路會根據這些觀測值，決定下一步要怎麼做。
+        
+        返回：
+            dict: 包含 "policy" 鍵的字典，值是觀測向量
+        """
+        # 先更新內部狀態（從模擬器讀取最新數據）
         self._update_state()
 
-        # 主驅動關節狀態
+        # 讀取主驅動關節的位置和速度
         main_drive_pos = self.joint_pos[:, self._main_drive_indices]
         main_drive_vel = self.joint_vel[:, self._main_drive_indices]
         
-        # 用 sin/cos 表示主驅動位置（因為是循環的）
+        # 【為什麼用 sin/cos 表示旋轉位置？】
+        # 
+        # 問題：旋轉角度是「循環」的（0° = 360°）
+        # 如果直接用角度值，神經網路會以為 0° 和 359° 差很遠，
+        # 但其實它們只差 1°！
+        # 
+        # 解決方案：用 sin 和 cos 來表示
+        # • sin(0°) = 0, cos(0°) = 1
+        # • sin(359°) ≈ 0, cos(359°) ≈ 1  ← 很接近！
+        # 
+        # 這樣神經網路就能理解角度的「循環」性質了。
         main_drive_pos_sin = torch.sin(main_drive_pos)
         main_drive_pos_cos = torch.cos(main_drive_pos)
         
@@ -484,14 +717,19 @@ class RedrhexEnv(DirectRLEnv):
             self.last_actions,                              # (12)
         ], dim=-1)
 
-        # 噪聲
+        # 【添加觀測噪音】
+        # 為什麼要加噪音？模擬真實世界感測器的誤差！
+        # 這樣訓練出來的 AI 更能適應真實環境的不完美感測。
         if self.cfg.add_noise:
             noise = torch.randn_like(obs) * 0.01 * self.cfg.noise_level
             obs = obs + noise
 
-        # NaN/Inf 保護
+        # 【數值保護：防止異常值】
+        # nan = 「不是數字」（計算錯誤時會出現）
+        # inf = 「無限大」（除以零等情況會出現）
+        # 這些異常值會讓神經網路爆炸，所以要處理掉
         obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs = torch.clamp(obs, min=-100.0, max=100.0)
+        obs = torch.clamp(obs, min=-100.0, max=100.0)  # 限制在合理範圍
 
         return {"policy": obs}
 
@@ -530,92 +768,142 @@ class RedrhexEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        ===== RHex 機器人多方向速度追蹤 Reward（按照用戶需求重新設計）=====
+        =================================================================
+        【獎勵函數】強化學習的核心！！
+        =================================================================
         
-        【設計原則】
-        G1: 追蹤項（核心）- 線速度 + 角速度
-        G2: 姿態與穩定性 - 避免偏航亂翻、避免彈跳
-        G3: 身體觸地 - 必須強烈懲罰！！
-        G4: 能耗與動作平滑
-        G5: 步態相位結構 - 打擊六腿同相
-        G6: ABAD 使用策略 - 有 lateral/yaw 分量就鼓勵 ABAD
+        【什麼是獎勵函數？】
+        這是教機器人「什麼是對、什麼是錯」的方法。
         
-        【關節定義】
-        - 主驅動 (15,12,18,23,24,7): 360° 連續旋轉推進
-        - 避震 (5,13,25,26,27,8): 只吸震，不推進
-        - ABAD (14,11,17,22,21,6): 側向與穩定性輔助
+        想像你在訓練一隻小狗：
+        • 做對了 → 給零食（正獎勵）→ 小狗會多做這個動作
+        • 做錯了 → 扣分（負獎勵/懲罰）→ 小狗會避免這個動作
         
-        【Tripod 分組】
-        - Tripod A (同相): 15, 18, 24
-        - Tripod B (同相): 12, 23, 7
-        - A 與 B 相差 180°
+        機器人也是一樣！AI 會嘗試最大化「總獎勵」，
+        所以我們要仔細設計獎勵，讓機器人學會我們想要的行為。
+        
+        =================================================================
+        【獎勵設計總覽】
+        =================================================================
+        
+        ┌───────────────────────────────────────────────────────────────┐
+        │ G1: 速度追蹤獎勵 ⭐ 最重要！                                 │
+        │     → 跟著命令走就給獎勵（前進、側移、轉彎）                │
+        ├───────────────────────────────────────────────────────────────┤
+        │ G2: 姿態穩定性懲罰                                           │
+        │     → 傾斜、亂跳、亂晃就扣分                                │
+        ├───────────────────────────────────────────────────────────────┤
+        │ G3: 身體觸地懲罰 ⚠️ 超級重要！                               │
+        │     → 摔倒就大扣分（甚至直接結束）                          │
+        ├───────────────────────────────────────────────────────────────┤
+        │ G4: 能耗與平滑懲罰                                           │
+        │     → 浪費力氣、動作抖動就扣分                              │
+        ├───────────────────────────────────────────────────────────────┤
+        │ G5: 步態結構獎勵                                             │
+        │     → 六隻腳協調運動就給獎勵                                │
+        ├───────────────────────────────────────────────────────────────┤
+        │ G6: ABAD 使用獎勵                                            │
+        │     → 需要轉彎時用 ABAD 給獎勵，不需要時亂用就扣分         │
+        └───────────────────────────────────────────────────────────────┘
         """
-        # 初始化總獎勵
+        # 初始化總獎勵（所有環境都從 0 開始累加）
         total_reward = torch.zeros(self.num_envs, device=self.device)
-        dt = self.step_dt  # 時間步長
+        dt = self.step_dt  # 時間步長（用於把獎勵縮放到正確的量級）
 
-        # ===== 獲取狀態 =====
-        main_drive_vel = self.joint_vel[:, self._main_drive_indices]  # [N, 6]
-        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
-        abad_pos = self.joint_pos[:, self._abad_indices]  # [N, 6]
-        abad_vel = self.joint_vel[:, self._abad_indices]  # [N, 6]
+        # =================================================================
+        # 【獲取當前狀態】
+        # =================================================================
+        # 讀取各種關節和機身的狀態，用於計算獎勵
         
-        # 目標速度命令
-        cmd_vx = self.commands[:, 0]  # 目標前進速度
-        cmd_vy = self.commands[:, 1]  # 目標側向速度
-        cmd_wz = self.commands[:, 2]  # 目標旋轉速度
+        # 主驅動關節的速度和位置
+        main_drive_vel = self.joint_vel[:, self._main_drive_indices]  # 形狀 [環境數, 6]
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # 形狀 [環境數, 6]
         
-        # 實際速度（本體座標系）
-        actual_vx = self.base_lin_vel[:, 0]
-        actual_vy = self.base_lin_vel[:, 1]
-        actual_vz = self.base_lin_vel[:, 2]
-        actual_wz = self.base_ang_vel[:, 2]
+        # ABAD 關節的位置和速度
+        abad_pos = self.joint_pos[:, self._abad_indices]  # 形狀 [環境數, 6]
+        abad_vel = self.joint_vel[:, self._abad_indices]  # 形狀 [環境數, 6]
         
-        # 計算任務需求強度 S = α*|vy*| + β*|wz*|
+        # 【目標速度命令】（這是 AI 要追蹤的目標）
+        cmd_vx = self.commands[:, 0]  # 目標前進速度（正 = 前，負 = 後）
+        cmd_vy = self.commands[:, 1]  # 目標側向速度（正 = 左，負 = 右）
+        cmd_wz = self.commands[:, 2]  # 目標旋轉速度（正 = 逆時針，負 = 順時針）
+        
+        # 【實際速度】（機器人現在的速度）
+        # 注意：這是「本體座標系」，意思是從機器人自己的角度看
+        actual_vx = self.base_lin_vel[:, 0]  # 實際前後速度
+        actual_vy = self.base_lin_vel[:, 1]  # 實際左右速度
+        actual_vz = self.base_lin_vel[:, 2]  # 實際上下速度（理想情況應該 ≈ 0）
+        actual_wz = self.base_ang_vel[:, 2]  # 實際旋轉速度
+        
+        # 【任務需求強度 S】
+        # 這個數值表示「當前命令有多複雜」
+        # • 純直走：S ≈ 0（不需要側移或旋轉）
+        # • 側移 + 旋轉：S 很大（需要 ABAD 關節幫忙）
         S = torch.abs(cmd_vy) + 0.5 * torch.abs(cmd_wz)
-        S0 = 0.3  # 歸一化閾值
+        S0 = 0.3  # 歸一化閾值（超過這個值就算「複雜任務」）
 
-        # ========================================================
-        # G1: 追蹤項（核心）- 參考 anymal_c 的 exp 映射
-        # ========================================================
+        # =================================================================
+        # G1: 速度追蹤獎勵（核心獎勵！）
+        # =================================================================
+        # 目標：讓機器人學會「聽命令」
+        # 方法：命令速度和實際速度越接近，獎勵越高
+        # 
+        # 使用 exp（指數函數）映射的好處：
+        # • 誤差 = 0 時，獎勵 = 1（完美！）
+        # • 誤差越大，獎勵快速下降趨近 0
+        # 這樣可以讓 AI 很清楚地知道「越準確越好」
         
-        # G1.1 線速度 XY 追蹤: r_vel = exp(-|e_v|^2 / 0.25)
+        # G1.1 線速度追蹤（前後 + 左右）
+        # 計算 XY 方向的速度誤差平方和
         lin_vel_error = torch.sum(
             torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
         )
+        # 公式：獎勵 = exp(-誤差² / 0.25)
+        # 當誤差 = 0 時，獎勵 = 1
+        # 當誤差 = 0.5 時，獎勵 ≈ 0.37
         lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
         rew_track_lin_vel = lin_vel_error_mapped * self.cfg.rew_scale_track_lin_vel * dt
         total_reward += rew_track_lin_vel
         
-        # G1.2 角速度 Z 追蹤: r_yaw = exp(-|e_w|^2 / 0.25)
+        # G1.2 角速度追蹤（旋轉）
+        # 計算旋轉速度的誤差
         yaw_rate_error = torch.square(cmd_wz - actual_wz)
         yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
         rew_track_ang_vel = yaw_rate_error_mapped * self.cfg.rew_scale_track_ang_vel * dt
         total_reward += rew_track_ang_vel
 
-        # ========================================================
-        # G2: 姿態與穩定性（避免偏航亂翻、避免彈跳）
-        # ========================================================
+        # =================================================================
+        # G2: 姿態與穩定性懲罰
+        # =================================================================
+        # 目標：讓機器人保持平穩，不要亂翻、亂跳、亂晃
+        # 
+        # 這些都是「懲罰」（負值），所以越少越好！
         
-        # G2.1 俯仰/側滾穩定: r_upright = -(p^2 + r^2)
-        # projected_gravity 的 xy 分量反映 roll/pitch
+        # G2.1 直立性懲罰（不要傾斜）
+        # 原理：如果機器人完全直立，重力方向 = [0, 0, -1]
+        #       projected_gravity 的 xy 分量 = [0, 0]（都是 0）
+        #       如果傾斜了，xy 分量就會變大
+        # 所以：xy 分量越大 = 傾斜越多 = 懲罰越重
         flat_orientation = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
         rew_upright = flat_orientation * self.cfg.rew_scale_upright * dt
         total_reward += rew_upright
         
-        # G2.2 垂直彈跳抑制: r_smooth = -vz^2
+        # G2.2 垂直彈跳懲罰（不要亂跳）
+        # 機器人應該平穩移動，上下速度（vz）應該接近 0
         z_vel_error = torch.square(actual_vz)
         rew_z_vel = z_vel_error * self.cfg.rew_scale_z_vel * dt
         total_reward += rew_z_vel
         
-        # G2.3 xy 角速度懲罰
+        # G2.3 XY 軸角速度懲罰（不要翻滾）
+        # 機器人不應該繞 X 軸或 Y 軸旋轉（那是翻滾），只允許繞 Z 軸旋轉（正常轉彎）
         ang_vel_xy_error = torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
         rew_ang_vel_xy = ang_vel_xy_error * self.cfg.rew_scale_ang_vel_xy * dt
         total_reward += rew_ang_vel_xy
         
-        # G2.4 高度保持
-        base_height = self.robot.data.root_pos_w[:, 2]
-        target_height = 0.12
+        # G2.4 高度維持懲罰（保持正常站立高度）
+        # 正常站立高度約 0.12 公尺，偏離太多就扣分
+        base_height = self.robot.data.root_pos_w[:, 2]  # 機身離地面的高度
+        target_height = 0.12  # 目標高度 12 公分
         height_error = torch.square(base_height - target_height)
         rew_base_height = height_error * self.cfg.rew_scale_base_height * dt
         total_reward += rew_base_height
@@ -631,117 +919,173 @@ class RedrhexEnv(DirectRLEnv):
         rew_unwanted_yaw = -unwanted_yaw * 2.0 * dt
         total_reward += rew_unwanted_yaw
 
-        # ========================================================
-        # G3: 身體觸地（必須強烈！！）- 用高度/姿態檢測代替 ContactSensor
-        # ========================================================
-        
-        # ★★★ 重要：RHex 正常站立高度只有約 1.6cm！★★★
-        # 基於高度的"觸地"檢測對 RHex 不適用
-        # ★★★ 身體觸地檢測（高度 + 傾斜）★★★
-        # 注意：機器人初始姿態是繞 X 軸旋轉 90°，所以不能假設 projected_gravity = [0,0,-1]
-        # 必須使用 reference_projected_gravity 做相對比較
+        # =================================================================
+        # G3: 身體觸地懲罰（超級重要！！）
+        # =================================================================
+        # 目標：防止機器人「摔倒」或「翻車」
+        # 
+        # 什麼是「身體觸地」？
+        # • 機身（不是腿）碰到地面 = 摔倒了！
+        # • 這是非常糟糕的情況，要大力懲罰
+        # 
+        # 檢測方法（因為沒有接觸感測器，用間接方式判斷）：
+        # 1. 高度太低 → 可能趴在地上
+        # 2. 傾斜太大 → 可能翻倒了
         body_height = base_height
         
-        # 傾斜程度 = 1 - 當前重力與參考重力的點積
-        # 點積 = 1 表示完全對齊（0° 傾斜）
-        # 點積 = 0 表示垂直（90° 傾斜）
-        # 點積 = -1 表示完全翻轉（180° 傾斜）
+        # 【計算傾斜程度】
+        # 方法：比較「現在的重力方向」和「正常站立時的重力方向」
+        # 使用「點積」（Dot Product）來計算相似度：
+        # • 點積 = 1  → 完全對齊（0° 傾斜，完美！）
+        # • 點積 = 0  → 垂直（90° 傾斜，快翻了！）
+        # • 點積 = -1 → 完全相反（180° 傾斜，完全翻過來了！）
         gravity_alignment = torch.sum(
             self.projected_gravity * self.reference_projected_gravity, dim=1
-        )  # [-1, 1]
+        )  # 範圍 [-1, 1]
         
-        # 傾斜程度: 0 = 完全對齊, 1 = 90°, 2 = 180°
-        body_tilt = 1.0 - gravity_alignment  # [0, 2]
+        # 轉換成「傾斜程度」：
+        # • body_tilt = 0 → 完全對齊（沒傾斜）
+        # • body_tilt = 1 → 傾斜 90 度
+        # • body_tilt = 2 → 翻轉 180 度
+        body_tilt = 1.0 - gravity_alignment  # 範圍 [0, 2]
         
-        # 身體觸地條件：
-        # 1. 高度過低（< 0.01m，正常站立約 0.12m）- 身體趴地
-        # 2. 傾斜過大（> 0.5，表示傾斜超過約 60°）- 側翻或前後翻
+        # 【判斷「身體觸地」的條件】
+        # 滿足任一條件就視為摔倒：
+        # 
+        # 條件 1：高度太低（< 0.01 公尺 = 1 公分）
+        #         正常站立高度約 12 公分，低於 1 公分肯定是趴著了
         height_threshold = getattr(self.cfg, 'body_contact_height_threshold', 0.01)
         height_contact = body_height < height_threshold
-        severe_tilt = body_tilt > 0.5  # cos(60°) = 0.5, 所以 1 - 0.5 = 0.5
-        body_contact = height_contact | severe_tilt  # 任一條件都算觸地
         
-        # 身體觸地懲罰（即使不終止也要懲罰）
+        # 條件 2：傾斜太大（超過約 60 度）
+        #         body_tilt > 0.5 對應 cos(60°) = 0.5，即傾斜超過 60 度
+        severe_tilt = body_tilt > 0.5
+        
+        # 任一條件成立 = 身體觸地！
+        body_contact = height_contact | severe_tilt
+        
+        # 【身體觸地懲罰】超大懲罰！摔倒是很嚴重的錯誤
         rew_body_contact = body_contact.float() * self.cfg.rew_scale_body_contact * dt
         total_reward += rew_body_contact
         
-        # 連續傾斜懲罰：傾斜越大懲罰越大（鼓勵保持平衡）
-        # body_tilt 範圍 [0, 2]，0.2 約等於 25° 傾斜
-        tilt_penalty = torch.clamp(body_tilt - 0.2, min=0.0) * 5.0  # 傾斜超過 25° 開始懲罰
+        # 【連續傾斜懲罰】傾斜越多扣分越多（鼓勵保持平衡）
+        # 傾斜小於 25 度：沒事
+        # 傾斜超過 25 度：開始扣分，越斜扣越多
+        tilt_penalty = torch.clamp(body_tilt - 0.2, min=0.0) * 5.0
         total_reward -= tilt_penalty * dt
         
         # 記錄用於終止條件
         self._body_contact = body_contact
         self._body_tilt = body_tilt  # 保存用於 _get_dones
 
-        # ========================================================
-        # G4: 能耗與動作平滑
-        # ========================================================
+        # =================================================================
+        # G4: 能耗與動作平滑懲罰
+        # =================================================================
+        # 目標：讓機器人的動作更省力、更平順
+        # 
+        # 為什麼這很重要？
+        # 1. 省電：真實機器人電池有限，不能浪費
+        # 2. 保護硬體：劇烈動作會損壞馬達和關節
+        # 3. 看起來更自然：平滑的動作比抖動好看
         
-        # G4.1 力矩懲罰（如果有）
+        # G4.1 力矩懲罰（不要用太大力）
+        # 馬達出力越大，耗電越多，所以要懲罰大力矩
         if hasattr(self.robot.data, 'applied_torque'):
             joint_torques = torch.sum(torch.square(self.robot.data.applied_torque), dim=1)
             rew_torque = joint_torques * self.cfg.rew_scale_torque * dt
             total_reward += rew_torque
         
-        # G4.2 動作變化率懲罰
+        # G4.2 動作變化率懲罰（不要抖動）
+        # 比較這次動作和上次動作，變化越大懲罰越重
+        # 這樣可以讓動作更平滑，不會忽大忽小
         action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         rew_action_rate = action_rate * self.cfg.rew_scale_action_rate * dt
         total_reward += rew_action_rate
         
-        # G4.3 關節加速度懲罰
+        # G4.3 關節加速度懲罰（不要急加速）
+        # 加速度太大 = 動作太劇烈，對機械結構不好
         if hasattr(self.robot.data, 'joint_acc'):
             joint_accel = torch.sum(torch.square(self.robot.data.joint_acc), dim=1)
             rew_joint_acc = joint_accel * self.cfg.rew_scale_joint_acc * dt
             total_reward += rew_joint_acc
 
-        # ========================================================
-        # G5: 步態相位結構（打擊六腿同相！）
-        # ========================================================
+        # =================================================================
+        # G5: 步態結構獎勵（讓六隻腳協調運動！）
+        # =================================================================
+        # 目標：確保交替三足步態正確執行
+        # 
+        # 【正確的步態是什麼樣的？】
+        # • Tripod A 的三隻腳要「同步」（一起著地、一起離地）
+        # • Tripod B 的三隻腳也要「同步」
+        # • A 和 B 要「反相」（A 著地時 B 在空中，反過來也是）
+        # 
+        # 【錯誤的步態會怎樣？】
+        # 如果六隻腳都同相（一起著地、一起離地）：
+        # → 機器人會「跳」而不是「走」，非常不穩定！
         
-        # 計算主髖 joint 的相位
+        # 計算每隻腿的「相位」（現在轉到哪裡了）
         effective_pos = main_drive_pos * self._direction_multiplier
-        leg_phase = torch.remainder(effective_pos, 2 * math.pi)
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)  # 限制在 [0, 2π]
         
-        phase_a = leg_phase[:, self._tripod_a_indices]  # Tripod A: idx 0,3,5
-        phase_b = leg_phase[:, self._tripod_b_indices]  # Tripod B: idx 1,2,4
+        # 分開兩組的相位
+        phase_a = leg_phase[:, self._tripod_a_indices]  # Tripod A: 腿 0, 3, 5
+        phase_b = leg_phase[:, self._tripod_b_indices]  # Tripod B: 腿 1, 2, 4
         
-        # G5.1 組內一致性（鼓勵 A 組內三腿同相、B 組內三腿同相）
-        # 使用相位向量的長度來衡量一致性（越接近 1 越一致）
+        # G5.1 組內一致性獎勵（同組的腳要同步）
+        # 使用「相位一致性」(Coherence) 來衡量：
+        # • 如果三隻腳相位完全一樣，coherence = 1（完美同步）
+        # • 如果三隻腳相位散亂，coherence ≈ 0（不同步）
         def phase_coherence(phases):
+            # 把相位轉成單位圓上的點，取平均，計算長度
             sin_mean = torch.sin(phases).mean(dim=1)
             cos_mean = torch.cos(phases).mean(dim=1)
             return torch.sqrt(sin_mean**2 + cos_mean**2)
         
-        coherence_a = phase_coherence(phase_a)
-        coherence_b = phase_coherence(phase_b)
+        # 計算兩組的一致性分數
+        coherence_a = phase_coherence(phase_a)  # A 組的同步程度
+        coherence_b = phase_coherence(phase_b)  # B 組的同步程度
+        # 兩組都同步 = 給獎勵
         rew_tripod_sync = (coherence_a + coherence_b) * self.cfg.rew_scale_tripod_sync * dt
         total_reward += rew_tripod_sync
         
-        # G5.2 組間反相（鼓勵 A 與 B 相差 π）
+        # G5.2 組間反相獎勵（A 和 B 要交替）
+        # 計算兩組的平均相位
         mean_phase_a = torch.atan2(torch.sin(phase_a).mean(dim=1), torch.cos(phase_a).mean(dim=1))
         mean_phase_b = torch.atan2(torch.sin(phase_b).mean(dim=1), torch.cos(phase_b).mean(dim=1))
+        
+        # 計算相位差（應該接近 π = 180 度）
         phase_diff = torch.abs(mean_phase_a - mean_phase_b)
-        phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)  # wrap to [0, π]
-        phase_diff_error = torch.abs(phase_diff - math.pi)  # 與 π 的差距
+        phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)  # 處理循環（0° 和 360° 是一樣的）
+        
+        # 相位差與 π 的差距越小，獎勵越高
+        phase_diff_error = torch.abs(phase_diff - math.pi)
         rew_antiphase = torch.exp(-phase_diff_error) * self.cfg.rew_scale_tripod_antiphase * dt
         total_reward += rew_antiphase
 
-        # ========================================================
-        # G6: ABAD 使用策略（重點：有 lateral/yaw 分量就鼓勵）
-        # ========================================================
+        # =================================================================
+        # G6: ABAD 使用策略獎勵
+        # =================================================================
+        # ABAD 關節的作用：幫助機器人側移和轉彎
+        # 
+        # 【設計原則】
+        # • 需要時用（側移、轉彎）→ 給獎勵
+        # • 不需要時亂用（直走時亂擺）→ 給懲罰
+        # 
+        # 這樣 AI 會學會「在對的時機用 ABAD」
         
-        # ABAD 使用量
-        U_abad = torch.sum(torch.square(abad_vel), dim=1)  # 使用角速度作為使用量
-        abad_magnitude = torch.abs(abad_pos).mean(dim=1)
+        # 計算 ABAD 的「使用量」（關節動得多不多）
+        U_abad = torch.sum(torch.square(abad_vel), dim=1)  # 用速度平方和表示
+        abad_magnitude = torch.abs(abad_pos).mean(dim=1)   # 用位置絕對值表示
         
-        # G6.1 需要時鼓勵使用 ABAD
-        # r_abad_use = +w * S * tanh(c * U_abad)
+        # G6.1 聰明使用獎勵（需要側移/轉彎時用 ABAD）
+        # S 代表「任務複雜度」，S 越大 = 越需要 ABAD
+        # 當 S 大且 ABAD 有在用 → 給獎勵
         rew_abad_smart = S * torch.tanh(0.5 * U_abad) * self.cfg.rew_scale_abad_smart_use * dt
         total_reward += rew_abad_smart
         
-        # G6.2 不需要時抑制 ABAD 亂動
-        # p_abad_waste = -w * (1 - clamp(S/S0)) * U_abad
+        # G6.2 浪費懲罰（不需要時亂用 ABAD）
+        # 當 S 小（直走）但 ABAD 亂動 → 給懲罰
+        # waste_factor：S 越小，waste_factor 越接近 1（懲罰越重）
         waste_factor = 1.0 - torch.clamp(S / S0, max=1.0)
         rew_abad_waste = waste_factor * U_abad * self.cfg.rew_scale_abad_waste * dt
         total_reward += rew_abad_waste
@@ -761,24 +1105,32 @@ class RedrhexEnv(DirectRLEnv):
         rew_alive = torch.ones(self.num_envs, device=self.device) * self.cfg.rew_scale_alive * dt
         total_reward += rew_alive
 
-        # ========================================================
-        # ★★★ 新增：靜止懲罰（打擊躺平策略！）★★★
-        # ========================================================
-        # 當命令要求移動但機器人幾乎不動時，給予懲罰
-        cmd_speed = torch.sqrt(cmd_vx**2 + cmd_vy**2 + 0.1 * cmd_wz**2)  # 命令速度
-        actual_speed = torch.sqrt(actual_vx**2 + actual_vy**2)  # 實際速度
+        # =================================================================
+        # 靜止懲罰（防止 AI 學會「躺平」！）
+        # =================================================================
+        # 問題：如果沒有這個懲罰，AI 可能會學到一個偷懶策略：
+        #       「只要我不動，就不會摔倒，也不會被扣太多分」
+        # 
+        # 解決：命令要你動，你不動 → 大扣分！
         
-        # 如果命令速度 > 0.1 但實際速度 < 0.05，懲罰
+        # 計算命令要求的速度（綜合考慮前後、左右、旋轉）
+        cmd_speed = torch.sqrt(cmd_vx**2 + cmd_vy**2 + 0.1 * cmd_wz**2)
+        # 計算機器人實際移動速度
+        actual_speed = torch.sqrt(actual_vx**2 + actual_vy**2)
+        
+        # 判斷「該動卻不動」的情況：
+        # • 命令速度 > 0.1（要你動）
+        # • 實際速度 < 0.05（但你幾乎不動）
         not_moving = (cmd_speed > 0.1) & (actual_speed < 0.05)
         rew_stationary_penalty = not_moving.float() * (-3.0) * dt
         total_reward += rew_stationary_penalty
         
-        # 額外：鼓勵腿積極轉動（當有命令時）
-        # 腿旋轉速度越接近目標越好
-        target_leg_vel = 6.28 * torch.clamp(cmd_speed / 0.4, max=1.0)  # 最高 6.28 rad/s
+        # 【腿旋轉速度獎勵】鼓勵腿積極轉動
+        # 當有移動命令時，腿轉得越快（接近目標速度）獎勵越高
+        target_leg_vel = 6.28 * torch.clamp(cmd_speed / 0.4, max=1.0)  # 目標速度
         actual_leg_vel = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
         leg_vel_reward = torch.where(
-            cmd_speed > 0.05,
+            cmd_speed > 0.05,  # 只有在有命令時才給這個獎勵
             torch.clamp(actual_leg_vel / (target_leg_vel + 0.1), max=1.5) * 1.5,
             torch.zeros_like(actual_leg_vel)
         ) * dt
@@ -864,32 +1216,52 @@ class RedrhexEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        ===== 終止條件（重新設計：加入身體觸地終止！）=====
+        =================================================================
+        【判斷是否結束】
+        =================================================================
         
-        【關鍵改動】
-        - 身體觸地 (body contact) 必須終止！這是防止「翻車取巧」的核心
-        - 翻轉超過閾值終止
-        - 物理失控終止
+        強化學習中的「Episode」（回合）什麼時候結束？
+        
+        1. 超時：玩太久了（例如 30 秒），強制結束
+        2. 終止：發生嚴重問題（摔倒、飛走、物理爆炸），提前結束
+        
+        【為什麼要區分這兩種？】
+        • 超時 = 正常結束，不代表失敗
+        • 終止 = 失敗！AI 要學會避免這種情況
+        
+        返回：
+            terminated: 哪些環境因為「失敗」而結束
+            time_out: 哪些環境因為「超時」而結束
         """
-        # 超時
+        # 【超時檢查】已經玩了最大時間步數了嗎？
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        # 終止條件
+        # 初始化終止標記（全部設為 False，等等再根據條件設為 True）
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        root_pos = self.robot.data.root_pos_w
-        root_vel = self.robot.data.root_lin_vel_w
+        # 讀取機器人當前狀態
+        root_pos = self.robot.data.root_pos_w    # 機身位置
+        root_vel = self.robot.data.root_lin_vel_w # 機身速度
         
-        # 1. 物理爆炸檢測（NaN/Inf）
+        # =================================================================
+        # 終止條件 1：物理模擬爆炸（出現 NaN 或 Inf）
+        # =================================================================
+        # NaN = Not a Number（計算錯誤的結果）
+        # Inf = Infinity（無限大）
+        # 這些都是模擬器出問題的徵兆，必須立即終止
         pos_invalid = torch.any(torch.isnan(root_pos) | torch.isinf(root_pos), dim=1)
         vel_invalid = torch.any(torch.isnan(root_vel) | torch.isinf(root_vel), dim=1)
         
-        # 2. 速度過快（物理失控）
+        # =================================================================
+        # 終止條件 2：速度過快（物理失控）
+        # =================================================================
+        # 如果速度超過 30 m/s，肯定是出問題了（正常機器人不可能這麼快）
         vel_too_fast = torch.any(torch.abs(root_vel) > 30.0, dim=1)
 
-        # 3. 翻車檢測 - 使用參考重力方向
-        # 注意：機器人初始姿態是繞 X 軸旋轉 90°，所以不能假設 projected_gravity[:, 2] 的值
-        # 使用重力對齊度：點積 < -0.2 表示翻轉超過約 100°
+        # =================================================================
+        # 終止條件 3：翻車（傾斜太大）
+        # =================================================================
+        # 使用之前計算的 body_tilt 來判斷
         if hasattr(self, '_body_tilt'):
             flipped_over = self._body_tilt > 1.2  # 傾斜 > 1.2 表示翻轉超過約 100°
         else:
@@ -899,13 +1271,18 @@ class RedrhexEnv(DirectRLEnv):
             )
             flipped_over = gravity_alignment < -0.2
 
-        # 4. 高度終止
-        base_height = root_pos[:, 2]
-        too_low = base_height < -0.1  # 地面以下 10cm
-        too_high = base_height > 2.0   # 飛太高
+        # =================================================================
+        # 終止條件 4：高度異常
+        # =================================================================
+        base_height = root_pos[:, 2]   # 機身高度（Z 座標）
+        too_low = base_height < -0.1   # 低於地面 10 公分（掉進地下了？）
+        too_high = base_height > 2.0   # 高於 2 公尺（飛上天了？）
         
-        # 5. ★★★ 身體觸地終止（關鍵！） ★★★
-        # 如果啟用 terminate_on_body_contact，則身體觸地就終止
+        # =================================================================
+        # 終止條件 5：身體觸地（摔倒）
+        # =================================================================
+        # 這是最重要的終止條件！
+        # 機器人摔倒了就應該結束，不然它會學會「躺著不動」的偷懶策略
         body_contact_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.cfg.terminate_on_body_contact and hasattr(self, '_body_contact'):
             body_contact_terminated = self._body_contact
@@ -929,10 +1306,22 @@ class RedrhexEnv(DirectRLEnv):
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
-        """重置環境"""
+        """
+        【重置環境】
+        
+        當一個環境結束（超時或終止）後，需要「重置」它：
+        • 把機器人放回起點
+        • 清除所有狀態
+        • 給一個新的速度命令
+        
+        這樣這個環境就可以開始新的一輪訓練了！
+        
+        參數：
+            env_ids: 需要重置的環境編號列表
+        """
         if env_ids is None:
-            env_ids = self.robot._ALL_INDICES
-        super()._reset_idx(env_ids)
+            env_ids = self.robot._ALL_INDICES  # 如果沒指定，就重置全部
+        super()._reset_idx(env_ids)  # 呼叫父類別的重置方法
 
         num_reset = len(env_ids)
 
@@ -1006,17 +1395,23 @@ class RedrhexEnv(DirectRLEnv):
             self.episode_sums[key][env_ids] = 0.0
 
     # ===================================================================
-    # Debug Visualization (Official Isaac Lab Method)
+    # 【調試可視化功能】
     # ===================================================================
+    # 這個功能會在模擬畫面上畫出箭頭，幫助我們「看見」機器人的狀態：
+    # • 綠色箭頭 = 目標速度（你要它往哪走）
+    # • 紅色箭頭 = 實際速度（它實際往哪走）
+    # 
+    # 如果兩個箭頭方向一致 = 追蹤得很好！
+    # 如果兩個箭頭方向不同 = 還在學習中...
     
     def _set_debug_vis_impl(self, debug_vis: bool):
-        """創建或設置 debug visualization markers 的可見性
+        """
+        【開啟或關閉調試可視化】
         
-        這是 Isaac Lab DirectRLEnv 的官方接口。當 debug_vis=True 時，
-        創建 VisualizationMarkers 並設置可見。當 debug_vis=False 時隱藏。
+        這是 Isaac Lab 的官方介面，用來控制畫面上的調試標記。
         
-        綠色箭頭 = 目標速度方向
-        紅色箭頭 = 實際速度方向
+        參數：
+            debug_vis: True = 顯示箭頭，False = 隱藏箭頭
         """
         if debug_vis:
             # 第一次創建 markers
@@ -1047,10 +1442,15 @@ class RedrhexEnv(DirectRLEnv):
                 self.current_vel_visualizer.set_visibility(False)
     
     def _debug_vis_callback(self, event):
-        """每個渲染幀更新 debug visualization markers
+        """
+        【更新調試箭頭】每一幀都會被呼叫
         
-        這個回調函數由 Isaac Lab 自動訂閱到 post_update_event。
-        在每次渲染後調用，用於更新箭頭的位置和方向。
+        這個函數會：
+        1. 讀取機器人當前位置
+        2. 計算目標速度和實際速度的方向
+        3. 更新箭頭的位置和旋轉
+        
+        這樣箭頭就會跟著機器人移動，並且指向正確的方向！
         """
         # 檢查機器人是否已初始化
         if not self.robot.is_initialized:
@@ -1079,15 +1479,21 @@ class RedrhexEnv(DirectRLEnv):
         self.current_vel_visualizer.visualize(base_pos_w_current, current_arrow_quat, current_arrow_scale)
     
     def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor, is_goal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        """將 XY 速度向量轉換為箭頭的縮放和旋轉
+        """
+        【把速度向量轉換成箭頭的外觀】
         
-        Args:
-            xy_velocity: 本體坐標系下的 XY 速度 [N, 2]
-            is_goal: 是否為目標速度箭頭（影響基礎縮放）
+        這個函數計算箭頭應該「多長」和「指向哪裡」。
         
-        Returns:
-            arrow_scale: 箭頭縮放 [N, 3]
-            arrow_quat: 箭頭旋轉四元數（世界坐標系）[N, 4]
+        參數：
+            xy_velocity: XY 方向的速度向量 [環境數, 2]
+            is_goal: 是不是目標速度的箭頭？
+                    （True = 綠色目標箭頭，False = 紅色實際箭頭）
+        
+        返回：
+            arrow_scale: 箭頭的大小 [環境數, 3]（長、寬、高）
+            arrow_quat: 箭頭的旋轉（四元數格式）[環境數, 4]
+        
+        箭頭長度會根據速度大小變化：速度越快，箭頭越長！
         """
         # 基礎縮放：只改變長度，寬高固定
         if is_goal:
