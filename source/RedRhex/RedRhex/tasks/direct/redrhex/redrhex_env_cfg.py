@@ -37,6 +37,8 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 
+from isaaclab.sensors import ContactSensorCfg
+
 ##
 # RedRhex Robot Configuration
 ##
@@ -102,15 +104,18 @@ REDRHEX_CFG = ArticulationCfg(
     actuators={
         # 主驅動關節 - 速度控制，允許連續旋轉
         # RHex 腿需要足夠扭矩來驅動 ~12kg 機身
+        # ★★★ 重要：damping 決定速度控制的驅動力！★★★
+        # 力矩 = damping * (target_vel - current_vel)
+        # damping 太低會導致腿轉不動
         "main_drive": ImplicitActuatorCfg(
             joint_names_expr=[
                 "Revolute_15", "Revolute_12", "Revolute_18",
                 "Revolute_23", "Revolute_24", "Revolute_7"
             ],
-            effort_limit=15.0,       # 提高力矩限制以驅動重機身
-            velocity_limit=15.0,     # 提高速度限制允許快速旋轉
+            effort_limit=100.0,      # 再次提高力矩限制！(was 50.0)
+            velocity_limit=30.0,     # 提高速度限制
             stiffness=0.0,           # 純速度控制，無位置剛性
-            damping=1.0,             # 低阻尼讓腿可以持續旋轉
+            damping=50.0,            # ★★★ 大幅提高阻尼！(was 10.0) ★★★
         ),
         # ABAD 關節 - 位置控制，小範圍調節
         "abad": ImplicitActuatorCfg(
@@ -206,6 +211,21 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # Robot Configuration
     # ===================
     robot_cfg: ArticulationCfg = REDRHEX_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+
+    # ===================
+    # Contact Sensor Configuration (關鍵！用於檢測身體觸地)
+    # ===================
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*",
+        history_length=3,
+        update_period=0.0,  # 每個仿真步都更新
+        track_air_time=True,
+    )
+    
+    # 身體部位名稱（用於觸地檢測）- 這些部位不應觸地
+    body_names = ["base_link"]  # 主機身
+    # 腿部觸地是正常的，不需要懲罰
+    leg_names = [".*leg.*", ".*Leg.*"]  # 腿部
 
     # ===================
     # Scene Configuration
@@ -371,35 +391,61 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     tripod_phase_offset = math.pi
 
     # ===================
-    # Reward Scales
+    # Reward Scales (按照用戶需求重新設計)
     # ===================
     
-    # --- 核心獎勵：前進運動（最重要）---
-    rew_scale_forward_vel = 8.0         # 大幅提高前進獎勵
-    rew_scale_vel_tracking = 3.0        # 提高速度追蹤獎勵
-    rew_scale_alive = 0.5               # 降低存活獎勵（避免原地不動）
+    # --- G1: 追蹤項（核心）---
+    # r_vel = exp(-k_v * e_v^2), r_yaw = exp(-k_w * e_w^2)
+    # ★★★ 進一步提高追蹤獎勵，讓機器人積極移動！★★★
+    rew_scale_track_lin_vel = 8.0       # 再提高！線速度追蹤
+    rew_scale_track_ang_vel = 4.0       # 再提高！角速度追蹤
     
-    # --- 步態獎勵 ---
-    rew_scale_gait_sync = 0.2           # 降低同步要求
-    rew_scale_smooth_rotation = 0.0     # 完全移除（不懲罰速度變化）
-    rew_scale_rotation_direction = 3.0  # 大幅提高旋轉方向獎勵
+    # --- G2: 姿態與穩定性（避免偏航亂翻、避免彈跳）---
+    # ★★★ 降低姿態懲罰，避免機器人因為怕移動而靜止 ★★★
+    rew_scale_upright = -2.0            # 降低！俯仰/側滾穩定
+    rew_scale_z_vel = -1.0              # 降低！垂直彈跳抑制
+    rew_scale_ang_vel_xy = -0.02        # 降低！xy 角速度懲罰
+    rew_scale_base_height = -0.5        # 降低！高度偏離懲罰
     
-    # --- 穩定性懲罰（大幅降低）---
-    rew_scale_orientation = -0.05       # 大幅降低傾斜懲罰
-    rew_scale_base_height = -0.02       # 大幅降低高度懲罰
-    rew_scale_lin_vel_z = -0.02         # 大幅降低垂直跳動懲罰
-    rew_scale_ang_vel_xy = -0.01        # 大幅降低角速度懲罰
+    # --- G3: 身體觸地（必須強烈！）---
+    rew_scale_body_contact = -50.0      # 身體觸地大負值！！
+    # ★★★ 啟用身體觸地終止！★★★
+    # 正常站立高度約 0.12m，當高度低於 0.05m 或傾斜超過 55° 視為觸地
+    terminate_on_body_contact = True    # 身體觸地時終止 episode
+    body_contact_height_threshold = 0.01  # 高度低於此值視為身體觸地 (m)
     
-    # --- ABAD 獎勵 ---
-    rew_scale_abad_action = 0.0         # 完全移除 ABAD 動作懲罰
-    rew_scale_abad_stability = 0.1      # 降低 ABAD 穩定獎勵
+    # --- G4: 能耗與動作平滑 ---
+    rew_scale_torque = -2.5e-5          # 力矩懲罰（anymal_c 是 -2.5e-5）
+    rew_scale_action_rate = -0.01       # 動作變化率懲罰
+    rew_scale_joint_acc = -2.5e-7       # 關節加速度懲罰
     
-    # --- 平滑性懲罰（完全移除）---
-    rew_scale_action_rate = 0.0         # 完全移除動作變化率懲罰
-    rew_scale_drive_acc = 0.0           # 完全移除主驅動加速度懲罰
+    # --- G5: 步態相位結構（打擊六腿同相）---
+    rew_scale_tripod_sync = 1.0         # 組內一致獎勵
+    rew_scale_tripod_antiphase = 1.0    # 組間反相獎勵
     
-    # --- 碰撞懲罰 ---
-    rew_scale_collision = -1.0          # 身體碰撞懲罰
+    # --- G6: ABAD 使用策略 ---
+    # 當 |vy*| 或 |wz*| 大時，鼓勵 ABAD 使用
+    # 當 vy*=0 且 wz*=0 時，抑制 ABAD 亂動
+    # ★★★ 降低 ABAD 浪費懲罰，讓機器人更自由探索 ★★★
+    rew_scale_abad_smart_use = 1.5      # 智能使用 ABAD 獎勵
+    rew_scale_abad_waste = -0.2         # 降低！ABAD 浪費懲罰
+    
+    # --- 存活獎勵 ---
+    # ★★★ 完全禁用存活獎勵！靠速度追蹤和運動獲得獎勵 ★★★
+    rew_scale_alive = 0.0               # 禁用！不給躺平機會
+    
+    # --- 兼容舊變量（會被新系統覆蓋）---
+    rew_scale_forward_vel = 8.0
+    rew_scale_vel_tracking = 3.0
+    rew_scale_gait_sync = 0.2
+    rew_scale_smooth_rotation = 0.0
+    rew_scale_rotation_direction = 3.0
+    rew_scale_orientation = -0.05
+    rew_scale_lin_vel_z = -0.02
+    rew_scale_abad_action = 0.0
+    rew_scale_abad_stability = 0.1
+    rew_scale_drive_acc = 0.0
+    rew_scale_collision = -1.0
 
     # ===================
     # Termination Conditions
