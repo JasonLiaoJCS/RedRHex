@@ -410,7 +410,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # --- G3: 身體觸地（必須強烈！）---
     rew_scale_body_contact = -50.0      # 身體觸地大負值！！
     # ★★★ 啟用身體觸地終止！★★★
-    # 正常站立高度約 0.12m，當高度低於 0.05m 或傾斜超過 55° 視為觸地
+    # 正常站立高度約 0.12m，當高度低於 0.01m 或傾斜超過 55° 視為觸地
     terminate_on_body_contact = True    # 身體觸地時終止 episode
     body_contact_height_threshold = 0.01  # 高度低於此值視為身體觸地 (m)
     
