@@ -5,6 +5,14 @@ import gymnasium as gym
 
 from . import agents
 
+# Export terrain configuration (doesn't require Isaac Lab runtime)
+from .terrain_cfg import TerrainCfg, TerrainType
+
+# Note: TerrainGenerator and TerrainConfig are NOT imported at module level
+# because they require Isaac Lab/Sim to be initialized first.
+# Import them explicitly when needed:
+#   from RedRhex.tasks.direct.redrhex.terrain_manager import TerrainGenerator, TerrainConfig
+
 ##
 # Register Gym environments.
 ##

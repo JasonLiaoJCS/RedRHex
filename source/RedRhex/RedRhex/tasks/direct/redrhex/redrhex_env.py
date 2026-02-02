@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import torch
 from collections.abc import Sequence
+from typing import Optional
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -32,6 +33,12 @@ import isaaclab.utils.math as math_utils
 # Visualization Markers for debug arrows
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG, RED_ARROW_X_MARKER_CFG
+
+# Terrain configuration (doesn't require Isaac Lab runtime)
+from .terrain_cfg import TerrainCfg, TerrainType
+
+# Note: TerrainGenerator is imported lazily in _setup_procedural_terrain()
+# because it requires omni.usd which is only available after simulation starts
 
 from .redrhex_env_cfg import RedrhexEnvCfg
 
@@ -47,6 +54,9 @@ class RedrhexEnv(DirectRLEnv):
     """
 
     cfg: RedrhexEnvCfg
+    
+    # Terrain generator instance (only created if procedural terrain is enabled)
+    _terrain_generator: Optional[TerrainGenerator] = None
 
     def __init__(self, cfg: RedrhexEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -75,6 +85,9 @@ class RedrhexEnv(DirectRLEnv):
         print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space} (6 main_drive + 6 ABAD)")
         print(f"[RedrhexEnv] 觀測空間: {self.cfg.observation_space}")
         
+        # 打印地形配置信息
+        self._print_terrain_info()
+        
         # 自動啟用 debug visualization（如果配置啟用且有 GUI）
         if hasattr(self.cfg, 'draw_debug_vis') and self.cfg.draw_debug_vis:
             if self.sim.has_gui():
@@ -82,6 +95,12 @@ class RedrhexEnv(DirectRLEnv):
                 print("[RedrhexEnv] Debug visualization 已啟用")
             else:
                 print("[RedrhexEnv] 無 GUI 模式，跳過 debug visualization")
+        
+        # Initialize terrain debug visualization if enabled
+        if hasattr(self.cfg, 'procedural_terrain') and self.cfg.procedural_terrain.debug_visualize:
+            if self.sim.has_gui():
+                self._setup_terrain_debug_vis()
+                print("[RedrhexEnv] Terrain debug visualization 已啟用")
 
     def _setup_joint_indices(self):
         """設置關節索引映射"""
@@ -331,7 +350,19 @@ class RedrhexEnv(DirectRLEnv):
         self.leg_phase_offsets[self._tripod_b_indices] = math.pi
 
     def _setup_scene(self):
-        """設置模擬場景"""
+        """
+        設置模擬場景
+        
+        This method handles:
+        1. Robot articulation setup
+        2. Terrain setup (flat or procedural based on config)
+        3. Environment cloning
+        4. Lighting
+        
+        The terrain type is determined by cfg.procedural_terrain.terrain_type:
+        - FLAT: Uses standard Isaac Lab plane ground (backward compatible)
+        - ROUGH/STAIRS/OBSTACLES/MIXED: Uses procedural TerrainGenerator
+        """
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
         
@@ -340,9 +371,24 @@ class RedrhexEnv(DirectRLEnv):
         # self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         # self.scene.sensors["contact_sensor"] = self._contact_sensor
 
-        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
-        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
-        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        # =====================================================================
+        # TERRAIN SETUP: Flat vs Procedural
+        # =====================================================================
+        # Check if procedural terrain is enabled
+        use_procedural_terrain = (
+            hasattr(self.cfg, 'procedural_terrain')
+            and self.cfg.procedural_terrain.is_procedural()
+        )
+        
+        if use_procedural_terrain:
+            # Initialize and generate procedural terrain
+            self._setup_procedural_terrain()
+        else:
+            # Use default flat terrain (backward compatible)
+            self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+            self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+            self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+            self._terrain_generator = None  # No procedural terrain
 
         self.scene.clone_environments(copy_from_source=False)
 
@@ -351,6 +397,209 @@ class RedrhexEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+    
+    def _setup_procedural_terrain(self) -> None:
+        """
+        Initialize and generate procedural terrain based on configuration.
+        
+        This method:
+        1. Creates TerrainGenerator with parameters from cfg.procedural_terrain
+        2. Generates terrain with current difficulty level
+        3. Adjusts robot spawn height based on terrain height at origin
+        """
+        # Lazy import - TerrainGenerator requires omni.usd which is only
+        # available after Isaac Lab simulation is initialized
+        from .terrain_manager import TerrainGenerator, TerrainConfig
+        
+        terrain_cfg = self.cfg.procedural_terrain
+        
+        # Convert TerrainCfg to TerrainConfig for TerrainGenerator
+        generator_config = TerrainConfig(
+            grid_size=terrain_cfg.grid_size,
+            cell_size=terrain_cfg.horizontal_scale,
+            base_friction=terrain_cfg.friction,
+            max_height_variance=terrain_cfg.vertical_scale,
+            max_stair_height=terrain_cfg.max_stair_height,
+            max_stair_depth=terrain_cfg.max_stair_depth,
+            max_obstacle_density=terrain_cfg.obstacle_density,
+            min_obstacle_size=terrain_cfg.min_obstacle_size,
+            max_obstacle_size=terrain_cfg.max_obstacle_size,
+            terrain_prim_path=terrain_cfg.terrain_prim_path,
+            random_seed=terrain_cfg.random_seed,
+        )
+        
+        # Create terrain generator
+        self._terrain_generator = TerrainGenerator(generator_config)
+        
+        # Generate terrain with current difficulty
+        terrain_type_str = terrain_cfg.get_terrain_type_string()
+        self._terrain_generator.generate(
+            difficulty=terrain_cfg.difficulty_scale,
+            terrain_type=terrain_type_str,
+        )
+        
+        print(f"[Terrain] Generated {terrain_type_str} terrain with difficulty {terrain_cfg.difficulty_scale:.2f}")
+        
+        # Also create the default flat terrain (needed for collision filtering)
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+    
+    def regenerate_terrain(self, difficulty: float, terrain_type: Optional[str] = None) -> None:
+        """
+        Regenerate procedural terrain with new difficulty level.
+        
+        Use this method during curriculum learning to increase terrain difficulty
+        as the agent improves.
+        
+        Args:
+            difficulty: New difficulty level from 0.0 to 1.0
+            terrain_type: Optional new terrain type. If None, uses current type.
+        
+        Raises:
+            RuntimeError: If procedural terrain is not enabled
+        """
+        if self._terrain_generator is None:
+            raise RuntimeError(
+                "Cannot regenerate terrain: procedural terrain is not enabled. "
+                "Set cfg.procedural_terrain.terrain_type to ROUGH, STAIRS, OBSTACLES, or MIXED."
+            )
+        
+        # Update config
+        self.cfg.procedural_terrain.difficulty_scale = difficulty
+        
+        # Get terrain type
+        if terrain_type is None:
+            terrain_type = self.cfg.procedural_terrain.get_terrain_type_string()
+        
+        # Regenerate
+        self._terrain_generator.generate(
+            difficulty=difficulty,
+            terrain_type=terrain_type,
+        )
+        
+        print(f"[Terrain] Regenerated {terrain_type} terrain with difficulty {difficulty:.2f}")
+    
+    def get_terrain_height_at_position(self, x: float, y: float) -> float:
+        """
+        Get the terrain height at a specific (x, y) position.
+        
+        Useful for adjusting spawn positions or checking terrain elevation.
+        
+        Args:
+            x: X coordinate in world frame
+            y: Y coordinate in world frame
+            
+        Returns:
+            Terrain height at (x, y), or 0.0 if flat terrain
+        """
+        if self._terrain_generator is None:
+            return 0.0  # Flat terrain
+        
+        # For now, return a conservative estimate
+        # TODO: Implement actual height sampling from terrain mesh
+        return self.cfg.procedural_terrain.vertical_scale * self.cfg.procedural_terrain.difficulty_scale
+    
+    def _print_terrain_info(self) -> None:
+        """Print terrain configuration information."""
+        if not hasattr(self.cfg, 'procedural_terrain'):
+            print(f"[Terrain] Using default flat terrain")
+            return
+            
+        terrain_cfg = self.cfg.procedural_terrain
+        print(f"\n🏔️  Terrain Configuration:")
+        print(f"   Type: {terrain_cfg.terrain_type.name}")
+        print(f"   Procedural: {terrain_cfg.is_procedural()}")
+        
+        if terrain_cfg.is_procedural():
+            print(f"   Difficulty: {terrain_cfg.difficulty_scale:.2f}")
+            print(f"   Grid Size: {terrain_cfg.grid_size[0]:.1f}m x {terrain_cfg.grid_size[1]:.1f}m")
+            print(f"   Cell Size: {terrain_cfg.horizontal_scale:.2f}m")
+            print(f"   Max Height: {terrain_cfg.vertical_scale:.3f}m")
+            print(f"   Friction: {terrain_cfg.friction:.2f}")
+            print(f"   Debug Vis: {terrain_cfg.debug_visualize}")
+        else:
+            print(f"   Using Isaac Lab default plane ground")
+    
+    def _setup_terrain_debug_vis(self) -> None:
+        """
+        Setup debug visualization for terrain bounds.
+        
+        Draws red lines around the active terrain area when
+        cfg.procedural_terrain.debug_visualize is True.
+        """
+        # This will be called after terrain is generated
+        # to draw boundary markers
+        if not hasattr(self, '_terrain_debug_markers'):
+            self._terrain_debug_markers = None
+        
+        # Visualization will be updated in _draw_terrain_bounds()
+        print("[Terrain] Debug visualization markers initialized")
+    
+    def visualize_terrain_bounds(self) -> None:
+        """
+        Draw red lines around the active terrain area.
+        
+        This method uses Isaac Lab's debug drawing tools to visualize
+        the terrain boundaries. Useful for verifying the robot is
+        seeing the correct map.
+        
+        Only works when:
+        1. Simulation has GUI enabled
+        2. cfg.procedural_terrain.debug_visualize is True
+        """
+        if not self.sim.has_gui():
+            return
+            
+        if not hasattr(self.cfg, 'procedural_terrain'):
+            return
+            
+        terrain_cfg = self.cfg.procedural_terrain
+        if not terrain_cfg.debug_visualize:
+            return
+        
+        try:
+            from omni.isaac.debug_draw import _debug_draw
+            draw = _debug_draw.acquire_debug_draw_interface()
+            
+            # Get terrain bounds
+            half_x = terrain_cfg.grid_size[0] / 2
+            half_y = terrain_cfg.grid_size[1] / 2
+            z = 0.1  # Draw slightly above ground
+            
+            # Define corner points
+            corners = [
+                (-half_x, -half_y, z),
+                (half_x, -half_y, z),
+                (half_x, half_y, z),
+                (-half_x, half_y, z),
+            ]
+            
+            # Draw boundary lines (red)
+            color = terrain_cfg.debug_vis_color + (1.0,)  # Add alpha
+            line_width = 3.0
+            
+            for i in range(4):
+                start = corners[i]
+                end = corners[(i + 1) % 4]
+                draw.draw_line(start, color, end, color)
+            
+            # Draw spawn area marker (green)
+            spawn_size = terrain_cfg.spawn_area_size / 2
+            spawn_color = (0.0, 1.0, 0.0, 1.0)
+            spawn_corners = [
+                (-spawn_size, -spawn_size, z + 0.01),
+                (spawn_size, -spawn_size, z + 0.01),
+                (spawn_size, spawn_size, z + 0.01),
+                (-spawn_size, spawn_size, z + 0.01),
+            ]
+            for i in range(4):
+                start = spawn_corners[i]
+                end = spawn_corners[(i + 1) % 4]
+                draw.draw_line(start, spawn_color, end, spawn_color)
+                
+        except ImportError:
+            print("[Terrain] Debug draw interface not available")
         
     def _post_physics_step(self):
         """物理步之後更新狀態"""

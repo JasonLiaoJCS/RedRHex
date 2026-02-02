@@ -23,6 +23,9 @@ import math
 import os
 import isaaclab.sim as sim_utils
 
+# Import terrain configuration
+from .terrain_cfg import TerrainCfg, TerrainType
+
 # Get the USD path - config file is at source/RedRhex/RedRhex/tasks/direct/redrhex/
 # USD file is at project root: /home/jasonliao/RedRhex/RedRhex/RedRhex.usd
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -239,6 +242,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # ===================
     # Terrain Configuration
     # ===================
+    # Default flat ground (Isaac Lab built-in)
+    # This is used when procedural_terrain.terrain_type == FLAT
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -250,6 +255,22 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
             dynamic_friction=1.0,
         ),
         debug_vis=False,
+    )
+    
+    # ===================
+    # Procedural Terrain Configuration (for curriculum learning)
+    # ===================
+    # IMPORTANT: Default is FLAT for backward compatibility!
+    # To enable procedural terrain, set terrain_type to ROUGH, STAIRS, OBSTACLES, or MIXED
+    procedural_terrain: TerrainCfg = TerrainCfg(
+        terrain_type=TerrainType.FLAT,  # Default: FLAT (uses built-in plane above)
+        difficulty_scale=0.0,           # Start easy for curriculum learning
+        horizontal_scale=0.5,           # Grid resolution in meters
+        vertical_scale=0.15,            # Max height variation at difficulty=1.0
+        friction=0.8,                   # Surface friction coefficient
+        grid_size=(10.0, 10.0),         # Terrain size in meters
+        spawn_height_offset=0.1,        # Extra spawn height above terrain
+        debug_visualize=False,          # Set True to see terrain bounds
     )
 
     # ===================
