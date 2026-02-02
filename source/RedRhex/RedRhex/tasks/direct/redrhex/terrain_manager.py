@@ -341,16 +341,23 @@ class TerrainGenerator:
         self._generated_prims.append(ground_path)
     
     def _bind_physics_material(self, stage, prim_path: str) -> None:
-        """Bind the shared physics material to a prim."""
+        """Bind the shared physics material to a prim using collision API."""
         prim = stage.GetPrimAtPath(prim_path)
         if not prim.IsValid():
             return
         
-        material_binding = UsdShade.MaterialBindingAPI.Apply(prim)
+        # Use PhysxSchema to bind physics material directly
         material_prim = stage.GetPrimAtPath(self._physics_material_path)
         if material_prim.IsValid():
+            # Create collision API if needed and set material
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.CollisionAPI.Apply(prim)
+            
+            # Bind material using relationship
+            material_binding = UsdShade.MaterialBindingAPI.Apply(prim)
             material = UsdShade.Material(material_prim)
-            material_binding.Bind(material, UsdShade.Tokens.physics)
+            # Use default binding (physics materials work through collision API)
+            material_binding.Bind(material)
     
     # =========================================================================
     # TERRAIN GENERATION FUNCTIONS

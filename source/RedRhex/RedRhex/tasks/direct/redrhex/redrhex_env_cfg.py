@@ -263,14 +263,17 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # IMPORTANT: Default is FLAT for backward compatibility!
     # To enable procedural terrain, set terrain_type to ROUGH, STAIRS, OBSTACLES, or MIXED
     procedural_terrain: TerrainCfg = TerrainCfg(
-        terrain_type=TerrainType.FLAT,  # Default: FLAT (uses built-in plane above)
-        difficulty_scale=0.0,           # Start easy for curriculum learning
+        terrain_type=TerrainType.OBSTACLES,  # 🎮 Try: ROUGH, STAIRS, OBSTACLES, MIXED
+        difficulty_scale=0.3,           # 0.0=easy, 1.0=hard (start moderate)
         horizontal_scale=0.5,           # Grid resolution in meters
         vertical_scale=0.15,            # Max height variation at difficulty=1.0
         friction=0.8,                   # Surface friction coefficient
-        grid_size=(10.0, 10.0),         # Terrain size in meters
-        spawn_height_offset=0.1,        # Extra spawn height above terrain
-        debug_visualize=False,          # Set True to see terrain bounds
+        grid_size=(15.0, 15.0),         # Terrain size in meters
+        spawn_height_offset=0.15,       # Extra spawn height above terrain
+        obstacle_density=0.3,           # Obstacle density (0.0-1.0)
+        min_obstacle_size=0.1,          # Min obstacle dimension
+        max_obstacle_size=0.4,          # Max obstacle dimension
+        debug_visualize=True,           # 👁️ Visualize terrain bounds
     )
 
     # ===================
