@@ -24,7 +24,12 @@ from collections.abc import Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.utils.math import quat_apply_inverse, sample_uniform
+from isaaclab.utils.math import quat_apply_inverse, quat_apply, sample_uniform
+import isaaclab.utils.math as math_utils
+
+# Visualization Markers for debug arrows
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG, RED_ARROW_X_MARKER_CFG
 
 from .redrhex_env_cfg import RedrhexEnvCfg
 
@@ -62,6 +67,14 @@ class RedrhexEnv(DirectRLEnv):
         print(f"[RedrhexEnv] 環境初始化完成")
         print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space} (6 main_drive + 6 ABAD)")
         print(f"[RedrhexEnv] 觀測空間: {self.cfg.observation_space}")
+        
+        # 自動啟用 debug visualization（如果配置啟用且有 GUI）
+        if hasattr(self.cfg, 'draw_debug_vis') and self.cfg.draw_debug_vis:
+            if self.sim.has_gui():
+                self.set_debug_vis(True)
+                print("[RedrhexEnv] Debug visualization 已啟用")
+            else:
+                print("[RedrhexEnv] 無 GUI 模式，跳過 debug visualization")
 
     def _setup_joint_indices(self):
         """設置關節索引映射"""
@@ -168,7 +181,7 @@ class RedrhexEnv(DirectRLEnv):
             # 步態獎勵
             "rew_gait_sync": torch.zeros(self.num_envs, device=self.device),
             "rew_rotation_dir": torch.zeros(self.num_envs, device=self.device),
-            "rew_correct_dir": torch.zeros(self.num_envs, device=self.device),  # 新增
+            "rew_correct_dir": torch.zeros(self.num_envs, device=self.device),
             "rew_all_legs": torch.zeros(self.num_envs, device=self.device),
             "rew_tripod_sync": torch.zeros(self.num_envs, device=self.device),
             "rew_mean_vel": torch.zeros(self.num_envs, device=self.device),
@@ -187,16 +200,110 @@ class RedrhexEnv(DirectRLEnv):
             "rew_action_rate": torch.zeros(self.num_envs, device=self.device),
             # 診斷指標 (非獎勵)
             "diag_forward_vel": torch.zeros(self.num_envs, device=self.device),
+            "diag_lateral_vel": torch.zeros(self.num_envs, device=self.device),
+            "diag_cmd_vx": torch.zeros(self.num_envs, device=self.device),
+            "diag_cmd_vy": torch.zeros(self.num_envs, device=self.device),
+            "diag_vel_error": torch.zeros(self.num_envs, device=self.device),
             "diag_base_height": torch.zeros(self.num_envs, device=self.device),
             "diag_tilt": torch.zeros(self.num_envs, device=self.device),
             "diag_drive_vel_mean": torch.zeros(self.num_envs, device=self.device),
             "diag_rotating_legs": torch.zeros(self.num_envs, device=self.device),
             "diag_min_leg_vel": torch.zeros(self.num_envs, device=self.device),
+            "diag_abad_magnitude": torch.zeros(self.num_envs, device=self.device),
+            # 旋轉追蹤診斷
+            "diag_cmd_wz": torch.zeros(self.num_envs, device=self.device),
+            "diag_actual_wz": torch.zeros(self.num_envs, device=self.device),
+            "diag_wz_error": torch.zeros(self.num_envs, device=self.device),
         }
 
     def _setup_commands(self):
-        """設置速度命令"""
+        """設置多方向速度命令系統"""
+        # 速度命令 [vx, vy, wz]
         self.commands = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # 命令切換計時器
+        self.command_time_left = torch.zeros(self.num_envs, device=self.device)
+        
+        # 離散方向（10個方向：8個移動方向 + 2個原地旋轉）
+        if hasattr(self.cfg, 'discrete_directions') and self.cfg.use_discrete_directions:
+            self.discrete_directions = torch.tensor(
+                self.cfg.discrete_directions, device=self.device, dtype=torch.float32
+            )
+            self.num_directions = self.discrete_directions.shape[0]
+            
+            # 檢查方向格式（是否包含 wz）
+            if self.discrete_directions.shape[1] == 2:
+                # 舊格式 [vx, vy]，添加 wz=0
+                zeros = torch.zeros(self.num_directions, 1, device=self.device)
+                self.discrete_directions = torch.cat([self.discrete_directions, zeros], dim=1)
+            
+            print(f"[命令系統] 使用離散方向模式，共 {self.num_directions} 個方向")
+            if hasattr(self.cfg, 'direction_names'):
+                print(f"   方向: {', '.join(self.cfg.direction_names)}")
+        else:
+            self.discrete_directions = None
+            self.num_directions = 0
+            print(f"[命令系統] 使用連續速度範圍")
+        
+        # 當前方向索引（用於追蹤）
+        self.current_direction_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        # 初始化命令
+        self._resample_commands(torch.arange(self.num_envs, device=self.device))
+
+    def _resample_commands(self, env_ids: torch.Tensor):
+        """重新採樣速度命令"""
+        if len(env_ids) == 0:
+            return
+            
+        # 重置計時器
+        self.command_time_left[env_ids] = self.cfg.command_resample_time
+        
+        if self.discrete_directions is not None and self.cfg.use_discrete_directions:
+            # 離散方向模式：隨機選擇一個方向
+            dir_indices = torch.randint(0, self.num_directions, (len(env_ids),), device=self.device)
+            self.current_direction_idx[env_ids] = dir_indices
+            
+            # 設置 vx, vy, wz（直接從 discrete_directions 獲取全部三個值）
+            self.commands[env_ids, 0] = self.discrete_directions[dir_indices, 0]
+            self.commands[env_ids, 1] = self.discrete_directions[dir_indices, 1]
+            self.commands[env_ids, 2] = self.discrete_directions[dir_indices, 2]
+            
+            # 打印方向切換信息（只打印前幾個環境，避免刷屏）
+            if len(env_ids) > 0 and env_ids[0] == 0 and hasattr(self.cfg, 'direction_names'):
+                idx = dir_indices[0].item()
+                name = self.cfg.direction_names[idx] if idx < len(self.cfg.direction_names) else f"Dir{idx}"
+                print(f"[命令切換] env0 → {name} (vx={self.commands[0,0]:.2f}, vy={self.commands[0,1]:.2f}, wz={self.commands[0,2]:.2f})")
+        else:
+            # 連續範圍模式
+            self.commands[env_ids, 0] = sample_uniform(
+                self.cfg.lin_vel_x_range[0],
+                self.cfg.lin_vel_x_range[1],
+                (len(env_ids),),
+                self.device
+            )
+            self.commands[env_ids, 1] = sample_uniform(
+                self.cfg.lin_vel_y_range[0],
+                self.cfg.lin_vel_y_range[1],
+                (len(env_ids),),
+                self.device
+            )
+            self.commands[env_ids, 2] = sample_uniform(
+                self.cfg.ang_vel_z_range[0],
+                self.cfg.ang_vel_z_range[1],
+                (len(env_ids),),
+                self.device
+            )
+
+    def _update_commands(self):
+        """更新命令（定期切換方向）"""
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        self.command_time_left -= dt
+        
+        # 找出需要重新採樣的環境
+        resample_ids = (self.command_time_left <= 0).nonzero(as_tuple=False).flatten()
+        if len(resample_ids) > 0:
+            self._resample_commands(resample_ids)
 
     def _setup_gait(self):
         """設置步態相位"""
@@ -384,127 +491,202 @@ class RedrhexEnv(DirectRLEnv):
         # 更新步態相位
         dt = self.cfg.sim.dt * self.cfg.decimation
         self.gait_phase = (self.gait_phase + 2 * math.pi * self.cfg.base_gait_frequency * dt) % (2 * math.pi)
+        
+        # 更新速度命令（定期切換方向）
+        self._update_commands()
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        ===== RHex 機器人運動原理（極簡版）=====
+        ===== RHex 機器人多方向速度追蹤 (參考 Isaac Lab anymal_c) =====
         
-        【機構】
-        RHex 是六足機器人，每隻腳是半圓形的 C 型腿。
+        【目標】
+        訓練機器人追蹤 10 個方向的速度命令：
+        - 前、後、左、右
+        - 左前、右前、左後、右後
+        - 原地順時針旋轉、原地逆時針旋轉
         
-        腿的驅動方式：
-        - 主驅動關節（持續 360° 旋轉）：15, 12, 7（右側）; 18, 23, 24（左側）
-        - 腿通過連續旋轉向前移動（像輪子，不是走路）
-        - 旋轉方向：右腿負向，左腿正向 → 都是往後踩地推動機器人前進
-        
-        Tripod 分組（交替三足步態）：
-        - Tripod A：腿 0, 3, 5（關節 15, 18, 24）
-        - Tripod B：腿 1, 2, 4（關節 7, 12, 23）
-        
-        【動態步態核心】
-        不是簡單的 180° 相位差！而是速度調節：
-        
-        1. 當腿在地面（Stance）：較慢、穩定的速度旋轉
-           → 提供推進力，避免打滑
-        
-        2. 當腿離地（Swing）：快速旋轉
-           → 迅速轉到即將落地位置，準備接力
-        
-        這樣確保永遠有腿在支撐，不會有滯空期。
-        
-        【獎勵設計原則】
-        極度簡化！只獎勵：
-        1. 前進（最重要）
-        2. 腿在旋轉
-        3. 不翻車
+        【獎勵設計】(參考 anymal_c 的 exp 映射寫法)
+        1. 線速度追蹤 (track_lin_vel_xy_exp): exp(-error/0.25)
+        2. 角速度追蹤 (track_ang_vel_z_exp): exp(-error/0.25)
+        3. 穩定性懲罰
+        4. 步態協調
         """
         rewards = torch.zeros(self.num_envs, device=self.device)
 
         # ===== 獲取狀態 =====
         main_drive_vel = self.joint_vel[:, self._main_drive_indices]  # [N, 6]
         main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
+        abad_pos = self.joint_pos[:, self._abad_indices]  # [N, 6]
         
         # 有效速度（考慮旋轉方向）
-        # 正值 = 往前進方向旋轉
         effective_vel = main_drive_vel * self._direction_multiplier  # [N, 6]
         vel_magnitude = torch.abs(effective_vel)  # [N, 6]
         mean_vel = vel_magnitude.mean(dim=1)
         min_vel = vel_magnitude.min(dim=1).values
         num_active_legs = (vel_magnitude > 0.3).float().sum(dim=1)
         
-        # ===== 1. 前進速度（最重要！）=====
-        forward_vel = self.base_lin_vel[:, 0]
+        # 目標速度命令
+        cmd_vx = self.commands[:, 0]  # 目標前進速度
+        cmd_vy = self.commands[:, 1]  # 目標側向速度
+        cmd_wz = self.commands[:, 2]  # 目標旋轉速度
         
-        # 簡單直接：前進 = 獎勵，後退 = 懲罰
-        rew_forward_vel = forward_vel * 10.0  # 大權重
-        rewards += rew_forward_vel
-        
-        # 達到目標速度的獎勵
-        target_vel = self.commands[:, 0]
-        vel_error = torch.abs(forward_vel - target_vel)
-        rew_vel_tracking = torch.exp(-vel_error * 2.0) * 2.0
-        rewards += rew_vel_tracking
+        # 實際速度
+        actual_vx = self.base_lin_vel[:, 0]  # 實際前進速度
+        actual_vy = self.base_lin_vel[:, 1]  # 實際側向速度
+        actual_wz = self.base_ang_vel[:, 2]  # 實際旋轉速度
 
-        # ===== 2. 腿旋轉獎勵（簡化）=====
+        # ===== 1. 速度追蹤獎勵（核心！參考 anymal_c）=====
         
-        # 2.1 正確方向旋轉
-        correct_direction = effective_vel > 0.5  # 往前進方向轉
-        rew_rotation_dir = correct_direction.float().sum(dim=1) * 0.5  # 每條腿 0.5
+        # 1.1 線速度 XY 追蹤 (參考 anymal_c 的 track_lin_vel_xy_exp)
+        # 使用 exp(-error/0.25) 映射，誤差越小獎勵越高
+        lin_vel_error = torch.sum(
+            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
+        )  # squared error: (cmd_vx - actual_vx)^2 + (cmd_vy - actual_vy)^2
+        rew_track_lin_vel = torch.exp(-lin_vel_error / 0.25) * 4.0  # 高權重
+        rewards += rew_track_lin_vel
+        
+        # 1.2 角速度 Z 追蹤 (參考 anymal_c 的 track_ang_vel_z_exp)
+        yaw_rate_error = torch.square(cmd_wz - actual_wz)
+        rew_track_ang_vel = torch.exp(-yaw_rate_error / 0.25) * 2.5  # 較高權重
+        rewards += rew_track_ang_vel
+        
+        # 1.3 原地旋轉特別獎勵
+        # 當 vx, vy 目標接近 0 且有旋轉命令時，額外獎勵旋轉追蹤
+        is_rotation_mode = (torch.abs(cmd_vx) < 0.1) & (torch.abs(cmd_vy) < 0.1) & (torch.abs(cmd_wz) > 0.3)
+        
+        # 原地旋轉時：
+        # - 獎勵旋轉方向正確
+        # - 懲罰不必要的線速度
+        wz_sign_match = (cmd_wz * actual_wz) > 0  # 旋轉方向正確
+        wz_magnitude_reward = torch.abs(actual_wz) * wz_sign_match.float()  # 只有方向正確時獎勵大小
+        lin_vel_in_rotation = torch.sqrt(actual_vx**2 + actual_vy**2)  # 旋轉時的線速度（應該接近 0）
+        
+        rotation_bonus = torch.where(
+            is_rotation_mode,
+            wz_magnitude_reward * 3.0 - lin_vel_in_rotation * 2.0,  # 獎勵旋轉，懲罰移動
+            torch.zeros_like(actual_wz)
+        )
+        rewards += rotation_bonus.clamp(min=-2.0, max=4.0)
+        
+        # 1.4 組合成舊的追蹤獎勵（for TensorBoard 相容）
+        vel_error_2d = torch.sqrt(lin_vel_error)  # L2 error
+        rew_vel_tracking = torch.exp(-vel_error_2d * 2.5) * 2.0  # 額外追蹤獎勵
+        rewards += rew_vel_tracking
+        
+        # forward_vel 相容舊版
+        rew_forward_vel = torch.where(
+            torch.abs(cmd_vx) > 0.05,
+            actual_vx * torch.sign(cmd_vx) * 3.0,  # 正確方向給獎勵
+            torch.zeros_like(actual_vx)  # 無前進命令時不給此獎勵
+        )
+        rewards += rew_forward_vel.clamp(min=-2.0, max=4.0)
+
+        # ===== 2. 方向對齊獎勵 =====
+        cmd_vel_2d = torch.stack([cmd_vx, cmd_vy], dim=1)  # [N, 2]
+        actual_vel_2d = torch.stack([actual_vx, actual_vy], dim=1)  # [N, 2]
+        cmd_speed = torch.norm(cmd_vel_2d, dim=1).clamp(min=0.01)
+        actual_speed = torch.norm(actual_vel_2d, dim=1).clamp(min=0.01)
+        
+        # 只在有移動命令時計算方向對齊
+        has_move_cmd = cmd_speed > 0.05
+        direction_dot = (cmd_vel_2d * actual_vel_2d).sum(dim=1) / (cmd_speed * actual_speed + 1e-6)
+        rew_direction_align = torch.where(
+            has_move_cmd,
+            direction_dot * 1.5,  # 對齊獎勵
+            torch.zeros_like(direction_dot)  # 無移動命令時不計算
+        )
+        rewards += rew_direction_align.clamp(min=-1.5, max=1.5)
+        
+        # ===== 3. 方向正確獎勵 =====
+        # 實際速度向量與命令同向時給獎勵
+        rew_correct_dir = rew_direction_align  # 複用
+
+        # ===== 4. ABAD 使用獎勵 =====
+        # 當需要側向移動或旋轉時，ABAD 應該有所動作
+        need_lateral = torch.abs(cmd_vy) > 0.1  # 需要側向移動
+        need_rotation = torch.abs(cmd_wz) > 0.3  # 需要旋轉
+        need_abad = need_lateral | need_rotation
+        abad_magnitude = torch.abs(abad_pos).mean(dim=1)  # ABAD 動作幅度
+        
+        # 需要側向/旋轉時，獎勵 ABAD 使用；不需要時，獎勵 ABAD 保持中立
+        rew_abad_action = torch.where(
+            need_abad,
+            abad_magnitude * 0.8,  # 需要時：獎勵 ABAD 動作
+            (1.0 - abad_magnitude) * 0.4  # 不需要：獎勵 ABAD 保持中立
+        )
+        rewards += rew_abad_action
+        
+        # ABAD 左右對稱性（旋轉時應該非對稱以產生差速轉向）
+        abad_left = abad_pos[:, 3:6].mean(dim=1)  # 左側 ABAD 平均
+        abad_right = abad_pos[:, 0:3].mean(dim=1)  # 右側 ABAD 平均
+        abad_asymmetry = torch.abs(abad_left - abad_right)
+        
+        # 需要轉向時，獎勵非對稱；直走時，獎勵對稱
+        rew_abad_stability = torch.where(
+            need_abad,
+            abad_asymmetry * 0.5,  # 轉向：獎勵非對稱
+            (1.0 - abad_asymmetry) * 0.3  # 直走：獎勵對稱
+        )
+        rewards += rew_abad_stability
+
+        # ===== 4. 腿旋轉獎勵 =====
+        
+        # 4.1 正確方向旋轉
+        correct_direction = effective_vel > 0.3
+        rew_rotation_dir = correct_direction.float().sum(dim=1) * 0.3
         rewards += rew_rotation_dir
         
-        # 2.2 所有腿都要動
-        rew_all_legs = num_active_legs * 0.3  # 每條活動的腿 0.3
+        # 4.2 所有腿都要動
+        rew_all_legs = num_active_legs * 0.2
         rewards += rew_all_legs
         
-        # 2.3 最慢的腿也要動（防止罷工）
-        rew_min_vel = torch.clamp(min_vel, max=3.0) * 0.5
+        # 4.3 最慢的腿也要動
+        rew_min_vel = torch.clamp(min_vel, max=3.0) * 0.3
         rewards += rew_min_vel
         
-        # 2.4 平均旋轉速度
-        rew_mean_vel = torch.clamp(mean_vel, max=5.0) * 0.3
+        # 4.4 平均旋轉速度
+        rew_mean_vel = torch.clamp(mean_vel, max=5.0) * 0.2
         rewards += rew_mean_vel
         
-        # 為了 TensorBoard 相容性
-        rew_correct_dir = rew_mean_vel  # 合併
+        # 合併用於 TensorBoard
+        rew_correct_dir = rew_direction_align
 
-        # ===== 3. 簡單的穩定性（輕微懲罰）=====
+        # ===== 5. 穩定性懲罰 =====
         
-        # 3.1 不要翻車（傾斜懲罰）
+        # 5.1 傾斜懲罰
         grav_xy = self.projected_gravity[:, :2]
         tilt = torch.norm(grav_xy, dim=1)
-        rew_orientation = -tilt * 0.5  # 輕微懲罰
+        rew_orientation = -tilt * 0.3
         rewards += rew_orientation
         
-        # 3.2 保持高度
+        # 5.2 高度保持
         base_height = self.robot.data.root_pos_w[:, 2]
         target_height = 0.12
         height_error = torch.abs(base_height - target_height)
-        rew_base_height = -height_error * 0.5
+        rew_base_height = -height_error * 0.3
         rewards += rew_base_height
         
-        # 3.3 不要亂跳（垂直速度懲罰）
+        # 5.3 垂直速度懲罰
         z_vel = self.base_lin_vel[:, 2]
-        rew_lin_vel_z = -torch.abs(z_vel) * 0.2
+        rew_lin_vel_z = -torch.abs(z_vel) * 0.15
         rewards += rew_lin_vel_z
         
-        # 3.4 不要亂轉（角速度懲罰）
+        # 5.4 不需要的角速度懲罰（xy 角速度）
         ang_vel_xy = self.base_ang_vel[:, :2]
         rew_ang_vel_xy = -torch.norm(ang_vel_xy, dim=1) * 0.1
         rewards += rew_ang_vel_xy
 
-        # ===== 4. 存活獎勵（小）=====
-        rew_alive = torch.ones(self.num_envs, device=self.device) * 0.2
+        # ===== 6. 存活獎勵 =====
+        rew_alive = torch.ones(self.num_envs, device=self.device) * 0.15
         rewards += rew_alive
 
-        # ===== 5. 步態協調（可選，權重很低）=====
-        # Tripod 相位
+        # ===== 7. 步態協調 =====
         effective_pos = main_drive_pos * self._direction_multiplier
         leg_phase = torch.remainder(effective_pos, 2 * math.pi)
         
-        phase_a = leg_phase[:, self._tripod_a_indices]  # [N, 3]
-        phase_b = leg_phase[:, self._tripod_b_indices]  # [N, 3]
+        phase_a = leg_phase[:, self._tripod_a_indices]
+        phase_b = leg_phase[:, self._tripod_b_indices]
         
-        # 同組腿相位一致性
         def phase_coherence(phases):
             sin_mean = torch.sin(phases).mean(dim=1)
             cos_mean = torch.cos(phases).mean(dim=1)
@@ -512,30 +694,30 @@ class RedrhexEnv(DirectRLEnv):
         
         coherence_a = phase_coherence(phase_a)
         coherence_b = phase_coherence(phase_b)
-        rew_tripod_sync = (coherence_a + coherence_b) * 0.2  # 低權重
+        rew_tripod_sync = (coherence_a + coherence_b) * 0.15
         rewards += rew_tripod_sync
         
-        # 兩組相位差
         mean_phase_a = torch.atan2(torch.sin(phase_a).mean(dim=1), torch.cos(phase_a).mean(dim=1))
         mean_phase_b = torch.atan2(torch.sin(phase_b).mean(dim=1), torch.cos(phase_b).mean(dim=1))
         phase_diff = torch.abs(mean_phase_a - mean_phase_b)
         phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)
         phase_diff_error = torch.abs(phase_diff - math.pi)
-        rew_gait_sync = torch.exp(-phase_diff_error) * 0.1  # 很低權重
+        rew_gait_sync = torch.exp(-phase_diff_error) * 0.1
         rewards += rew_gait_sync
         
-        # 持續支撐（有腿在地面）
+        # 持續支撐
         in_stance = leg_phase < math.pi
         stance_a = in_stance[:, self._tripod_a_indices].float().sum(dim=1)
         stance_b = in_stance[:, self._tripod_b_indices].float().sum(dim=1)
         has_support = ((stance_a >= 1) | (stance_b >= 1)).float()
-        rew_continuous_support = has_support * 0.2
+        rew_continuous_support = has_support * 0.15
         rewards += rew_continuous_support
 
-        # 佔位符（為了 TensorBoard 相容）
-        rew_abad_action = torch.zeros(self.num_envs, device=self.device)
-        rew_abad_stability = torch.zeros(self.num_envs, device=self.device)
-        rew_action_rate = torch.zeros(self.num_envs, device=self.device)
+        # 動作平滑性
+        action_diff = self.actions - self.last_actions
+        rew_action_rate = -torch.norm(action_diff, dim=1) * 0.02
+        rewards += rew_action_rate
+        
         rew_smooth_rotation = torch.zeros(self.num_envs, device=self.device)
 
         # NaN 保護
@@ -562,13 +744,23 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_abad_stability"] += rew_abad_stability
         self.episode_sums["rew_action_rate"] += rew_action_rate
         
-        # 診斷
-        self.episode_sums["diag_forward_vel"] += forward_vel
+        # 診斷（多方向追蹤）
+        self.episode_sums["diag_forward_vel"] += actual_vx
+        self.episode_sums["diag_lateral_vel"] += actual_vy
+        self.episode_sums["diag_cmd_vx"] += cmd_vx
+        self.episode_sums["diag_cmd_vy"] += cmd_vy
+        self.episode_sums["diag_vel_error"] += vel_error_2d
         self.episode_sums["diag_base_height"] += base_height
         self.episode_sums["diag_tilt"] += tilt
         self.episode_sums["diag_drive_vel_mean"] += mean_vel
         self.episode_sums["diag_rotating_legs"] += num_active_legs
         self.episode_sums["diag_min_leg_vel"] += min_vel
+        self.episode_sums["diag_abad_magnitude"] += abad_magnitude
+        # 旋轉追蹤診斷
+        wz_error = torch.abs(actual_wz - cmd_wz)  # 為診斷定義 wz_error
+        self.episode_sums["diag_cmd_wz"] += cmd_wz
+        self.episode_sums["diag_actual_wz"] += actual_wz
+        self.episode_sums["diag_wz_error"] += wz_error
         
         self.last_main_drive_vel = main_drive_vel.clone()
 
@@ -588,27 +780,37 @@ class RedrhexEnv(DirectRLEnv):
         # 1. 物理爆炸檢測（NaN/Inf）
         pos_invalid = torch.any(torch.isnan(root_pos) | torch.isinf(root_pos), dim=1)
         vel_invalid = torch.any(torch.isnan(root_vel) | torch.isinf(root_vel), dim=1)
-        terminated = terminated | pos_invalid | vel_invalid
         
-        # 2. 位置過遠（跑到仿真邊界外）
-        pos_too_far = torch.any(torch.abs(root_pos[:, :2]) > 50.0, dim=1)
-        terminated = terminated | pos_too_far
+        # 2. 位置過遠 - 移除此檢查，因為多環境時世界座標會超過閾值
+        # 機器人不會真的跑出仿真邊界，其他終止條件足夠
         
         # 3. 速度過快（物理失控）- 放寬閾值
         vel_too_fast = torch.any(torch.abs(root_vel) > 30.0, dim=1)
-        terminated = terminated | vel_too_fast
 
         # 4. 翻車檢測 - 只在完全翻過來時終止
         # projected_gravity 的 z 分量：正立時約 -1，完全翻轉時約 +1
         # 當 z > 0.5 表示翻過來超過 60°
         flipped_over = self.projected_gravity[:, 2] > 0.5
-        terminated = terminated | flipped_over
 
         # 5. 高度終止 - 放寬範圍
         base_height = root_pos[:, 2]
-        too_low = base_height < 0.01  # 只有地面以下才終止
-        too_high = base_height > 1.0   # 只有飛太高才終止
-        terminated = terminated | too_low | too_high
+        too_low = base_height < -0.1  # 只有地面以下 10cm 才終止 (允許掉落時有緩衝)
+        too_high = base_height > 2.0   # 只有飛太高才終止
+        
+        # 每隔一段時間打印一次終止原因統計
+        if not hasattr(self, '_term_debug_counter'):
+            self._term_debug_counter = 0
+        self._term_debug_counter += 1
+        if self._term_debug_counter % 1000 == 1:
+            print(f"[Term Debug] pos_invalid: {pos_invalid.sum().item()}, "
+                  f"vel_invalid: {vel_invalid.sum().item()}, "
+                  f"vel_too_fast: {vel_too_fast.sum().item()}, "
+                  f"flipped: {flipped_over.sum().item()}, "
+                  f"too_low: {too_low.sum().item()}, "
+                  f"too_high: {too_high.sum().item()}, "
+                  f"base_h_mean: {base_height.mean().item():.3f}")
+        
+        terminated = pos_invalid | vel_invalid | vel_too_fast | flipped_over | too_low | too_high
 
         return terminated, time_out
 
@@ -688,27 +890,130 @@ class RedrhexEnv(DirectRLEnv):
         for key in self.episode_sums:
             self.episode_sums[key][env_ids] = 0.0
 
-    def _resample_commands(self, env_ids: torch.Tensor):
-        """為指定環境採樣新的速度命令"""
-        num_cmds = len(env_ids)
-
-        self.commands[env_ids, 0] = sample_uniform(
-            self.cfg.lin_vel_x_range[0],
-            self.cfg.lin_vel_x_range[1],
-            (num_cmds,),
-            device=self.device
+    # ===================================================================
+    # Debug Visualization (Official Isaac Lab Method)
+    # ===================================================================
+    
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        """創建或設置 debug visualization markers 的可見性
+        
+        這是 Isaac Lab DirectRLEnv 的官方接口。當 debug_vis=True 時，
+        創建 VisualizationMarkers 並設置可見。當 debug_vis=False 時隱藏。
+        
+        綠色箭頭 = 目標速度方向
+        紅色箭頭 = 實際速度方向
+        """
+        if debug_vis:
+            # 第一次創建 markers
+            if not hasattr(self, "goal_vel_visualizer"):
+                # 目標速度箭頭（綠色）- 細長箭頭
+                goal_marker_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
+                goal_marker_cfg.prim_path = "/Visuals/Command/velocity_goal"
+                goal_marker_cfg.markers["arrow"].scale = (0.8, 0.25, 0.25)  # 長=0.8, 寬高=0.25
+                self.goal_vel_visualizer = VisualizationMarkers(goal_marker_cfg)
+                
+                # 實際速度箭頭（紅色）- 細長箭頭
+                current_marker_cfg = RED_ARROW_X_MARKER_CFG.copy()
+                current_marker_cfg.prim_path = "/Visuals/Command/velocity_current"
+                current_marker_cfg.markers["arrow"].scale = (0.8, 0.2, 0.2)  # 稍小以區分
+                self.current_vel_visualizer = VisualizationMarkers(current_marker_cfg)
+                
+                print("[可視化] Debug visualization markers 創建成功")
+                print("   綠色箭頭 = 目標速度方向")
+                print("   紅色箭頭 = 實際速度方向")
+            
+            # 設置可見
+            self.goal_vel_visualizer.set_visibility(True)
+            self.current_vel_visualizer.set_visibility(True)
+        else:
+            # 隱藏 markers
+            if hasattr(self, "goal_vel_visualizer"):
+                self.goal_vel_visualizer.set_visibility(False)
+                self.current_vel_visualizer.set_visibility(False)
+    
+    def _debug_vis_callback(self, event):
+        """每個渲染幀更新 debug visualization markers
+        
+        這個回調函數由 Isaac Lab 自動訂閱到 post_update_event。
+        在每次渲染後調用，用於更新箭頭的位置和方向。
+        """
+        # 檢查機器人是否已初始化
+        if not self.robot.is_initialized:
+            return
+        
+        # 獲取機器人位置（箭頭起點在機器人上方）
+        base_pos_w = self.robot.data.root_pos_w.clone()
+        base_pos_w[:, 2] += 0.5  # 箭頭高度
+        
+        # 計算目標速度箭頭的縮放和旋轉
+        goal_arrow_scale, goal_arrow_quat = self._resolve_xy_velocity_to_arrow(
+            self.commands[:, :2], is_goal=True  # [vx, vy]
         )
-
-        self.commands[env_ids, 1] = sample_uniform(
-            self.cfg.lin_vel_y_range[0],
-            self.cfg.lin_vel_y_range[1],
-            (num_cmds,),
-            device=self.device
+        
+        # 計算實際速度箭頭的縮放和旋轉
+        current_arrow_scale, current_arrow_quat = self._resolve_xy_velocity_to_arrow(
+            self.base_lin_vel[:, :2], is_goal=False  # 本體坐標系下的 [vx, vy]
         )
-
-        self.commands[env_ids, 2] = sample_uniform(
-            self.cfg.ang_vel_z_range[0],
-            self.cfg.ang_vel_z_range[1],
-            (num_cmds,),
-            device=self.device
-        )
+        
+        # 更新可視化 markers
+        self.goal_vel_visualizer.visualize(base_pos_w, goal_arrow_quat, goal_arrow_scale)
+        
+        # 實際速度箭頭稍微高一點，避免重疊
+        base_pos_w_current = base_pos_w.clone()
+        base_pos_w_current[:, 2] += 0.1
+        self.current_vel_visualizer.visualize(base_pos_w_current, current_arrow_quat, current_arrow_scale)
+    
+    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor, is_goal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        """將 XY 速度向量轉換為箭頭的縮放和旋轉
+        
+        Args:
+            xy_velocity: 本體坐標系下的 XY 速度 [N, 2]
+            is_goal: 是否為目標速度箭頭（影響基礎縮放）
+        
+        Returns:
+            arrow_scale: 箭頭縮放 [N, 3]
+            arrow_quat: 箭頭旋轉四元數（世界坐標系）[N, 4]
+        """
+        # 基礎縮放：只改變長度，寬高固定
+        if is_goal:
+            base_length = 0.8   # 綠色目標箭頭基礎長度
+            width_height = 0.25  # 固定寬高
+        else:
+            base_length = 0.8   # 紅色實際箭頭基礎長度
+            width_height = 0.2  # 固定寬高（稍小）
+        
+        # 計算速度大小
+        speed = torch.linalg.norm(xy_velocity, dim=1)
+        
+        # 箭頭長度根據速度調整：最小 0.3 倍，速度加成 2.0x
+        length_scale = base_length * (0.3 + speed * 2.0)
+        
+        # 創建 scale tensor: [length, width, height]
+        arrow_scale = torch.zeros(xy_velocity.shape[0], 3, device=self.device)
+        arrow_scale[:, 0] = length_scale  # 長度隨速度變化
+        arrow_scale[:, 1] = width_height  # 寬度固定
+        arrow_scale[:, 2] = width_height  # 高度固定
+        
+        # 箭頭方向：根據速度方向計算偏航角（只在 XY 平面上）
+        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+        
+        # 獲取機器人的偏航角（只取 yaw，忽略 roll/pitch）
+        # 這樣箭頭永遠在水平面上
+        base_quat_w = self.robot.data.root_quat_w
+        # 從四元數提取 yaw 角度
+        # quat = [w, x, y, z]
+        # yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
+        w = base_quat_w[:, 0]
+        x = base_quat_w[:, 1]
+        y = base_quat_w[:, 2]
+        z = base_quat_w[:, 3]
+        base_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        
+        # 組合箭頭方向（本體坐標系）和機器人 yaw（世界坐標系）
+        world_heading = base_yaw + heading_angle
+        
+        # 創建只有 yaw 旋轉的四元數（箭頭永遠水平）
+        zeros = torch.zeros_like(world_heading)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, world_heading)
+        
+        return arrow_scale, arrow_quat
