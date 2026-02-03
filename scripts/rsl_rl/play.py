@@ -82,152 +82,158 @@ import RedRhex.tasks  # noqa: F401
 
 
 # =============================================================================
-# 鍵盤控制器 - 用 WASD + QE 控制機器人
+# 鍵盤控制器 - 切換模式（按一下維持，直到按下一個新按鍵）
 # =============================================================================
 class KeyboardController:
     """
-    鍵盤控制器：讓你用鍵盤控制機器人的移動方向！
+    鍵盤控制器：按一下就維持那個命令，直到按下另一個按鍵！
     
-    控制方式：
-    ┌─────────────────────────────────────┐
-    │         Q (逆時針)   W (前進)   E (順時針)          │
-    │                      ↑                             │
-    │         A (左移) ←   ·   → D (右移)               │
-    │                      ↓                             │
-    │                    S (後退)                         │
+    控制方式（單鍵切換）：
+    ┌─────────────────────────────────────────────────────┐
     │                                                     │
-    │         Space: 停止所有移動                         │
-    │         ESC: 退出                                   │
-    └─────────────────────────────────────┘
+    │     T (左前)     W (前進)     R (右前)              │
+    │                    ↑                                │
+    │     A (左移)   ←  ·  →   D (右移)                  │
+    │                    ↓                                │
+    │     F (左後)     S (後退)     G (右後)              │
+    │                                                     │
+    │     Q: 逆時針旋轉    E: 順時針旋轉                  │
+    │     Space: 停止                                     │
+    │                                                     │
+    └─────────────────────────────────────────────────────┘
     
-    組合按鍵：
-    - W+D: 右前方移動
-    - W+A: 左前方移動
-    - W+E: 前進 + 順時針旋轉
-    - 等等...
+    ★ 切換模式：按一下就維持，直到按下另一個按鍵 ★
     """
     
-    def __init__(self, velocity_scale: float = 1.0, angular_scale: float = 1.0):
+    def __init__(self, velocity_scale: float = 0.4, lateral_scale: float = 0.3, angular_scale: float = 0.8):
         """
         初始化鍵盤控制器
         
         參數：
-            velocity_scale: 線速度縮放（預設 1.0 m/s）
-            angular_scale: 角速度縮放（預設 1.0 rad/s）
+            velocity_scale: 前後線速度縮放（預設 0.4 m/s）
+            lateral_scale: 左右線速度縮放（預設 0.3 m/s）
+            angular_scale: 角速度縮放（預設 0.8 rad/s）
         """
         self.velocity_scale = velocity_scale
+        self.lateral_scale = lateral_scale
         self.angular_scale = angular_scale
         
-        # 當前按下的按鍵狀態
-        self.keys_pressed = {
-            'w': False, 's': False,
-            'a': False, 'd': False,
-            'q': False, 'e': False,
+        # ★★★ 預定義的命令（切換模式用）★★★
+        # 格式: (vx, vy, wz, 名稱)
+        # 對角線命令使用更大的側移分量，讓方向更明顯（約 53 度）
+        self.command_presets = {
+            'w': (velocity_scale, 0.0, 0.0, "前進"),
+            's': (-velocity_scale, 0.0, 0.0, "後退"),
+            'a': (0.0, lateral_scale, 0.0, "左移"),
+            'd': (0.0, -lateral_scale, 0.0, "右移"),
+            'q': (0.0, 0.0, angular_scale, "逆時針"),
+            'e': (0.0, 0.0, -angular_scale, "順時針"),
+            # 對角線：vx=0.25, vy=±0.33 → 角度 ≈ 53° (更明顯的斜向)
+            'r': (velocity_scale * 0.6, -lateral_scale * 1.1, 0.0, "右前"),
+            't': (velocity_scale * 0.6, lateral_scale * 1.1, 0.0, "左前"),
+            'g': (-velocity_scale * 0.6, -lateral_scale * 1.1, 0.0, "右後"),
+            'f': (-velocity_scale * 0.6, lateral_scale * 1.1, 0.0, "左後"),
+            'space': (0.0, 0.0, 0.0, "停止"),
         }
         
-        # 目標速度命令
-        self.target_vx = 0.0  # 前後速度
-        self.target_vy = 0.0  # 左右速度
-        self.target_wz = 0.0  # 旋轉速度
+        # 當前命令（切換模式：維持直到下一個按鍵）
+        self.target_vx = 0.0
+        self.target_vy = 0.0
+        self.target_wz = 0.0
+        self.current_command_name = "停止"
+        
+        # 上一幀的按鍵狀態（用於檢測按鍵「剛按下」的瞬間）
+        self._last_key_states = {}
         
         # 控制執行緒
         self._running = False
-        self._thread = None
+        self._use_carb = False
         
     def start(self):
-        """啟動鍵盤監聽（在背景執行緒中）"""
+        """啟動鍵盤監聽"""
         try:
-            import keyboard
+            import carb.input
+            import omni.appwindow
+            self._use_carb = True
             self._running = True
-            
-            # 註冊按鍵事件
-            for key in self.keys_pressed.keys():
-                keyboard.on_press_key(key, lambda e, k=key: self._on_key_press(k))
-                keyboard.on_release_key(key, lambda e, k=key: self._on_key_release(k))
-            
-            # 空白鍵：停止
-            keyboard.on_press_key('space', lambda e: self._stop_all())
-            
             print("\n" + "="*60)
-            print("🎮 鍵盤控制已啟用！")
+            print("🎮 鍵盤控制已啟用！【切換模式】")
             print("="*60)
-            print("  W: 前進    S: 後退")
-            print("  A: 左移    D: 右移")
-            print("  Q: 逆時針  E: 順時針")
-            print("  Space: 停止")
+            print("  按一下就維持那個命令，直到按下另一個按鍵")
+            print("")
+            print("  ┌─────────────────────────────────────┐")
+            print("  │  T(左前)   W(前進)   R(右前)        │")
+            print("  │  A(左移)     ·       D(右移)        │")
+            print("  │  F(左後)   S(後退)   G(右後)        │")
+            print("  │                                     │")
+            print("  │  Q: 逆時針    E: 順時針             │")
+            print("  │  Space: 停止                        │")
+            print("  └─────────────────────────────────────┘")
+            print("")
+            print(f"  速度: 前進={self.velocity_scale:.2f} m/s, 側移={self.lateral_scale:.2f} m/s")
+            print(f"        旋轉={self.angular_scale:.2f} rad/s")
+            print("="*60)
+            print("  ⚠️  請確保 Isaac Sim 視窗是焦點視窗！")
             print("="*60 + "\n")
-            
-        except ImportError:
-            print("\n" + "="*60)
-            print("⚠️  警告：無法載入 keyboard 模組")
-            print("   請執行: pip install keyboard")
-            print("   鍵盤控制功能將被停用")
-            print("="*60 + "\n")
+            return
+        except Exception as e:
+            print(f"[鍵盤] carb input 不可用: {e}")
             self._running = False
     
-    def _on_key_press(self, key: str):
-        """按鍵按下事件"""
-        self.keys_pressed[key] = True
-        self._update_commands()
-        
-    def _on_key_release(self, key: str):
-        """按鍵釋放事件"""
-        self.keys_pressed[key] = False
-        self._update_commands()
-        
-    def _stop_all(self):
-        """停止所有移動"""
-        for key in self.keys_pressed:
-            self.keys_pressed[key] = False
-        self._update_commands()
-        print("[鍵盤] 停止所有移動")
-        
-    def _update_commands(self):
-        """根據當前按鍵狀態更新速度命令"""
-        # 前後速度 (vx)
-        vx = 0.0
-        if self.keys_pressed['w']:
-            vx += 1.0
-        if self.keys_pressed['s']:
-            vx -= 1.0
+    def update_from_carb(self):
+        """從 carb input 讀取按鍵狀態（每幀調用）- 切換模式"""
+        if not self._use_carb:
+            return
             
-        # 左右速度 (vy)
-        # 注意：本體座標系中，正 Y 是左邊
-        vy = 0.0
-        if self.keys_pressed['a']:
-            vy += 1.0  # 向左
-        if self.keys_pressed['d']:
-            vy -= 1.0  # 向右
+        try:
+            import carb.input
+            import omni.appwindow
             
-        # 旋轉速度 (wz)
-        # 正值 = 逆時針，負值 = 順時針
-        wz = 0.0
-        if self.keys_pressed['q']:
-            wz += 1.0  # 逆時針
-        if self.keys_pressed['e']:
-            wz -= 1.0  # 順時針
+            app_window = omni.appwindow.get_default_app_window()
+            keyboard = app_window.get_keyboard()
+            input_iface = carb.input.acquire_input_interface()
             
-        # 正規化對角移動（讓對角線速度不會超過直線速度）
-        linear_speed = (vx**2 + vy**2)**0.5
-        if linear_speed > 1.0:
-            vx /= linear_speed
-            vy /= linear_speed
+            # 按鍵對應
+            key_map = {
+                'w': carb.input.KeyboardInput.W,
+                's': carb.input.KeyboardInput.S,
+                'a': carb.input.KeyboardInput.A,
+                'd': carb.input.KeyboardInput.D,
+                'q': carb.input.KeyboardInput.Q,
+                'e': carb.input.KeyboardInput.E,
+                'r': carb.input.KeyboardInput.R,
+                't': carb.input.KeyboardInput.T,
+                'f': carb.input.KeyboardInput.F,
+                'g': carb.input.KeyboardInput.G,
+                'space': carb.input.KeyboardInput.SPACE,
+            }
             
-        # 套用縮放
-        self.target_vx = vx * self.velocity_scale
-        self.target_vy = vy * self.velocity_scale
-        self.target_wz = wz * self.angular_scale
-        
-        # 顯示當前命令（只在有變化時）
-        if vx != 0 or vy != 0 or wz != 0:
-            direction = []
-            if vx > 0: direction.append("前進")
-            if vx < 0: direction.append("後退")
-            if vy > 0: direction.append("左移")
-            if vy < 0: direction.append("右移")
-            if wz > 0: direction.append("逆時針")
-            if wz < 0: direction.append("順時針")
-            print(f"[鍵盤] {'+'.join(direction)} | vx={self.target_vx:.2f}, vy={self.target_vy:.2f}, wz={self.target_wz:.2f}")
+            # 檢測「剛按下」的按鍵（上升沿觸發）
+            for key_name, key_code in key_map.items():
+                value = input_iface.get_keyboard_value(keyboard, key_code)
+                is_pressed = value > 0.5
+                was_pressed = self._last_key_states.get(key_name, False)
+                
+                # 檢測上升沿（從未按到按下）
+                if is_pressed and not was_pressed:
+                    self._on_key_triggered(key_name)
+                
+                self._last_key_states[key_name] = is_pressed
+                
+        except Exception as e:
+            if not hasattr(self, '_carb_error_printed'):
+                print(f"[鍵盤] carb input 錯誤: {e}")
+                self._carb_error_printed = True
+    
+    def _on_key_triggered(self, key: str):
+        """按鍵觸發事件（切換模式：設置並維持命令）"""
+        if key in self.command_presets:
+            vx, vy, wz, name = self.command_presets[key]
+            self.target_vx = vx
+            self.target_vy = vy
+            self.target_wz = wz
+            self.current_command_name = name
+            print(f"[命令切換] → {name} (vx={vx:.2f}, vy={vy:.2f}, wz={wz:.2f})")
     
     def get_commands(self, num_envs: int, device: torch.device) -> torch.Tensor:
         """
@@ -249,11 +255,6 @@ class KeyboardController:
     def stop(self):
         """停止鍵盤監聽"""
         self._running = False
-        try:
-            import keyboard
-            keyboard.unhook_all()
-        except:
-            pass
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -355,19 +356,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # =========================================================================
     # 從環境配置獲取速度範圍（用於縮放）
     unwrapped_env = env.unwrapped
-    try:
-        velocity_scale = getattr(unwrapped_env.cfg, 'vel_x_max', 1.0)
-        angular_scale = getattr(unwrapped_env.cfg, 'ang_vel_max', 1.0)
-    except:
-        velocity_scale = 1.0
-        angular_scale = 1.0
     
-    # 創建鍵盤控制器
+    # 使用與 discrete_directions 中相同的速度值
+    # 前進: 0.4 m/s, 側移: 0.3 m/s, 旋轉: 0.8 rad/s
+    velocity_scale = 0.4   # 與環境中的前進速度一致
+    lateral_scale = 0.3    # 與環境中的側移速度一致
+    angular_scale = 0.8    # 與環境中的旋轉速度一致
+    
+    # 創建鍵盤控制器（切換模式）
     keyboard_ctrl = KeyboardController(
         velocity_scale=velocity_scale,
+        lateral_scale=lateral_scale,
         angular_scale=angular_scale
     )
     keyboard_ctrl.start()
+    
+    # ★★★ 啟用外部控制模式，禁用環境的自動命令重採樣 ★★★
+    if hasattr(unwrapped_env, 'external_control'):
+        unwrapped_env.external_control = True
+        print("[INFO] 已啟用外部控制模式，環境不會自動切換命令")
     
     # 獲取設備和環境數量
     device = unwrapped_env.device
@@ -376,30 +383,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    frame_count = 0
+    
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
+        frame_count += 1
         
         # =====================================================================
-        # 鍵盤控制：覆蓋環境的速度命令
+        # 鍵盤控制（切換模式）
         # =====================================================================
         if keyboard_ctrl._running:
-            # 獲取鍵盤輸入的命令
+            keyboard_ctrl.update_from_carb()
             keyboard_commands = keyboard_ctrl.get_commands(num_envs, device)
-            # 覆蓋環境的命令
-            unwrapped_env.commands[:] = keyboard_commands
+            if hasattr(unwrapped_env, 'commands'):
+                unwrapped_env.commands[:] = keyboard_commands
         
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
             actions = policy(obs)
-            # env stepping
             obs, _, dones, _ = env.step(actions)
-            # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+        
+        # 再次設置命令（確保 reset 後也正確）
+        if keyboard_ctrl._running and hasattr(unwrapped_env, 'commands'):
+            unwrapped_env.commands[:] = keyboard_commands
+        
         if args_cli.video:
             timestep += 1
-            # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
 
@@ -408,15 +419,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    # 清理鍵盤控制器
     keyboard_ctrl.stop()
-    
-    # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()

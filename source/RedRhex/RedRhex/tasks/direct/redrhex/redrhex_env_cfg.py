@@ -741,7 +741,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     draw_debug_vis = True
     
     # 每隔幾個時間步更新一次視覺化（減少效能負擔）
-    debug_vis_interval = 5
+    # ★★★ 改為 1 讓視覺化即時更新，用於鍵盤控制測試 ★★★
+    debug_vis_interval = 1
 
     # =========================================================================
     # 【步態參數】RHex 非對稱 Duty Cycle 步態 - 詳細說明

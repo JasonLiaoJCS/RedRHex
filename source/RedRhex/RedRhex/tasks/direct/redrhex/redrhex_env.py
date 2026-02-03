@@ -418,6 +418,10 @@ class RedrhexEnv(DirectRLEnv):
         # 當前方向索引（用於追蹤）
         self.current_direction_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         
+        # ★★★ 外部控制標誌 ★★★
+        # 當設為 True 時，禁用自動命令重採樣，讓外部（如鍵盤）控制
+        self.external_control = False
+        
         # 初始化命令
         self._resample_commands(torch.arange(self.num_envs, device=self.device))
 
@@ -478,6 +482,10 @@ class RedrhexEnv(DirectRLEnv):
 
     def _update_commands(self):
         """更新命令（定期切換方向）"""
+        # ★★★ 外部控制時跳過自動重採樣 ★★★
+        if self.external_control:
+            return
+            
         dt = self.cfg.sim.dt * self.cfg.decimation
         self.command_time_left -= dt
         
@@ -2048,7 +2056,9 @@ class RedrhexEnv(DirectRLEnv):
         self.gait_phase[env_ids] = sample_uniform(0, 2 * math.pi, (num_reset,), device=self.device)
 
         # 採樣新的速度命令
-        self._resample_commands(env_ids)
+        # ★★★ 外部控制時不重新採樣命令，保持用戶設置的命令 ★★★
+        if not self.external_control:
+            self._resample_commands(env_ids)
 
         # ===== TensorBoard Logging =====
         # 計算並記錄 episode 獎勵總和到 extras["log"]
@@ -2241,25 +2251,34 @@ class RedrhexEnv(DirectRLEnv):
         arrow_scale[:, 2] = width_height  # 高度固定
         
         # =====================================================================
-        # 箭頭方向計算 - 使用向量旋轉而非角度計算
+        # 箭頭方向計算 - 只使用 YAW 角度，忽略 pitch/roll
         # =====================================================================
         # 
-        # 【方法】：將本體座標系的速度向量直接旋轉到世界座標系
-        # 這樣可以避免手動計算 yaw 角度可能出現的錯誤
+        # ★★★ 重要修正 ★★★
+        # 之前的方法用 quat_apply 會把 pitch/roll 也應用上去，
+        # 導致當機器人晃動時，箭頭方向會瘋狂抖動甚至反向！
+        # 
+        # 正確做法：只提取 yaw 角度，用純 yaw 旋轉來轉換速度向量
+        # 這樣箭頭才會穩定地指向機器人的本體坐標系方向
         #
         
         # 獲取機器人的姿態四元數
         base_quat_w = self.robot.data.root_quat_w
         
-        # 創建本體座標系的速度向量 (vx, vy, 0)
-        body_vel_3d = torch.zeros(xy_velocity.shape[0], 3, device=self.device)
-        body_vel_3d[:, 0] = xy_velocity[:, 0]  # 本體 X（前方）
-        body_vel_3d[:, 1] = xy_velocity[:, 1]  # 本體 Y（左方）
-        # body_vel_3d[:, 2] = 0  # 保持水平
+        # ★★★ 只提取 YAW 角度（忽略 pitch 和 roll）★★★
+        # Isaac Lab 四元數格式: [w, x, y, z]
+        w = base_quat_w[:, 0]
+        x = base_quat_w[:, 1]
+        y = base_quat_w[:, 2]
+        z = base_quat_w[:, 3]
+        base_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
         
-        # ★★★ 關鍵：使用 quat_apply 將本體座標系向量轉換到世界座標系 ★★★
-        # 這是最可靠的方法，不需要手動提取 yaw 角度
-        world_vel_3d = math_utils.quat_apply(base_quat_w, body_vel_3d)
+        # 計算本體座標系速度的方向角度（相對於機器人前方）
+        # atan2(vy, vx) 給出本體座標系中的速度方向
+        body_heading = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+        
+        # 世界座標系的方向 = 機器人 yaw + 本體速度方向
+        linear_world_angle = base_yaw + body_heading
         
         # 處理純旋轉的特殊情況
         if ang_vel is not None:
@@ -2269,25 +2288,13 @@ class RedrhexEnv(DirectRLEnv):
             # 純旋轉時的角度：箭頭以 wz 速度持續旋轉（相對於機器人朝向）
             rotation_angle = ang_vel * sim_time * 2.0  # 乘以 2 讓旋轉更明顯
             
-            # 從四元數提取 yaw（僅用於純旋轉的箭頭動畫）
-            # Isaac Lab 四元數格式: [w, x, y, z]
-            w = base_quat_w[:, 0]
-            x = base_quat_w[:, 1]
-            y = base_quat_w[:, 2]
-            z = base_quat_w[:, 3]
-            base_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-            
             # 純旋轉時的世界座標系角度（繞圈動畫）
             rotation_world_angle = base_yaw + rotation_angle
-            
-            # 線性移動時從世界座標系速度計算角度
-            linear_world_angle = torch.atan2(world_vel_3d[:, 1], world_vel_3d[:, 0])
             
             # 根據是否純旋轉選擇角度
             world_heading = torch.where(is_pure_rotation, rotation_world_angle, linear_world_angle)
         else:
-            # 從世界座標系速度直接計算角度
-            world_heading = torch.atan2(world_vel_3d[:, 1], world_vel_3d[:, 0])
+            world_heading = linear_world_angle
         
         # 創建只有 yaw 旋轉的四元數（箭頭永遠水平）
         zeros = torch.zeros_like(world_heading)
