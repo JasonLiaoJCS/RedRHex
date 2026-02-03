@@ -435,18 +435,18 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     
     # -------------------------------------------------------------------------
     # 【範例 1】平坦地面（目前使用中）
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
-        ),
-        debug_vis=False,
-    )
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground",
+    #     terrain_type="plane",
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         friction_combine_mode="multiply",
+    #         restitution_combine_mode="multiply",
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #     ),
+    #     debug_vis=False,
+    # )
     # -------------------------------------------------------------------------
 
     # -------------------------------------------------------------------------
@@ -509,45 +509,45 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # -------------------------------------------------------------------------
     # 【範例 4】混合地形（多種地形組合，取消註解即可使用）
     # -------------------------------------------------------------------------
-    # terrain = TerrainImporterCfg(
-    #     prim_path="/World/ground",
-    #     terrain_type="generator",
-    #     terrain_generator=TerrainGeneratorCfg(
-    #         size=(8.0, 8.0),
-    #         num_rows=8,
-    #         num_cols=8,
-    #         curriculum=True,        # 啟用課程學習：由簡到難
-    #         sub_terrains={
-    #             # 平坦地形佔 20%（最簡單）
-    #             "flat": mesh.MeshPlaneTerrainCfg(
-    #                 proportion=0.2,
-    #             ),
-    #             # 隨機起伏佔 30%（中等難度）
-    #             "rough": hf.HfRandomUniformTerrainCfg(
-    #                 proportion=0.3,
-    #                 noise_range=(-0.03, 0.03),
-    #                 noise_step=0.005,
-    #             ),
-    #             # 金字塔階梯佔 30%（較難）
-    #             "stairs": hf.HfPyramidStairsTerrainCfg(
-    #                 proportion=0.3,
-    #                 step_height_range=(0.05, 0.1),
-    #                 step_width=0.25,
-    #             ),
-    #             # 波浪地形佔 20%（困難）
-    #             "wave": hf.HfWaveTerrainCfg(
-    #                 proportion=0.2,
-    #                 amplitude_range=(0.02, 0.06),
-    #                 num_waves=2,
-    #             ),
-    #         },
-    #     ),
-    #     collision_group=-1,
-    #     physics_material=sim_utils.RigidBodyMaterialCfg(
-    #         static_friction=1.0,
-    #         dynamic_friction=1.0,
-    #     ),
-    # )
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            size=(8.0, 8.0),
+            num_rows=8,
+            num_cols=8,
+            curriculum=True,        # 啟用課程學習：由簡到難
+            sub_terrains={
+                # 平坦地形佔 20%（最簡單）
+                "flat": mesh.MeshPlaneTerrainCfg(
+                    proportion=0.2,
+                ),
+                # 隨機起伏佔 30%（中等難度）
+                "rough": hf.HfRandomUniformTerrainCfg(
+                    proportion=0.3,
+                    noise_range=(-0.03, 0.03),
+                    noise_step=0.005,
+                ),
+                # 金字塔階梯佔 30%（較難）
+                "stairs": hf.HfPyramidStairsTerrainCfg(
+                    proportion=0.3,
+                    step_height_range=(0.05, 0.1),
+                    step_width=0.25,
+                ),
+                # 波浪地形佔 20%（困難）
+                "wave": hf.HfWaveTerrainCfg(
+                    proportion=0.2,
+                    amplitude_range=(0.02, 0.06),
+                    num_waves=2,
+                ),
+            },
+        ),
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+    )
 
     # =========================================================================
     # 【關節名稱對照表】把關節編號與位置對應起來
