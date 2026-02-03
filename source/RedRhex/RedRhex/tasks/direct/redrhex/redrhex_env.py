@@ -322,6 +322,12 @@ class RedrhexEnv(DirectRLEnv):
             # ABAD 獎勵
             "rew_abad_action": torch.zeros(self.num_envs, device=self.device),
             "rew_abad_stability": torch.zeros(self.num_envs, device=self.device),
+            # ★★★ 新增：側移專用獎勵 ★★★
+            "rew_abad_alternation": torch.zeros(self.num_envs, device=self.device),    # ABAD 交替
+            "rew_abad_amplitude": torch.zeros(self.num_envs, device=self.device),      # ABAD 幅度
+            "rew_abad_jitter": torch.zeros(self.num_envs, device=self.device),         # ABAD 抖動懲罰
+            "rew_sync_jitter": torch.zeros(self.num_envs, device=self.device),         # 全身抖動懲罰
+            "rew_abad_action_rate": torch.zeros(self.num_envs, device=self.device),    # ABAD 變化率懲罰
             # 平滑性
             "rew_action_rate": torch.zeros(self.num_envs, device=self.device),
             # 診斷指標 (非獎勵)
@@ -843,7 +849,18 @@ class RedrhexEnv(DirectRLEnv):
         # 構建最終的速度目標
         final_drive_vel = target_drive_vel.clone()
         
-        # 對於純側移的環境，使用 PD 控制器計算速度來把腳固定在預設位置
+        # =====================================================================
+        # 純側移策略：使用 ABAD 交替外展內收 + 主驅動低速保持
+        # =====================================================================
+        # 目標步態：
+        # - 一組腿抬起（主驅動快轉讓腳離地），ABAD 向外擺
+        # - 另一組腿著地支撐，ABAD 向內收推動身體
+        # - 交替進行，實現類似「外八/內八」的側移
+        #
+        # 主驅動控制：使用 P 控制器緩慢將腿歸位，減少地面摩擦干擾
+        # ABAD 控制：由 AI 學習交替外展內收的模式
+        # =====================================================================
+        
         if is_pure_lateral.any():
             # 獲取當前主驅動關節位置
             current_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
@@ -852,21 +869,33 @@ class RedrhexEnv(DirectRLEnv):
             target_pos = self._lateral_default_pos.unsqueeze(0).expand(self.num_envs, -1)  # [N, 6]
             pos_error = target_pos - current_drive_pos  # [N, 6]
             
-            # 使用 P 控制器計算所需速度（Kp = 5.0，讓腳快速回到預設位置）
-            # 速度 = Kp * 位置誤差
-            lateral_kp = 5.0  # 比例增益
+            # ★★★ 降低 Kp 以減少振盪 ★★★
+            # Kp = 1.5 配合 damping=50 應該更穩定
+            lateral_kp = 1.5  # 降低從 5.0 → 1.5
             lateral_vel = lateral_kp * pos_error
             
             # 限制速度，防止過快
-            max_lateral_vel = 3.0  # 最大修正速度 rad/s
+            max_lateral_vel = 1.5  # 降低從 3.0 → 1.5 rad/s
             lateral_vel = torch.clamp(lateral_vel, min=-max_lateral_vel, max=max_lateral_vel)
             
-            # 對於純側移的環境，使用這個 PD 計算的速度
+            # 當位置誤差很小時（腿已歸位），速度設為 0（死區）
+            # 這樣可以避免在目標位置附近的微小振盪
+            deadzone = 0.05  # 約 3 度的死區
+            lateral_vel = torch.where(
+                torch.abs(pos_error) < deadzone,
+                torch.zeros_like(lateral_vel),
+                lateral_vel
+            )
+            
+            # 對於純側移的環境，使用這個 P 計算的速度
             final_drive_vel = torch.where(
                 lateral_mask,
                 lateral_vel,
                 final_drive_vel
             )
+            
+            # 記錄側移狀態供獎勵函數使用
+            self._is_lateral_mode = is_pure_lateral.clone()
         
         # 發送速度指令給所有環境
         self.robot.set_joint_velocity_target(final_drive_vel, joint_ids=self._main_drive_indices)
@@ -1446,6 +1475,84 @@ class RedrhexEnv(DirectRLEnv):
         ) * dt
         total_reward += lateral_tracking
 
+        # =================================================================
+        # G6.5: 側移專用獎勵 ★★★ 新增 ★★★
+        # =================================================================
+        # 這些獎勵專門用於純側移（正左/正右）時的步態控制
+        # 目標步態：ABAD 交替外展內收，一組抬腿一組著地
+        
+        # 檢測是否處於純側移模式
+        is_lateral_mode = getattr(self, '_is_lateral_mode', torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+        
+        if is_lateral_mode.any():
+            # 獲取左右兩側的 ABAD 位置
+            # 右側：索引 0, 1, 2；左側：索引 3, 4, 5
+            abad_right = abad_pos[:, :3]  # 右側 ABAD
+            abad_left = abad_pos[:, 3:]   # 左側 ABAD
+            
+            # G6.5.1 ABAD 交替獎勵：左右兩側應該反向
+            # 理想情況：一側外展（正值），另一側內收（負值）
+            # 使用乘積：如果反向，乘積為負數
+            abad_product = abad_right.mean(dim=1) * abad_left.mean(dim=1)
+            # 乘積為負數 = 反向 = 好 → 給獎勵
+            abad_alternation_reward = torch.where(
+                abad_product < -0.01,  # 乘積為負且有一定幅度
+                -abad_product * 2.0,   # 負數變正數作為獎勵
+                torch.zeros_like(abad_product)
+            )
+            rew_abad_alternation = abad_alternation_reward * getattr(self.cfg, 'rew_scale_abad_alternation', 2.0) * dt
+            # 只對側移模式的環境給獎勵
+            rew_abad_alternation = torch.where(is_lateral_mode, rew_abad_alternation, torch.zeros_like(rew_abad_alternation))
+            total_reward += rew_abad_alternation
+            
+            # G6.5.2 ABAD 幅度獎勵：側移時 ABAD 應該有足夠擺幅
+            min_abad_amplitude = 0.1  # 最小需要的擺幅（約 6 度）
+            abad_amplitude = torch.abs(abad_pos).mean(dim=1)
+            rew_abad_amplitude = torch.where(
+                abad_amplitude > min_abad_amplitude,
+                abad_amplitude * getattr(self.cfg, 'rew_scale_abad_amplitude', 1.0),
+                torch.zeros_like(abad_amplitude)
+            ) * dt
+            rew_abad_amplitude = torch.where(is_lateral_mode, rew_abad_amplitude, torch.zeros_like(rew_abad_amplitude))
+            total_reward += rew_abad_amplitude
+            
+            # G6.5.3 抖動懲罰：檢測 ABAD 的高頻小幅抖動
+            # 計算 ABAD 動作變化率
+            if hasattr(self, 'last_actions'):
+                abad_action_current = self.actions[:, 6:12]
+                abad_action_last = self.last_actions[:, 6:12]
+                abad_action_rate = torch.sum(torch.square(abad_action_current - abad_action_last), dim=1)
+                
+                # 如果變化率高但幅度小 → 抖動
+                is_jitter = (abad_action_rate > 0.1) & (abad_amplitude < 0.15)
+                rew_abad_jitter = is_jitter.float() * getattr(self.cfg, 'rew_scale_abad_jitter', -3.0) * dt
+                rew_abad_jitter = torch.where(is_lateral_mode, rew_abad_jitter, torch.zeros_like(rew_abad_jitter))
+                total_reward += rew_abad_jitter
+            
+            # G6.5.4 全身同步抖動懲罰：所有關節同時高頻動作
+            # 計算所有動作的變化率
+            all_action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+            # 如果所有動作變化都很大且幅度小 → 全身抖動
+            main_drive_amplitude = torch.abs(main_drive_vel).mean(dim=1)
+            is_sync_jitter = (all_action_rate > 0.5) & (main_drive_amplitude < 1.0) & (abad_amplitude < 0.1)
+            rew_sync_jitter = is_sync_jitter.float() * getattr(self.cfg, 'rew_scale_sync_jitter', -5.0) * dt
+            rew_sync_jitter = torch.where(is_lateral_mode, rew_sync_jitter, torch.zeros_like(rew_sync_jitter))
+            total_reward += rew_sync_jitter
+        else:
+            # 初始化這些獎勵為零
+            rew_abad_alternation = torch.zeros(self.num_envs, device=self.device)
+            rew_abad_amplitude = torch.zeros(self.num_envs, device=self.device)
+            rew_abad_jitter = torch.zeros(self.num_envs, device=self.device)
+            rew_sync_jitter = torch.zeros(self.num_envs, device=self.device)
+        
+        # G6.6 ABAD 動作變化率額外懲罰（對所有模式生效）
+        if hasattr(self, 'last_actions'):
+            abad_action_rate_all = torch.sum(torch.square(self.actions[:, 6:12] - self.last_actions[:, 6:12]), dim=1)
+            rew_abad_action_rate = abad_action_rate_all * getattr(self.cfg, 'rew_scale_abad_action_rate', -0.1) * dt
+            total_reward += rew_abad_action_rate
+        else:
+            rew_abad_action_rate = torch.zeros(self.num_envs, device=self.device)
+
         # ========================================================
         # 存活獎勵
         # ========================================================
@@ -1541,6 +1648,13 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_velocity_match"] += rew_velocity
         self.episode_sums["rew_alternation"] += rew_alternation
         self.episode_sums["rew_frequency"] += rew_frequency
+        
+        # ★★★ 新增：側移專用獎勵記錄 ★★★
+        self.episode_sums["rew_abad_alternation"] += rew_abad_alternation
+        self.episode_sums["rew_abad_amplitude"] += rew_abad_amplitude
+        self.episode_sums["rew_abad_jitter"] += rew_abad_jitter
+        self.episode_sums["rew_sync_jitter"] += rew_sync_jitter
+        self.episode_sums["rew_abad_action_rate"] += rew_abad_action_rate
         
         # 診斷
         self.episode_sums["diag_forward_vel"] += actual_vx

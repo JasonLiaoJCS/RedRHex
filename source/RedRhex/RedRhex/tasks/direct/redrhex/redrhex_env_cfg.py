@@ -1053,7 +1053,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
     # 動作變化率懲罰
     # legged_gym: action_rate = -0.01
-    rew_scale_action_rate = -0.005  # 降低，讓動作更靈活
+    # ★★★ 提高此值以抑制高頻抖動 ★★★
+    rew_scale_action_rate = -0.05  # 提高 10 倍：-0.005 → -0.05
 
     # 關節加速度懲罰
     # legged_gym: dof_acc = -2.5e-7
@@ -1061,6 +1062,9 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
     # 關節速度懲罰（可選，legged_gym: dof_vel = -0.0）
     rew_scale_dof_vel = -0.0
+    
+    # ABAD 動作變化率額外懲罰（抑制 ABAD 抖動）
+    rew_scale_abad_action_rate = -0.1
 
     # -------------------------------------------------------------------------
     # G5: RHex 步態專用獎勵
@@ -1099,11 +1103,32 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # ABAD 用於轉彎和側移，直走時應該保持穩定
 
     # ABAD 聰明使用獎勵
-    rew_scale_abad_smart_use = 0.3
+    rew_scale_abad_smart_use = 0.5  # 提高，鼓勵側移時使用 ABAD
 
     # ABAD 浪費懲罰
-    rew_scale_abad_waste = -0.05
+    rew_scale_abad_waste = -0.1  # 提高，直走時不要亂用
 
+    # -------------------------------------------------------------------------
+    # G6.5: 側移步態專用獎勵 ★★★ 新增 ★★★
+    # -------------------------------------------------------------------------
+    # 這些獎勵專門用於純側移（正左/正右）時的步態控制
+    # 目標步態：ABAD 交替外展內收，一組抬腿一組著地
+    
+    # ABAD 交替獎勵：左右兩側 ABAD 動作應該反向（一邊外展一邊內收）
+    rew_scale_abad_alternation = 2.0
+    
+    # ABAD 幅度獎勵：側移時 ABAD 應該有足夠的擺幅
+    rew_scale_abad_amplitude = 1.0
+    
+    # 抖動懲罰：懲罰 ABAD 的高頻小幅抖動
+    rew_scale_abad_jitter = -3.0
+    
+    # 同步抖動懲罰：懲罰所有腿同時高頻動作
+    rew_scale_sync_jitter = -5.0
+    
+    # 側移腳離地獎勵：側移時應該有腳離地（通過主驅動相位判斷）
+    rew_scale_lateral_lift = 1.5
+    
     # -------------------------------------------------------------------------
     # G7: 額外獎勵
     # -------------------------------------------------------------------------
