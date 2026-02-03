@@ -291,12 +291,19 @@ class RedrhexEnv(DirectRLEnv):
             "rew_alive": torch.zeros(self.num_envs, device=self.device),
             "rew_forward_vel": torch.zeros(self.num_envs, device=self.device),
             "rew_vel_tracking": torch.zeros(self.num_envs, device=self.device),
-            # 步態獎勵
+            # 步態獎勵 - RHex 非對稱 Duty Cycle
             "rew_gait_sync": torch.zeros(self.num_envs, device=self.device),
+            "rew_tripod_sync": torch.zeros(self.num_envs, device=self.device),
+            "rew_tripod_support": torch.zeros(self.num_envs, device=self.device),      # 連續支撐
+            "rew_airborne_penalty": torch.zeros(self.num_envs, device=self.device),    # 騰空懲罰
+            "rew_double_support": torch.zeros(self.num_envs, device=self.device),      # 雙支撐獎勵
+            "rew_velocity_match": torch.zeros(self.num_envs, device=self.device),      # 速度匹配
+            "rew_alternation": torch.zeros(self.num_envs, device=self.device),         # 交替步態
+            "rew_frequency": torch.zeros(self.num_envs, device=self.device),           # 頻率一致
+            # 舊版步態獎勵（保留向後相容）
             "rew_rotation_dir": torch.zeros(self.num_envs, device=self.device),
             "rew_correct_dir": torch.zeros(self.num_envs, device=self.device),
             "rew_all_legs": torch.zeros(self.num_envs, device=self.device),
-            "rew_tripod_sync": torch.zeros(self.num_envs, device=self.device),
             "rew_mean_vel": torch.zeros(self.num_envs, device=self.device),
             "rew_min_vel": torch.zeros(self.num_envs, device=self.device),
             "rew_continuous_support": torch.zeros(self.num_envs, device=self.device),
@@ -327,13 +334,22 @@ class RedrhexEnv(DirectRLEnv):
             "diag_cmd_wz": torch.zeros(self.num_envs, device=self.device),
             "diag_actual_wz": torch.zeros(self.num_envs, device=self.device),
             "diag_wz_error": torch.zeros(self.num_envs, device=self.device),
-            # ★★★ 新增：腿速度診斷 ★★★
+            # 腿速度診斷
             "diag_target_leg_vel": torch.zeros(self.num_envs, device=self.device),
             "diag_leg_vel_error": torch.zeros(self.num_envs, device=self.device),
+            # ★★★ 新增：RHex 步態診斷 ★★★
+            "diag_stance_count_a": torch.zeros(self.num_envs, device=self.device),    # A組著地腿數
+            "diag_stance_count_b": torch.zeros(self.num_envs, device=self.device),    # B組著地腿數
+            "diag_phase_diff": torch.zeros(self.num_envs, device=self.device),        # 相位差
+            "diag_mean_velocity": torch.zeros(self.num_envs, device=self.device),     # 平均腿速
+            "diag_stance_velocity": torch.zeros(self.num_envs, device=self.device),   # 著地組速度
+            "diag_swing_velocity": torch.zeros(self.num_envs, device=self.device),    # 擺動組速度
+            "diag_airborne_count": torch.zeros(self.num_envs, device=self.device),    # 騰空次數
         }
 
         # 初始化目標速度緩衝
         self._target_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
+        self._base_velocity = torch.zeros(self.num_envs, 6, device=self.device)  # 基礎速度（未經AI調節）
 
     def _setup_commands(self):
         """
@@ -453,29 +469,97 @@ class RedrhexEnv(DirectRLEnv):
 
     def _setup_gait(self):
         """
-        【設置步態相位】
+        【設置步態相位系統】 - RHex 非對稱 Duty Cycle 步態
         
-        什麼是「相位」？
-        想像六隻腳是六個時鐘的秒針，都在轉圈：
-        - 「相位」就是秒針現在指向幾點鐘的位置
-        - 「相位 0」= 12 點鐘方向
-        - 「相位 π」= 6 點鐘方向（相差 180 度）
+        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        ★ RHex 步態的核心概念                                      ★
+        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
         
-        為什麼需要相位？
-        交替三足步態要求：
-        - Tripod A 的三隻腳同步（相位都是 0）
-        - Tripod B 的三隻腳同步（相位都是 π）
-        - A 和 B 剛好相反（一組著地時，另一組在空中）
+        【傳統錯誤理解】
+        很多人以為 RHex 的兩組腿（Tripod A 和 B）是簡單的 180° 反相：
+        - A 組在 0° 時著地
+        - B 組在 180° 時著地
+        這樣會導致大部分時間機器人沒有腳撐著地板！
+        
+        【正確的 RHex 步態】
+        實際上，RHex 使用「非對稱 duty cycle」步態：
+        
+        1. 著地相位（Stance Phase）- 佔 ~65% 時間
+           - 腿在地面上，緩慢旋轉
+           - 提供穩定的支撐和推進力
+           - 速度約為基礎速度的 50%
+        
+        2. 擺動相位（Swing Phase）- 佔 ~35% 時間
+           - 腿離開地面，快速旋轉「一圈」
+           - 迅速回到準備著地的位置
+           - 速度約為基礎速度的 300%（3倍速！）
+        
+        【關鍵：為什麼不會騰空？】
+        因為 duty_cycle > 0.5，兩組的著地時間有「重疊」！
+        
+        重疊時間 = (2 × 0.65 - 1) × T = 0.30 × T
+        
+        這表示在每個週期中，有 30% 的時間是「兩組都著地」的超穩定狀態。
+        
+        ┌───────────────────────────────────────────────────────────────┐
+        │ 時間軸：                                                      │
+        │                                                               │
+        │ A組: ████████████████████████████████░░░░░░░░░░░░░░           │
+        │      ←──── 著地 (65%) ──────────────→←─ 擺動 ─→              │
+        │                                                               │
+        │ B組: ░░░░░░░░░░████████████████████████████████████░░░░       │
+        │      ←擺動→←────────── 著地 (65%) ─────────────→             │
+        │                                                               │
+        │ 支撐:████████████████████████████████████████████████████     │
+        │      ←─ A ─→←─ 重疊 ─→←─── B ───→←─ 重疊 ─→←─ A ─→          │
+        │              ↑                    ↑                          │
+        │         兩組都著地            兩組都著地                      │
+        │         (超級穩定!)           (超級穩定!)                     │
+        └───────────────────────────────────────────────────────────────┘
         """
-        # 全局步態相位計數器（像一個主時鐘，從 0 到 2π 循環）
+        # 全局步態相位計數器（主時鐘）
+        # 這是一個從 0 到 2π 循環的計數器，代表整個步態週期的進度
         self.gait_phase = torch.zeros(self.num_envs, device=self.device)
         
-        # 每條腿相對於主時鐘的偏移量
-        # Tripod A (腿 0, 3, 5): 跟著主時鐘走（偏移 0）
-        # Tripod B (腿 1, 2, 4): 比主時鐘慢半圈（偏移 π = 180°）
+        # 每條腿的相位偏移量
+        # Tripod A (腿 0, 3, 5): 偏移 0（跟著主時鐘）
+        # Tripod B (腿 1, 2, 4): 偏移值由 tripod_phase_offset 決定
         self.leg_phase_offsets = torch.zeros(6, device=self.device)
         self.leg_phase_offsets[self._tripod_a_indices] = 0.0
-        self.leg_phase_offsets[self._tripod_b_indices] = math.pi
+        self.leg_phase_offsets[self._tripod_b_indices] = self.cfg.tripod_phase_offset
+        
+        # =====================================================================
+        # 【預計算步態參數】
+        # =====================================================================
+
+        # 著地相位邊界（弧度）
+        # 注意：stance_phase_start 可能是負數（如 -π/6）
+        # 需要正規化到 [0, 2π] 範圍進行比較
+        self.stance_phase_start = self.cfg.stance_phase_start  # 如 -π/6 (-30°)
+        self.stance_phase_end = self.cfg.stance_phase_end      # 如 +π/6 (+30°)
+
+        # 著地角度區間大小（弧度）
+        stance_angle_range = self.stance_phase_end - self.stance_phase_start  # 如 π/3 (60°)
+        swing_angle_range = 2 * math.pi - stance_angle_range  # 如 5π/3 (300°)
+
+        # 著地和擺動的目標速度（弧度/秒）
+        base_vel = self.cfg.base_gait_angular_vel  # 6.28 rad/s
+        self.stance_velocity = base_vel * self.cfg.stance_velocity_ratio  # ~0.94 rad/s (很慢)
+        self.swing_velocity = base_vel * self.cfg.swing_velocity_ratio    # ~9.42 rad/s (快)
+
+        # 速度比值（用於獎勵計算）
+        self.velocity_ratio = self.swing_velocity / self.stance_velocity  # ~10x
+
+        # 記錄上一步的相位狀態（用於檢測相位轉換）
+        self.last_leg_in_stance = torch.ones(self.num_envs, 6, dtype=torch.bool, device=self.device)
+
+        print(f"\n[步態系統初始化] ★ 著地角度小、時間長；擺動角度大、時間短 ★")
+        print(f"  著地相位角度範圍: {math.degrees(self.stance_phase_start):.1f}° ~ {math.degrees(self.stance_phase_end):.1f}° (共 {math.degrees(stance_angle_range):.1f}°)")
+        print(f"  擺動相位角度範圍: {math.degrees(self.stance_phase_end):.1f}° ~ {math.degrees(self.stance_phase_start + 2*math.pi):.1f}° (共 {math.degrees(swing_angle_range):.1f}°)")
+        print(f"  著地時間佔比: {self.cfg.stance_duty_cycle * 100:.1f}%")
+        print(f"  著地速度: {self.stance_velocity:.2f} rad/s ({math.degrees(self.stance_velocity):.1f}°/s)")
+        print(f"  擺動速度: {self.swing_velocity:.2f} rad/s ({math.degrees(self.swing_velocity):.1f}°/s)")
+        print(f"  速度比值 (swing/stance): {self.velocity_ratio:.1f}x")
 
     def _setup_scene(self):
         """
@@ -535,14 +619,28 @@ class RedrhexEnv(DirectRLEnv):
         print(f"   Tripod B (idx {self._tripod_b_indices.tolist()}): 關節 7, 12, 23")
         
         print(f"\n🎮 動作空間 ({self.cfg.action_space}):")
-        print(f"   [0:6] 主驅動速度 (scale: ±{self.cfg.main_drive_vel_scale} rad/s)")
+        print(f"   [0:6] 主驅動速度調節因子 (±50%)")
         print(f"   [6:12] ABAD 位置 (scale: ±{self.cfg.abad_pos_scale} rad)")
         
-        print(f"\n💡 RHex 步態原理:")
-        print(f"   - C型腿持續旋轉（非擺動），像輪子一樣推進")
-        print(f"   - Stance phase (0~π): 腿接觸地面，穩定推進")
-        print(f"   - Swing phase (π~2π): 腿離地，快速轉到落地位置")
-        print(f"   - 兩組 Tripod 交替支撐，確保持續接地")
+        print(f"\n💡 RHex 非對稱 Duty Cycle 步態:")
+        print(f"   ┌────────────────────────────────────────────────────────┐")
+        print(f"   │ 著地相位 (Stance): 佔 {self.cfg.stance_duty_cycle*100:.0f}% 週期             │")
+        print(f"   │   - 速度: {self.stance_velocity:.2f} rad/s (慢轉)                  │")
+        print(f"   │   - 功能: 提供穩定支撐和推進力                       │")
+        print(f"   │                                                        │")
+        print(f"   │ 擺動相位 (Swing): 佔 {(1-self.cfg.stance_duty_cycle)*100:.0f}% 週期              │")
+        print(f"   │   - 速度: {self.swing_velocity:.2f} rad/s (快轉！)                │")
+        print(f"   │   - 功能: 快速回到準備著地的位置                     │")
+        print(f"   │                                                        │")
+        print(f"   │ 速度比: {self.velocity_ratio:.1f}x (擺動是著地的 {self.velocity_ratio:.1f} 倍速)       │")
+        print(f"   │ 重疊期: {(2*self.cfg.stance_duty_cycle-1)*100:.0f}% (兩組同時著地的超穩定期)      │")
+        print(f"   └────────────────────────────────────────────────────────┘")
+        
+        print(f"\n📊 步態時序圖:")
+        print(f"   時間 →")
+        print(f"   A組: ████████████████░░░░░░░░  (著地65% + 擺動35%)")
+        print(f"   B組: ░░░░░░░░████████████████  (先擺動 + 後著地)")
+        print(f"   支撐: ████████████████████████  (始終有支撐!)")
         print("=" * 70 + "\n")
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -566,94 +664,117 @@ class RedrhexEnv(DirectRLEnv):
         """
         【將 AI 的動作指令轉換成實際的關節控制】
         
-        這是控制機器人運動的核心函數！
+        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        ★ RHex 非對稱 Duty Cycle 步態控制邏輯                               ★
+        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
         
-        AI 輸出的動作是 12 個數字（範圍 -1 到 +1）：
-        ┌──────────────────────────────────────────────────────────┐
-        │ 動作 [0:6]  → 控制 6 個主驅動關節的旋轉速度             │
-        │              （數字越大，腿轉得越快）                   │
-        │                                                          │
-        │ 動作 [6:12] → 控制 6 個 ABAD 關節的角度位置             │
-        │              （數字越大，腿往外擺越多）                 │
-        └──────────────────────────────────────────────────────────┘
+        【控制架構】
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ AI 動作 [0:6]  → 速度調節因子（微調基礎速度 ±50%）             │
+        │ AI 動作 [6:12] → ABAD 關節目標位置                              │
+        └─────────────────────────────────────────────────────────────────┘
         
-        【重要概念：左右腿的旋轉方向】
-        想像你站在機器人上方往下看：
-        - 右側的腿要「逆時針」轉，才能把機器人往前推
-        - 左側的腿要「順時針」轉，才能把機器人往前推
-        - 所以同樣的「前進」命令，左右腿的旋轉方向是相反的！
+        【核心邏輯：根據相位決定基礎速度】
+        1. 計算每隻腿當前的相位角度
+        2. 判斷是在「著地相位」還是「擺動相位」
+        3. 著地相位 → 使用慢速 (stance_velocity)
+        4. 擺動相位 → 使用快速 (swing_velocity)
+        5. AI 只能微調（±50%），不能完全停止
         
-            前方 →
-           ↺ ↻     （左右腿轉向相反）
-           ↺ ↻
-           ↺ ↻
+        【為什麼這樣設計？】
+        - 確保步態結構正確（著地慢、擺動快）
+        - 給 AI 調整空間（適應不同地形和速度需求）
+        - 防止 AI 學會「停下來偷懶」的策略
         """
         # =====================================================================
-        # 主驅動關節控制：速度控制模式
+        # 步驟 1：計算每隻腿的當前相位
         # =====================================================================
-        # 取出動作向量的前 6 個數值（控制 6 個主驅動關節）
+        # 從關節角度計算相位（考慮方向乘數）
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
+        effective_pos = main_drive_pos * self._direction_multiplier   # 修正左右方向
+        
+        # 將角度正規化到 [0, 2π] 範圍
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)  # [N, 6]
+        
+        # =====================================================================
+        # 步驟 2：判斷每隻腿是否在著地相位
+        # =====================================================================
+        # 著地相位範圍可能跨越 0°/360° 邊界
+        # 例如：stance_phase_start = -30° (-π/6), stance_phase_end = +30° (π/6)
+        # 需要特殊處理！
+
+        if self.stance_phase_start < 0:
+            # 著地區間跨越 0° 邊界：例如 330° ~ 30° (即 -30° ~ +30°)
+            # 正規化 start 到 [0, 2π]
+            normalized_start = self.stance_phase_start + 2 * math.pi  # 如 330° (11π/6)
+
+            # 腿相位在著地區間內的條件：
+            # phase >= normalized_start (如 >= 330°) 或 phase < stance_phase_end (如 < 30°)
+            in_stance_phase = (leg_phase >= normalized_start) | (leg_phase < self.stance_phase_end)
+        else:
+            # 著地區間不跨越邊界：正常比較
+            in_stance_phase = (leg_phase >= self.stance_phase_start) & (leg_phase < self.stance_phase_end)
+
+        # in_stance_phase: [N, 6] 布林張量
+
+        # 記錄相位狀態（用於獎勵計算）
+        self._current_leg_in_stance = in_stance_phase
+        
+        # =====================================================================
+        # 步驟 3：根據相位選擇基礎速度
+        # =====================================================================
+        # 著地相位 → 很慢 (stance_velocity ≈ 0.94 rad/s ≈ 54°/s)
+        #           只轉一小段角度 (60°)，但花 65% 的時間
+        # 擺動相位 → 很快 (swing_velocity ≈ 9.42 rad/s ≈ 540°/s)
+        #           要轉大段角度 (300°)，只花 35% 的時間
+        base_velocity = torch.where(
+            in_stance_phase,
+            torch.full_like(leg_phase, self.stance_velocity),   # 著地：很慢
+            torch.full_like(leg_phase, self.swing_velocity)     # 擺動：很快
+        )  # [N, 6]
+        
+        # =====================================================================
+        # 步驟 4：應用 AI 的速度調節因子
+        # =====================================================================
+        # AI 動作 [0:6] 範圍 [-1, 1]
+        # 轉換成速度乘數 [0.5, 1.5]，讓 AI 可以微調但不能停下來
         drive_actions = self.actions[:, :6]
-        
-        # 基礎旋轉速度（弧度/秒）
-        # 6.28 rad/s ≈ 每秒轉 1 圈（因為 2π ≈ 6.28）
-        base_vel = self.cfg.base_gait_angular_vel  # 6.28 rad/s
-        
-        # 【動作到速度的轉換邏輯】
-        # 
-        # 設計原則：腿不能完全停下來！
-        # 因為 RHex 的運動原理就是靠腿持續旋轉，停下來就不能動了。
-        # 
-        # 轉換規則：
-        # • 動作 = -1 → 速度 = 基礎速度 × 0.5（最慢，但還是在轉）
-        # • 動作 =  0 → 速度 = 基礎速度 × 1.0（正常速度）
-        # • 動作 = +1 → 速度 = 基礎速度 × 1.5（最快）
-        # 
-        # 這樣 AI 只能調整「轉多快」，不能讓腿停下來偷懶
         speed_scale = 1.0 + drive_actions * 0.5  # 範圍 [0.5, 1.5]
-        target_speed = base_vel * speed_scale    # 範圍 [3.14, 9.42] rad/s
         
-        # 【應用方向乘數：讓左右腿往正確的方向轉】
+        # 計算目標速度
+        target_speed = base_velocity * speed_scale  # [N, 6]
+        
+        # =====================================================================
+        # 步驟 5：應用方向乘數（左右腿轉向相反）
+        # =====================================================================
         # 右側腿（索引 0,1,2）乘以 -1 → 逆時針轉
         # 左側腿（索引 3,4,5）乘以 +1 → 順時針轉
         target_drive_vel = target_speed * self._direction_multiplier
         
-        # 安全限制：防止速度過快（最大 15 rad/s ≈ 每秒 2.4 圈）
-        target_drive_vel = torch.clamp(target_drive_vel, min=-15.0, max=15.0)
+        # 安全限制：防止速度過快
+        max_vel = self.swing_velocity * 1.5  # 允許最大 1.5 倍擺動速度
+        target_drive_vel = torch.clamp(target_drive_vel, min=-max_vel, max=max_vel)
         
-        # 保存目標速度（之後用來計算「目標 vs 實際」的差距）
+        # 保存目標速度（用於獎勵計算和診斷）
         self._target_drive_vel = target_drive_vel.clone()
+        self._base_velocity = base_velocity.clone()  # 保存基礎速度（未經 AI 調節）
         
-        # 【發送速度指令給主驅動關節】
-        # set_joint_velocity_target = 告訴關節「請以這個速度旋轉」
-        # 模擬器會嘗試讓關節達到這個速度（但可能因為負載而達不到）
+        # =====================================================================
+        # 步驟 6：發送速度指令給主驅動關節
+        # =====================================================================
         self.robot.set_joint_velocity_target(target_drive_vel, joint_ids=self._main_drive_indices)
         
         # =====================================================================
-        # ABAD 關節控制：位置控制模式
+        # ABAD 關節控制：位置控制模式（與之前相同）
         # =====================================================================
-        # 取出動作向量的後 6 個數值（控制 6 個 ABAD 關節）
         abad_actions = self.actions[:, 6:12]
-        
-        # 將動作值轉換成實際角度
-        # 動作範圍 [-1, 1]，乘以 scale 後變成實際角度（弧度）
         target_abad_pos = abad_actions * self.cfg.abad_pos_scale
-        
-        # 安全限制：最大擺動角度 ±0.5 弧度（約 ±29 度）
         target_abad_pos = torch.clamp(target_abad_pos, min=-0.5, max=0.5)
-        
-        # 【發送位置指令給 ABAD 關節】
-        # set_joint_position_target = 告訴關節「請移動到這個角度」
         self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
         
         # =====================================================================
-        # 避震關節控制：保持固定（被動式）
+        # 避震關節控制：保持固定位置
         # =====================================================================
-        # 避震關節不被 AI 控制，但我們仍然要告訴它「保持在初始位置」
-        # 
-        # 為什麼？
-        # 模擬器使用「彈簧」來控制關節位置。如果不設定目標，
-        # 彈簧會把關節拉到 0 度（拉直），這樣腿的形狀就壞掉了！
-        # 所以我們要持續告訴它「請保持初始角度」。
         self.robot.set_joint_position_target(
             self._damper_initial_pos.expand(self.num_envs, -1), 
             joint_ids=self._damper_indices
@@ -852,23 +973,26 @@ class RedrhexEnv(DirectRLEnv):
         # • 誤差 = 0 時，獎勵 = 1（完美！）
         # • 誤差越大，獎勵快速下降趨近 0
         # 這樣可以讓 AI 很清楚地知道「越準確越好」
-        
+
+        # 獲取 tracking_sigma 參數（預設 0.25，來自 legged_gym）
+        tracking_sigma = getattr(self.cfg, 'tracking_sigma', 0.25)
+
         # G1.1 線速度追蹤（前後 + 左右）
         # 計算 XY 方向的速度誤差平方和
         lin_vel_error = torch.sum(
             torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
         )
-        # 公式：獎勵 = exp(-誤差² / 0.25)
+        # 公式：獎勵 = exp(-誤差² / sigma)
         # 當誤差 = 0 時，獎勵 = 1
-        # 當誤差 = 0.5 時，獎勵 ≈ 0.37
-        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
+        # sigma 控制衰減速度
+        lin_vel_error_mapped = torch.exp(-lin_vel_error / tracking_sigma)
         rew_track_lin_vel = lin_vel_error_mapped * self.cfg.rew_scale_track_lin_vel * dt
         total_reward += rew_track_lin_vel
-        
+
         # G1.2 角速度追蹤（旋轉）
         # 計算旋轉速度的誤差
         yaw_rate_error = torch.square(cmd_wz - actual_wz)
-        yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
+        yaw_rate_error_mapped = torch.exp(-yaw_rate_error / tracking_sigma)
         rew_track_ang_vel = yaw_rate_error_mapped * self.cfg.rew_scale_track_ang_vel * dt
         total_reward += rew_track_ang_vel
 
@@ -1010,57 +1134,173 @@ class RedrhexEnv(DirectRLEnv):
             total_reward += rew_joint_acc
 
         # =================================================================
-        # G5: 步態結構獎勵（讓六隻腳協調運動！）
+        # G5: 步態結構獎勵 ★★★ RHex 非對稱 Duty Cycle 核心獎勵 ★★★
         # =================================================================
-        # 目標：確保交替三足步態正確執行
         # 
-        # 【正確的步態是什麼樣的？】
-        # • Tripod A 的三隻腳要「同步」（一起著地、一起離地）
-        # • Tripod B 的三隻腳也要「同步」
-        # • A 和 B 要「反相」（A 著地時 B 在空中，反過來也是）
+        # 【目標】確保 RHex 風格的「著地慢轉、擺動快轉」步態正確執行
         # 
-        # 【錯誤的步態會怎樣？】
-        # 如果六隻腳都同相（一起著地、一起離地）：
-        # → 機器人會「跳」而不是「走」，非常不穩定！
+        # ┌───────────────────────────────────────────────────────────────┐
+        # │ G5.1 組內同步：同組三腳相位一致                              │
+        # │ G5.2 連續支撐：任何時刻至少一組著地 ★最重要★               │
+        # │ G5.3 正確速度：著地慢轉、擺動快轉                            │
+        # │ G5.4 交替步態：兩組交替著地                                  │
+        # │ G5.5 頻率一致：整體步態頻率正確                              │
+        # └───────────────────────────────────────────────────────────────┘
         
-        # 計算每隻腿的「相位」（現在轉到哪裡了）
+        # ---------------------------------------------------------------------
+        # 計算每隻腿的「相位」（考慮方向乘數）
+        # ---------------------------------------------------------------------
         effective_pos = main_drive_pos * self._direction_multiplier
-        leg_phase = torch.remainder(effective_pos, 2 * math.pi)  # 限制在 [0, 2π]
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)  # [N, 6]
         
         # 分開兩組的相位
         phase_a = leg_phase[:, self._tripod_a_indices]  # Tripod A: 腿 0, 3, 5
         phase_b = leg_phase[:, self._tripod_b_indices]  # Tripod B: 腿 1, 2, 4
         
-        # G5.1 組內一致性獎勵（同組的腳要同步）
-        # 使用「相位一致性」(Coherence) 來衡量：
-        # • 如果三隻腳相位完全一樣，coherence = 1（完美同步）
-        # • 如果三隻腳相位散亂，coherence ≈ 0（不同步）
+        # ---------------------------------------------------------------------
+        # G5.1 組內同步獎勵（同組的三隻腳應該相位一致）
+        # ---------------------------------------------------------------------
+        # 使用「相位一致性」(Phase Coherence) 來衡量同步程度
+        # coherence = |mean(e^(i*phase))| 
+        # = 1 時表示所有相位完全相同，= 0 表示完全分散
+        
         def phase_coherence(phases):
-            # 把相位轉成單位圓上的點，取平均，計算長度
+            """計算相位一致性（0~1）"""
             sin_mean = torch.sin(phases).mean(dim=1)
             cos_mean = torch.cos(phases).mean(dim=1)
             return torch.sqrt(sin_mean**2 + cos_mean**2)
         
-        # 計算兩組的一致性分數
-        coherence_a = phase_coherence(phase_a)  # A 組的同步程度
-        coherence_b = phase_coherence(phase_b)  # B 組的同步程度
-        # 兩組都同步 = 給獎勵
+        coherence_a = phase_coherence(phase_a)  # A 組同步程度
+        coherence_b = phase_coherence(phase_b)  # B 組同步程度
+        
+        # 獎勵：兩組都同步 → 給獎勵
         rew_tripod_sync = (coherence_a + coherence_b) * self.cfg.rew_scale_tripod_sync * dt
         total_reward += rew_tripod_sync
         
-        # G5.2 組間反相獎勵（A 和 B 要交替）
+        # ---------------------------------------------------------------------
+        # G5.2 連續支撐獎勵 ★★★ 最重要的步態獎勵！★★★
+        # ---------------------------------------------------------------------
+        # 確保任何時刻都有至少一組在「著地相位」
+        # 
+        # 判斷每隻腿是否在著地相位
+        if hasattr(self, '_current_leg_in_stance'):
+            leg_in_stance = self._current_leg_in_stance  # [N, 6]
+        else:
+            # 回退方案
+            leg_in_stance = (leg_phase >= self.stance_phase_start) & (leg_phase < self.stance_phase_end)
+        
+        # 計算每組有幾隻腳在著地
+        stance_count_a = leg_in_stance[:, self._tripod_a_indices].float().sum(dim=1)  # [N]
+        stance_count_b = leg_in_stance[:, self._tripod_b_indices].float().sum(dim=1)  # [N]
+        
+        # 判斷每組是否「有效著地」（至少 2 隻腳在著地相位）
+        a_in_stance = stance_count_a >= 2
+        b_in_stance = stance_count_b >= 2
+        
+        # ★ 連續支撐獎勵：至少一組有效著地
+        at_least_one_stance = (a_in_stance | b_in_stance).float()
+        rew_tripod_support = at_least_one_stance * self.cfg.rew_scale_tripod_support * dt
+        total_reward += rew_tripod_support
+        
+        # ★★ 騰空懲罰：如果兩組都不在著地相位 → 大懲罰！
+        both_airborne = (~a_in_stance & ~b_in_stance).float()
+        rew_airborne_penalty = both_airborne * getattr(self.cfg, 'rew_scale_airborne_penalty', -10.0) * dt
+        total_reward += rew_airborne_penalty
+        
+        # ★★★ 雙支撐獎勵：兩組都著地時是超級穩定狀態
+        both_in_stance = (a_in_stance & b_in_stance).float()
+        rew_double_support = both_in_stance * 1.0 * dt  # 額外獎勵重疊期
+        total_reward += rew_double_support
+        
+        # ---------------------------------------------------------------------
+        # G5.3 正確速度比例獎勵（著地慢轉、擺動快轉）
+        # ---------------------------------------------------------------------
+        # 獎勵腿在正確的相位使用正確的速度
+        # 
+        # 期望：
+        # - 著地相位的腿：速度 ≈ stance_velocity
+        # - 擺動相位的腿：速度 ≈ swing_velocity
+        
+        if hasattr(self, '_base_velocity'):
+            # 使用 _apply_action 中計算的基礎速度
+            expected_velocity = self._base_velocity  # [N, 6]
+        else:
+            # 回退方案
+            expected_velocity = torch.where(
+                leg_in_stance,
+                torch.full_like(leg_phase, self.stance_velocity),
+                torch.full_like(leg_phase, self.swing_velocity)
+            )
+        
+        # 計算實際速度與期望速度的誤差（考慮方向）
+        actual_signed_vel = main_drive_vel * self._direction_multiplier  # 修正方向
+        velocity_error = torch.abs(torch.abs(actual_signed_vel) - expected_velocity)
+        
+        # 正規化誤差並計算獎勵
+        normalized_vel_error = velocity_error / self.swing_velocity  # 正規化
+        velocity_match = torch.exp(-2.0 * normalized_vel_error.mean(dim=1))  # 指數映射
+        rew_velocity = velocity_match * self.cfg.rew_scale_duty_cycle_velocity * dt
+        total_reward += rew_velocity
+        
+        # ---------------------------------------------------------------------
+        # G5.4 交替步態獎勵（兩組應該交替著地，不是同時）
+        # ---------------------------------------------------------------------
+        # 理想情況：
+        # - 一組在著地相位末端（即將進入擺動）
+        # - 另一組在著地相位中段（準備接手支撐）
+        # 
+        # 這不是強制 180° 反相，而是獎勵「平滑交接」
+        
         # 計算兩組的平均相位
         mean_phase_a = torch.atan2(torch.sin(phase_a).mean(dim=1), torch.cos(phase_a).mean(dim=1))
         mean_phase_b = torch.atan2(torch.sin(phase_b).mean(dim=1), torch.cos(phase_b).mean(dim=1))
         
-        # 計算相位差（應該接近 π = 180 度）
+        # 計算相位差（應該接近某個值，但不強制是 π）
         phase_diff = torch.abs(mean_phase_a - mean_phase_b)
-        phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)  # 處理循環（0° 和 360° 是一樣的）
+        phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)  # 處理循環
         
-        # 相位差與 π 的差距越小，獎勵越高
-        phase_diff_error = torch.abs(phase_diff - math.pi)
-        rew_antiphase = torch.exp(-phase_diff_error) * self.cfg.rew_scale_tripod_antiphase * dt
-        total_reward += rew_antiphase
+        # 獎勵相位差在合理範圍內（π ± 0.5）
+        # 這比強制 180° 更寬鬆，允許步態有一定的靈活性
+        target_phase_diff = math.pi
+        phase_diff_tolerance = 0.8  # 允許 ±0.8 弧度（約 ±46°）的誤差
+        phase_diff_error = torch.abs(phase_diff - target_phase_diff)
+        phase_diff_in_range = (phase_diff_error < phase_diff_tolerance).float()
+        rew_alternation = phase_diff_in_range * getattr(self.cfg, 'rew_scale_tripod_alternation', 1.5) * dt
+        total_reward += rew_alternation
+        
+        # 舊版 antiphase 獎勵（權重通常為 0，保留向後相容）
+        if self.cfg.rew_scale_tripod_antiphase != 0:
+            phase_diff_error_old = torch.abs(phase_diff - math.pi)
+            rew_antiphase = torch.exp(-phase_diff_error_old) * self.cfg.rew_scale_tripod_antiphase * dt
+            total_reward += rew_antiphase
+        
+        # ---------------------------------------------------------------------
+        # G5.5 步態頻率一致性獎勵
+        # ---------------------------------------------------------------------
+        # 整體的「平均轉速」應該接近目標頻率
+        mean_abs_vel = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
+        
+        # 目標平均速度（考慮 duty cycle 的加權平均）
+        target_mean_vel = (self.cfg.stance_duty_cycle * self.stance_velocity + 
+                          (1 - self.cfg.stance_duty_cycle) * self.swing_velocity)
+        
+        freq_error = torch.abs(mean_abs_vel - target_mean_vel) / target_mean_vel
+        freq_match = torch.exp(-2.0 * freq_error)
+        rew_frequency = freq_match * getattr(self.cfg, 'rew_scale_gait_frequency', 1.0) * dt
+        total_reward += rew_frequency
+        
+        # ---------------------------------------------------------------------
+        # 診斷：記錄步態狀態
+        # ---------------------------------------------------------------------
+        if not hasattr(self, '_gait_debug_counter'):
+            self._gait_debug_counter = 0
+        self._gait_debug_counter += 1
+        
+        # 每 500 步打印一次步態診斷
+        if self._gait_debug_counter % 500 == 1:
+            print(f"[步態診斷] A組著地: {stance_count_a[0]:.0f}/3, B組著地: {stance_count_b[0]:.0f}/3, "
+                  f"相位差: {phase_diff[0]:.2f} rad ({phase_diff[0]*180/math.pi:.1f}°), "
+                  f"平均速度: {mean_abs_vel[0]:.2f} rad/s")
 
         # =================================================================
         # G6: ABAD 使用策略獎勵
@@ -1154,7 +1394,7 @@ class RedrhexEnv(DirectRLEnv):
         # 兼容舊版獎勵名稱
         rew_forward_vel = actual_vx * torch.sign(cmd_vx) * 3.0 * dt
         rew_vel_tracking = lin_vel_error_mapped * 2.0 * dt
-        rew_gait_sync = rew_antiphase
+        rew_gait_sync = rew_alternation  # 使用新的交替步態獎勵
         rew_rotation_dir = rew_track_ang_vel
         rew_all_legs = num_active_legs * 0.2 * dt
         rew_correct_dir = lateral_tracking
@@ -1187,6 +1427,14 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_abad_stability"] += rew_abad_stability
         self.episode_sums["rew_action_rate"] += rew_action_rate
         
+        # ★★★ 新增：RHex 步態獎勵記錄 ★★★
+        self.episode_sums["rew_tripod_support"] += rew_tripod_support
+        self.episode_sums["rew_airborne_penalty"] += rew_airborne_penalty
+        self.episode_sums["rew_double_support"] += rew_double_support
+        self.episode_sums["rew_velocity_match"] += rew_velocity
+        self.episode_sums["rew_alternation"] += rew_alternation
+        self.episode_sums["rew_frequency"] += rew_frequency
+        
         # 診斷
         self.episode_sums["diag_forward_vel"] += actual_vx
         self.episode_sums["diag_lateral_vel"] += actual_vy
@@ -1203,12 +1451,32 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_actual_wz"] += actual_wz
         self.episode_sums["diag_wz_error"] += torch.abs(actual_wz - cmd_wz)
         
-        # ★★★ 新增：腿速度診斷 ★★★
+        # 腿速度診斷
         target_leg_vel_abs = torch.abs(self._target_drive_vel).mean(dim=1)
         leg_vel_error = torch.abs(torch.abs(main_drive_vel) - torch.abs(self._target_drive_vel)).mean(dim=1)
         
         self.episode_sums["diag_target_leg_vel"] += target_leg_vel_abs
         self.episode_sums["diag_leg_vel_error"] += leg_vel_error
+        
+        # ★★★ 新增：RHex 步態診斷 ★★★
+        self.episode_sums["diag_stance_count_a"] += stance_count_a
+        self.episode_sums["diag_stance_count_b"] += stance_count_b
+        self.episode_sums["diag_phase_diff"] += phase_diff
+        self.episode_sums["diag_mean_velocity"] += mean_abs_vel
+        self.episode_sums["diag_airborne_count"] += both_airborne
+        
+        # 計算著地/擺動組的平均速度
+        stance_mask = leg_in_stance.float()
+        swing_mask = (~leg_in_stance).float()
+        actual_abs_vel = torch.abs(main_drive_vel * self._direction_multiplier)
+        
+        stance_vel_sum = (actual_abs_vel * stance_mask).sum(dim=1)
+        stance_count = stance_mask.sum(dim=1).clamp(min=1)  # 避免除以0
+        swing_vel_sum = (actual_abs_vel * swing_mask).sum(dim=1)
+        swing_count = swing_mask.sum(dim=1).clamp(min=1)
+        
+        self.episode_sums["diag_stance_velocity"] += stance_vel_sum / stance_count
+        self.episode_sums["diag_swing_velocity"] += swing_vel_sum / swing_count
         
         self.last_main_drive_vel = main_drive_vel.clone()
 
@@ -1451,6 +1719,18 @@ class RedrhexEnv(DirectRLEnv):
         3. 更新箭頭的位置和旋轉
         
         這樣箭頭就會跟著機器人移動，並且指向正確的方向！
+        
+        ★★★ 原地旋轉 vs 側移 的視覺區分 ★★★
+        
+        【側移命令】(vx≈0, vy≠0, wz=0)
+        - 箭頭「固定」指向左或右
+        - 靜止不動的箭頭 = 線性移動
+        
+        【旋轉命令】(vx=0, vy=0, wz≠0)  
+        - 箭頭會「持續繞圈旋轉」！
+        - 逆時針命令 (wz>0)：箭頭逆時針轉
+        - 順時針命令 (wz<0)：箭頭順時針轉
+        - 旋轉的箭頭 = 旋轉命令！
         """
         # 檢查機器人是否已初始化
         if not self.robot.is_initialized:
@@ -1461,13 +1741,14 @@ class RedrhexEnv(DirectRLEnv):
         base_pos_w[:, 2] += 0.5  # 箭頭高度
         
         # 計算目標速度箭頭的縮放和旋轉
+        # 傳入完整命令 (vx, vy, wz) 以便處理旋轉視覺化
         goal_arrow_scale, goal_arrow_quat = self._resolve_xy_velocity_to_arrow(
-            self.commands[:, :2], is_goal=True  # [vx, vy]
+            self.commands[:, :2], is_goal=True, ang_vel=self.commands[:, 2]
         )
         
         # 計算實際速度箭頭的縮放和旋轉
         current_arrow_scale, current_arrow_quat = self._resolve_xy_velocity_to_arrow(
-            self.base_lin_vel[:, :2], is_goal=False  # 本體坐標系下的 [vx, vy]
+            self.base_lin_vel[:, :2], is_goal=False, ang_vel=self.base_ang_vel[:, 2]
         )
         
         # 更新可視化 markers
@@ -1478,7 +1759,7 @@ class RedrhexEnv(DirectRLEnv):
         base_pos_w_current[:, 2] += 0.1
         self.current_vel_visualizer.visualize(base_pos_w_current, current_arrow_quat, current_arrow_scale)
     
-    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor, is_goal: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor, is_goal: bool = True, ang_vel: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         【把速度向量轉換成箭頭的外觀】
         
@@ -1488,12 +1769,30 @@ class RedrhexEnv(DirectRLEnv):
             xy_velocity: XY 方向的速度向量 [環境數, 2]
             is_goal: 是不是目標速度的箭頭？
                     （True = 綠色目標箭頭，False = 紅色實際箭頭）
+            ang_vel: 角速度 wz [環境數]（可選，用於旋轉可視化）
         
         返回：
             arrow_scale: 箭頭的大小 [環境數, 3]（長、寬、高）
             arrow_quat: 箭頭的旋轉（四元數格式）[環境數, 4]
         
-        箭頭長度會根據速度大小變化：速度越快，箭頭越長！
+        ★★★ 視覺區分：側移 vs 旋轉 ★★★
+        
+        【側移】箭頭固定指向移動方向
+        ┌─────────────────────────────┐
+        │    ← ← ← 🤖                 │  向左側移：箭頭靜止指左
+        │            → → →           │  向右側移：箭頭靜止指右
+        └─────────────────────────────┘
+        
+        【旋轉】箭頭持續繞圈轉動！
+        ┌─────────────────────────────┐
+        │      ↖ ↑ ↗                  │  
+        │    ←  🤖  →   逆時針：      │  箭頭逆時針繞圈
+        │      ↙ ↓ ↘                  │  
+        └─────────────────────────────┘
+        
+        這樣一眼就能看出：
+        - 箭頭不動 = 線性移動命令
+        - 箭頭繞圈 = 旋轉命令！
         """
         # 基礎縮放：只改變長度，寬高固定
         if is_goal:
@@ -1503,11 +1802,23 @@ class RedrhexEnv(DirectRLEnv):
             base_length = 0.8   # 紅色實際箭頭基礎長度
             width_height = 0.2  # 固定寬高（稍小）
         
-        # 計算速度大小
+        # 計算 XY 速度大小
         speed = torch.linalg.norm(xy_velocity, dim=1)
         
+        # 判斷是否為「純旋轉」命令（XY 速度很小，但有角速度）
+        is_pure_rotation = (speed < 0.05)  # XY 速度閾值
+        
+        # 處理角速度可視化
+        if ang_vel is not None:
+            # 對於純旋轉命令，用 |wz| 來決定箭頭長度
+            rotation_speed = torch.abs(ang_vel)
+            # 純旋轉時使用角速度決定長度，否則使用線速度
+            effective_speed = torch.where(is_pure_rotation, rotation_speed * 0.5, speed)
+        else:
+            effective_speed = speed
+        
         # 箭頭長度根據速度調整：最小 0.3 倍，速度加成 2.0x
-        length_scale = base_length * (0.3 + speed * 2.0)
+        length_scale = base_length * (0.3 + effective_speed * 2.0)
         
         # 創建 scale tensor: [length, width, height]
         arrow_scale = torch.zeros(xy_velocity.shape[0], 3, device=self.device)
@@ -1515,8 +1826,31 @@ class RedrhexEnv(DirectRLEnv):
         arrow_scale[:, 1] = width_height  # 寬度固定
         arrow_scale[:, 2] = width_height  # 高度固定
         
-        # 箭頭方向：根據速度方向計算偏航角（只在 XY 平面上）
-        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+        # =====================================================================
+        # 箭頭方向計算 - 關鍵區分邏輯！
+        # =====================================================================
+        # 
+        # 【線性移動】：箭頭指向速度方向（固定）
+        # 【純旋轉】：箭頭持續繞圈旋轉！
+        #
+        if ang_vel is not None:
+            # 使用模擬時間讓箭頭持續旋轉
+            # 旋轉速度 = wz（命令的角速度），這樣箭頭旋轉速度和命令一致
+            sim_time = self.episode_length_buf.float() * self.cfg.sim.dt * self.cfg.decimation
+            
+            # 純旋轉時的角度：箭頭以 wz 速度持續旋轉
+            # 這會讓箭頭像時鐘指針一樣繞圈！
+            rotation_angle = ang_vel * sim_time * 2.0  # 乘以 2 讓旋轉更明顯
+            
+            # 線速度方向（固定角度）
+            linear_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+            
+            # 根據是否純旋轉選擇角度
+            # - 純旋轉：使用持續變化的 rotation_angle（繞圈）
+            # - 線性移動：使用固定的 linear_angle（指向移動方向）
+            heading_angle = torch.where(is_pure_rotation, rotation_angle, linear_angle)
+        else:
+            heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
         
         # 獲取機器人的偏航角（只取 yaw，忽略 roll/pitch）
         # 這樣箭頭永遠在水平面上
