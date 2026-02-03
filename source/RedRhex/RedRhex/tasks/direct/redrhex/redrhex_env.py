@@ -87,16 +87,22 @@ class RedrhexEnv(DirectRLEnv):
     3. 什麼是「好」的行為（獎勵函數）
     4. 什麼時候「遊戲結束」（終止條件）
     
-    【運動方式說明】
+    【運動方式說明 - RHex 非對稱 Duty Cycle 步態】
     ┌─────────────────────────────────────────────────────────────────┐
     │ RHex 旋轉步態的工作原理：                                       │
     │                                                                 │
     │ 六隻腳分成兩組，交替運動：                                      │
-    │ • Tripod A（三角支撐組 A）：Leg 1, 4, 6 一起動                  │
-    │ • Tripod B（三角支撐組 B）：Leg 2, 3, 5 一起動                  │
+    │ • Tripod A（三角支撐組 A）：Leg 0, 3, 5 一起動                  │
+    │ • Tripod B（三角支撐組 B）：Leg 1, 2, 4 一起動                  │
     │                                                                 │
-    │ 當 A 組的腳著地時，B 組的腳在空中旋轉（相位差 180°）           │
-    │ 這樣任何時刻都有三隻腳支撐，非常穩定！                          │
+    │ ★ 核心機制（非對稱 Duty Cycle）：                               │
+    │ • 著地相位：腿在小角度範圍內（如 -30°~+30°）緩慢轉動           │
+    │            佔時間的 65%，但只轉過約 60° 的角度                  │
+    │ • 擺動相位：腿快速轉過剩餘的 300°，準備下一次著地              │
+    │            佔時間的 35%，速度是著地的 ~10 倍                    │
+    │                                                                 │
+    │ 由於 duty_cycle > 50%，兩組著地時間有 30% 重疊                  │
+    │ → 任何時刻都至少有一組著地，永不騰空！                          │
     │                                                                 │
     │ ABAD 關節的作用：                                               │
     │ • 直走時：不需要動                                              │
@@ -476,23 +482,26 @@ class RedrhexEnv(DirectRLEnv):
         ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
         
         【傳統錯誤理解】
-        很多人以為 RHex 的兩組腿（Tripod A 和 B）是簡單的 180° 反相：
-        - A 組在 0° 時著地
-        - B 組在 180° 時著地
-        這樣會導致大部分時間機器人沒有腳撐著地板！
+        很多人以為 RHex 的兩組腿（Tripod A 和 B）是簡單的 180° 反相，
+        或者以為著地佔 65% 時間就轉過 65% 的角度。
+        這些都是錯的！
         
-        【正確的 RHex 步態】
-        實際上，RHex 使用「非對稱 duty cycle」步態：
+        【正確的 RHex 步態】★★★ 角度 vs 時間 的區別 ★★★
         
-        1. 著地相位（Stance Phase）- 佔 ~65% 時間
-           - 腿在地面上，緩慢旋轉
-           - 提供穩定的支撐和推進力
-           - 速度約為基礎速度的 50%
+        RHex 使用「非對稱 duty cycle」步態，關鍵是：
+        著地時間長，但轉過的角度少！
         
-        2. 擺動相位（Swing Phase）- 佔 ~35% 時間
-           - 腿離開地面，快速旋轉「一圈」
-           - 迅速回到準備著地的位置
-           - 速度約為基礎速度的 300%（3倍速！）
+        1. 著地相位（Stance Phase）
+           - 時間佔比：~65%（時間長）
+           - 角度範圍：~60°（如 -30° ~ +30°）（角度小！）
+           - 腿底部在地面上，只能在小範圍內緩慢轉動
+           - 速度約為基礎速度的 15%（非常慢！）
+        
+        2. 擺動相位（Swing Phase）
+           - 時間佔比：~35%（時間短）
+           - 角度範圍：~300°（角度大！）
+           - 腿要快速轉過大部分角度，回到著地位置
+           - 速度約為基礎速度的 150%（10 倍於著地速度！）
         
         【關鍵：為什麼不會騰空？】
         因為 duty_cycle > 0.5，兩組的著地時間有「重疊」！
@@ -754,6 +763,48 @@ class RedrhexEnv(DirectRLEnv):
         # 安全限制：防止速度過快
         max_vel = self.swing_velocity * 1.5  # 允許最大 1.5 倍擺動速度
         target_drive_vel = torch.clamp(target_drive_vel, min=-max_vel, max=max_vel)
+        
+        # =====================================================================
+        # ★★★ 正左/正右側移時鎖住主驅動關節 ★★★
+        # =====================================================================
+        # 當命令是純側移（X 速度 ≈ 0，Y 速度 ≠ 0，旋轉 ≈ 0）時，
+        # 主驅動關節轉動會產生前進速度，這與目標衝突！
+        # 純側移應該只靠 ABAD 關節（腳往外擺）來推動。
+        #
+        # 判斷條件：
+        # - |cmd_x| < 0.05 (前後速度接近零)
+        # - |cmd_y| > 0.1  (有明顯的側移需求)
+        # - |cmd_yaw| < 0.1 (不旋轉)
+        
+        cmd_x = self.commands[:, 0]    # 前後速度指令
+        cmd_y = self.commands[:, 1]    # 左右速度指令
+        cmd_yaw = self.commands[:, 2]  # 旋轉速度指令
+        
+        # 判斷是否為純側移模式
+        is_pure_lateral = (
+            (torch.abs(cmd_x) < 0.05) &      # 前後速度接近零
+            (torch.abs(cmd_y) > 0.1) &       # 有側移需求
+            (torch.abs(cmd_yaw) < 0.1)       # 不旋轉
+        )  # [N]
+        
+        # 對於純側移的環境，將主驅動速度設為 0
+        # 擴展為 [N, 6] 以匹配所有腿
+        lateral_mask = is_pure_lateral.unsqueeze(1).expand(-1, 6)  # [N, 6]
+        target_drive_vel = torch.where(
+            lateral_mask,
+            torch.zeros_like(target_drive_vel),  # 純側移：鎖住主驅動
+            target_drive_vel                      # 其他情況：正常控制
+        )
+        
+        # 保存側移狀態（用於診斷）
+        self._is_pure_lateral = is_pure_lateral
+        
+        # 診斷輸出（每 500 步顯示一次）
+        if not hasattr(self, '_lateral_debug_counter'):
+            self._lateral_debug_counter = 0
+        self._lateral_debug_counter += 1
+        if self._lateral_debug_counter % 500 == 1 and is_pure_lateral[0]:
+            print(f"[側移模式] 環境 0 啟用純側移，主驅動已鎖定。cmd: x={cmd_x[0]:.2f}, y={cmd_y[0]:.2f}, yaw={cmd_yaw[0]:.2f}")
         
         # 保存目標速度（用於獎勵計算和診斷）
         self._target_drive_vel = target_drive_vel.clone()

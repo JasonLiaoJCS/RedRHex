@@ -643,10 +643,13 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # RHex 的交替三足步態工作原理：
     # 1. Tripod A 的三隻腳同時著地、同時離地
     # 2. Tripod B 的三隻腳同時著地、同時離地
-    # 3. A 和 B 交替進行，相位差 180 度
+    # 3. A 和 B 使用「非對稱 duty cycle」交替進行
+    #    ★ 著地相位：時間長（65%）但角度小（60°），腿緩慢轉動
+    #    ★ 擺動相位：時間短（35%）但角度大（300°），腿快速轉動
     # 
     # 這樣的好處：
-    # - 任何時刻都有三點支撐（像三腳架一樣穩定）
+    # - 因為 duty_cycle > 50%，兩組著地時間有 30% 重疊
+    # - 任何時刻都至少有一組著地，永不騰空！
     # - 運動效率高（類似昆蟲的走路方式）
     
     # Tripod A 組：索引 0, 3, 5 → 對應關節 15, 18, 24
@@ -988,15 +991,18 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # -------------------------------------------------------------------------
     # legged_gym 標準: tracking_lin_vel=1.0, tracking_ang_vel=0.5
     # 追蹤公式: reward = exp(-error²/sigma), sigma=0.25
+    # 
+    # ★ 提高權重讓機器人更積極移動 ★
 
     # 線速度追蹤（前後 + 左右）
-    rew_scale_track_lin_vel = 1.0
+    rew_scale_track_lin_vel = 2.0  # 提高從 1.0 → 2.0
 
-    # 角速度追蹤（旋轉）- 適當提高以確保旋轉學習
-    rew_scale_track_ang_vel = 0.5
+    # 角速度追蹤（旋轉）
+    rew_scale_track_ang_vel = 1.0  # 提高從 0.5 → 1.0
 
     # 追蹤獎勵的 sigma 參數（控制獎勵衰減速度）
-    tracking_sigma = 0.25
+    # 較小的 sigma 讓獎勵衰減更快，迫使更精確追蹤
+    tracking_sigma = 0.20  # 從 0.25 → 0.20
 
     # -------------------------------------------------------------------------
     # G2: 姿態穩定性懲罰
@@ -1040,15 +1046,15 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
     # 力矩懲罰
     # legged_gym: torques = -0.00001
-    rew_scale_torque = -0.00001
+    rew_scale_torque = -0.000005  # 降低，讓機器人更敢用力
 
     # 動作變化率懲罰
     # legged_gym: action_rate = -0.01
-    rew_scale_action_rate = -0.01
+    rew_scale_action_rate = -0.005  # 降低，讓動作更靈活
 
     # 關節加速度懲罰
     # legged_gym: dof_acc = -2.5e-7
-    rew_scale_joint_acc = -2.5e-7
+    rew_scale_joint_acc = -1.0e-7  # 降低
 
     # 關節速度懲罰（可選，legged_gym: dof_vel = -0.0）
     rew_scale_dof_vel = -0.0
