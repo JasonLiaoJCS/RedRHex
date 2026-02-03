@@ -2011,13 +2011,25 @@ class RedrhexEnv(DirectRLEnv):
         # 而不是「世界座標系」的追蹤
         random_yaw = sample_uniform(-math.pi, math.pi, (num_reset,), device=self.device)
         
-        # 從 yaw 角度創建四元數（只旋轉 yaw，roll 和 pitch 保持為 0）
-        # 四元數格式 [w, x, y, z] = [cos(yaw/2), 0, 0, sin(yaw/2)]
+        # 創建 yaw 旋轉的四元數 [w, x, y, z] = [cos(yaw/2), 0, 0, sin(yaw/2)]
         half_yaw = random_yaw * 0.5
-        default_root_state[:, 3] = torch.cos(half_yaw)  # w
-        default_root_state[:, 4] = 0.0                   # x
-        default_root_state[:, 5] = 0.0                   # y
-        default_root_state[:, 6] = torch.sin(half_yaw)  # z
+        yaw_w = torch.cos(half_yaw)
+        yaw_z = torch.sin(half_yaw)
+        
+        # ★★★ 重要：將 yaw 旋轉疊加到原本的初始旋轉上 ★★★
+        # 原本的初始旋轉是繞 X 軸 90 度：(w0, x0, y0, z0) = (0.7071068, 0.7071068, 0, 0)
+        # yaw 旋轉四元數：(yaw_w, 0, 0, yaw_z)
+        # 
+        # 四元數乘法：q_yaw * q_init
+        # w = yaw_w*w0 - yaw_z*0 = yaw_w * w0
+        # x = yaw_w*x0 + yaw_z*0 = yaw_w * x0
+        # y = yaw_z*x0           (注意：正號！)
+        # z = yaw_z*w0
+        w0, x0 = 0.7071068, 0.7071068  # 原本的 X 軸 90 度旋轉
+        default_root_state[:, 3] = w0 * yaw_w              # w
+        default_root_state[:, 4] = x0 * yaw_w              # x
+        default_root_state[:, 5] = x0 * yaw_z              # y (修正：正號)
+        default_root_state[:, 6] = w0 * yaw_z              # z
 
         # 寫入模擬
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
