@@ -317,6 +317,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         gravity=(0.0, 0.0, -9.81),
         
         # 【物理材質】定義物體表面的摩擦和彈性
+        # ★ 貼近現實橡膠輪胎/抖青地面的摩擦係數 ★
         physics_material=sim_utils.RigidBodyMaterialCfg(
             # 摩擦力合併模式：當兩個物體接觸時，如何計算總摩擦力
             # "multiply" = 兩者相乘（比較保守）
@@ -324,11 +325,12 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
             restitution_combine_mode="multiply",
             
             # 靜摩擦係數：物體靜止時需要多大力才能推動
-            # 越大 = 越難推動 = 腿更容易抓地
-            static_friction=1.0,
+            # 橡膠 vs 抖青 約 0.8~1.2，設為 1.2 以增強抓地力
+            static_friction=1.2,
             
             # 動摩擦係數：物體移動時的阻力
-            dynamic_friction=0.7,
+            # 通常比靜摩擦稍低
+            dynamic_friction=1.0,
             
             # 彈性係數：碰撞後反彈的程度
             # 0 = 完全不彈（像黏土）
@@ -435,6 +437,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     
     # -------------------------------------------------------------------------
     # 【範例 1】平坦地面（目前使用中）
+    # ★ 貼近現實橡膠輪胎/抖青地面的摩擦係數 ★
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -442,8 +445,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
+            static_friction=1.2,   # 提高：橡膠 vs 抖青 約 0.8~1.2
+            dynamic_friction=1.0,  # 提高
         ),
         debug_vis=False,
     )

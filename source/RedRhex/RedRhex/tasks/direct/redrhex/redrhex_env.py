@@ -771,6 +771,9 @@ class RedrhexEnv(DirectRLEnv):
         # 主驅動關節轉動會產生前進速度，這與目標衝突！
         # 純側移應該只靠 ABAD 關節（腳往外擺）來推動。
         #
+        # 重要：側移前要先把腳調回預設位置，確保六隻腳都接觸地面！
+        # 右側腿：45°，左側腿：-45°
+        #
         # 判斷條件：
         # - |cmd_x| < 0.05 (前後速度接近零)
         # - |cmd_y| > 0.1  (有明顯的側移需求)
@@ -811,9 +814,41 @@ class RedrhexEnv(DirectRLEnv):
         self._base_velocity = base_velocity.clone()  # 保存基礎速度（未經 AI 調節）
         
         # =====================================================================
-        # 步驟 6：發送速度指令給主驅動關節
+        # 步驟 6：發送指令給主驅動關節
         # =====================================================================
-        self.robot.set_joint_velocity_target(target_drive_vel, joint_ids=self._main_drive_indices)
+        # 純側移時：使用位置控制，把腳調回預設向下位置
+        # 其他情況：使用速度控制，執行步態
+        
+        # 預設位置：右側腿 45°，左側腿 -45°（確保六隻腳都接觸地面）
+        # 主驅動關節順序：[15, 7, 12, 18, 23, 24]
+        # 索引 0,1,2 = 右側腿（15, 7, 12）→ 45°
+        # 索引 3,4,5 = 左側腿（18, 23, 24）→ -45°
+        if not hasattr(self, '_lateral_default_pos'):
+            self._lateral_default_pos = torch.tensor(
+                [45.0, 45.0, 45.0, -45.0, -45.0, -45.0], 
+                device=self.device
+            ) * math.pi / 180.0  # 轉換為弧度
+        
+        # 對於純側移的環境，設定位置目標把腳調回預設位置
+        # 這確保六隻腳都接觸地面，然後只靠 ABAD 產生側向推力
+        if is_pure_lateral.any():
+            lateral_envs = torch.where(is_pure_lateral)[0]
+            lateral_pos_target = self._lateral_default_pos.unsqueeze(0).expand(len(lateral_envs), -1)
+            self.robot.set_joint_position_target(
+                lateral_pos_target,
+                joint_ids=self._main_drive_indices,
+                env_ids=lateral_envs
+            )
+        
+        # 對於非側移的環境，使用速度控制
+        non_lateral = ~is_pure_lateral
+        if non_lateral.any():
+            non_lateral_envs = torch.where(non_lateral)[0]
+            self.robot.set_joint_velocity_target(
+                target_drive_vel[non_lateral_envs], 
+                joint_ids=self._main_drive_indices,
+                env_ids=non_lateral_envs
+            )
         
         # =====================================================================
         # ABAD 關節控制：位置控制模式（與之前相同）
