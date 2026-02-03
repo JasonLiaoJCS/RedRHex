@@ -328,6 +328,12 @@ class RedrhexEnv(DirectRLEnv):
             "rew_abad_jitter": torch.zeros(self.num_envs, device=self.device),         # ABAD 抖動懲罰
             "rew_sync_jitter": torch.zeros(self.num_envs, device=self.device),         # 全身抖動懲罰
             "rew_abad_action_rate": torch.zeros(self.num_envs, device=self.device),    # ABAD 變化率懲罰
+            "rew_lateral_alternating_stance": torch.zeros(self.num_envs, device=self.device),  # 側移交替著地
+            # ★★★ 新增：時間基準步態獎勵 ★★★
+            "rew_gait_phase": torch.zeros(self.num_envs, device=self.device),          # 步態相位正確性
+            "rew_abad_smooth": torch.zeros(self.num_envs, device=self.device),         # ABAD 平滑獎勵
+            "rew_both_stance_penalty": torch.zeros(self.num_envs, device=self.device), # 雙側著地懲罰
+            "rew_lateral_direction": torch.zeros(self.num_envs, device=self.device),   # 側移方向一致性
             # 平滑性
             "rew_action_rate": torch.zeros(self.num_envs, device=self.device),
             # 診斷指標 (非獎勵)
@@ -357,6 +363,7 @@ class RedrhexEnv(DirectRLEnv):
             "diag_stance_velocity": torch.zeros(self.num_envs, device=self.device),   # 著地組速度
             "diag_swing_velocity": torch.zeros(self.num_envs, device=self.device),    # 擺動組速度
             "diag_airborne_count": torch.zeros(self.num_envs, device=self.device),    # 騰空次數
+            "diag_lateral_lift_count": torch.zeros(self.num_envs, device=self.device),  # 側移抬腿數
         }
 
         # 初始化目標速度緩衝
@@ -796,14 +803,17 @@ class RedrhexEnv(DirectRLEnv):
             (torch.abs(cmd_yaw) < 0.1)       # 不旋轉
         )  # [N]
         
-        # 對於純側移的環境，將主驅動速度設為 0
-        # 擴展為 [N, 6] 以匹配所有腿
+        # =====================================================================
+        # ★★★ 改進的側移策略：時間基準交替步態（參考 ETH Zurich legged_gym）★★★
+        # =====================================================================
+        # 核心改變：使用時間/步態相位來決定交替，而非 ABAD 角度觸發
+        # 這樣可以：
+        # 1. 避免 ABAD 和主驅動之間的耦合導致高頻抖動
+        # 2. 產生穩定、可預測的交替步態
+        # 3. 讓 AI 學習如何配合這個固定的步態節奏
+        # =====================================================================
+        
         lateral_mask = is_pure_lateral.unsqueeze(1).expand(-1, 6)  # [N, 6]
-        target_drive_vel = torch.where(
-            lateral_mask,
-            torch.zeros_like(target_drive_vel),  # 純側移：鎖住主驅動
-            target_drive_vel                      # 其他情況：正常控制
-        )
         
         # 保存側移狀態（用於診斷）
         self._is_pure_lateral = is_pure_lateral
@@ -812,82 +822,110 @@ class RedrhexEnv(DirectRLEnv):
         if not hasattr(self, '_lateral_debug_counter'):
             self._lateral_debug_counter = 0
         self._lateral_debug_counter += 1
-        if self._lateral_debug_counter % 500 == 1 and is_pure_lateral[0]:
-            print(f"[側移模式] 環境 0 啟用純側移，主驅動已鎖定。cmd: x={cmd_x[0]:.2f}, y={cmd_y[0]:.2f}, yaw={cmd_yaw[0]:.2f}")
         
         # 保存目標速度（用於獎勵計算和診斷）
         self._target_drive_vel = target_drive_vel.clone()
         self._base_velocity = base_velocity.clone()  # 保存基礎速度（未經 AI 調節）
         
         # =====================================================================
-        # 步驟 6：發送指令給主驅動關節
+        # 側移步態控制邏輯 - 時間基準版
         # =====================================================================
-        # ★★★ 純側移時完全鎖住主驅動關節 ★★★
         # 
-        # 純側移（正左/正右）時：
-        # 1. 把腳調回預設向下位置（確保六隻腳都接觸地面）
-        # 2. 完全鎖住主驅動關節（使用 PD 控制器把腳固定在預設位置）
-        # 3. 只靠 ABAD 關節產生側向推力
+        # 關鍵改變：
+        # 1. 使用全局步態相位 (gait_phase) 來決定左右交替
+        # 2. 週期前半段：右側著地，左側抬起
+        # 3. 週期後半段：左側著地，右側抬起
+        # 4. 使用更低的步態頻率（0.5 Hz = 2秒一個週期）避免快速切換
         #
-        # 其他情況（斜走、正前、旋轉）：
-        # 使用速度控制執行正常步態
-        #
-        # 注意：main_drive 關節的 stiffness=0，是純速度控制模式
-        # 所以我們不能用 set_joint_position_target()
-        # 而是要用 PD 控制器計算「讓腳回到預設位置的速度」
+        # 關鍵位置定義：
+        # - 著地位置：腿向下接觸地面（右側 45°，左側 -45°）
+        # - 懸空位置：腿抬起離地（右側 180°，左側 -180°）完全抬起
+        # =====================================================================
         
-        # 預設位置：右側腿 45°，左側腿 -45°（確保六隻腳都接觸地面）
-        # 主驅動關節順序：[15, 7, 12, 18, 23, 24]
-        # 索引 0,1,2 = 右側腿（15, 7, 12）→ 45°
-        # 索引 3,4,5 = 左側腿（18, 23, 24）→ -45°
-        if not hasattr(self, '_lateral_default_pos'):
-            self._lateral_default_pos = torch.tensor(
-                [45.0, 45.0, 45.0, -45.0, -45.0, -45.0], 
+        # 預設位置定義
+        if not hasattr(self, '_lateral_stance_pos'):
+            # 著地位置：腳向下接觸地面（更靠近垂直以提供支撐）
+            self._lateral_stance_pos = torch.tensor(
+                [30.0, 30.0, 30.0, -30.0, -30.0, -30.0], 
                 device=self.device
-            ) * math.pi / 180.0  # 轉換為弧度
+            ) * math.pi / 180.0
+            
+            # 懸空位置：腳完全抬起離地（轉到上方）
+            self._lateral_swing_pos = torch.tensor(
+                [180.0, 180.0, 180.0, -180.0, -180.0, -180.0], 
+                device=self.device
+            ) * math.pi / 180.0
+            
+            # 側移步態頻率（較慢，0.3 Hz = 3.3秒一個完整週期）
+            self._lateral_gait_freq = 0.3
+            
+            # 側移步態相位（獨立於主步態相位）
+            self._lateral_gait_phase = torch.zeros(self.num_envs, device=self.device)
         
         # 構建最終的速度目標
         final_drive_vel = target_drive_vel.clone()
         
-        # =====================================================================
-        # 純側移策略：使用 ABAD 交替外展內收 + 主驅動低速保持
-        # =====================================================================
-        # 目標步態：
-        # - 一組腿抬起（主驅動快轉讓腳離地），ABAD 向外擺
-        # - 另一組腿著地支撐，ABAD 向內收推動身體
-        # - 交替進行，實現類似「外八/內八」的側移
-        #
-        # 主驅動控制：使用 P 控制器緩慢將腿歸位，減少地面摩擦干擾
-        # ABAD 控制：由 AI 學習交替外展內收的模式
-        # =====================================================================
-        
         if is_pure_lateral.any():
-            # 獲取當前主驅動關節位置
-            current_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
+            # ====== 更新側移步態相位（只對純側移環境更新）======
+            dt_sim = self.cfg.sim.dt * self.cfg.decimation
+            phase_increment = 2 * math.pi * self._lateral_gait_freq * dt_sim
             
-            # 計算位置誤差（目標位置 - 當前位置）
-            target_pos = self._lateral_default_pos.unsqueeze(0).expand(self.num_envs, -1)  # [N, 6]
+            # 只更新純側移環境的相位
+            self._lateral_gait_phase = torch.where(
+                is_pure_lateral,
+                (self._lateral_gait_phase + phase_increment) % (2 * math.pi),
+                self._lateral_gait_phase
+            )
+            
+            # ====== 根據相位決定哪側抬腿 ======
+            # 相位 [0, π)：右側著地，左側抬起
+            # 相位 [π, 2π)：左側著地，右側抬起
+            lateral_phase = self._lateral_gait_phase  # [N]
+            right_is_stance_phase = lateral_phase < math.pi  # [N]
+            
+            # 使用 sin 曲線產生平滑的過渡，而非硬切換
+            # 這可以大幅減少抖動
+            phase_sin = torch.sin(lateral_phase)  # [-1, 1], 正值=右側著地期
+            
+            # 平滑插值因子：將 sin 映射到 [0, 1]
+            # 0 = 完全右側著地，1 = 完全左側著地
+            blend_factor = (1.0 - phase_sin) / 2.0  # [N]
+            blend_factor = blend_factor.unsqueeze(1)  # [N, 1]
+            
+            # ====== 計算目標位置 - 使用平滑插值 ======
+            stance_pos = self._lateral_stance_pos.unsqueeze(0).expand(self.num_envs, -1)  # [N, 6]
+            swing_pos = self._lateral_swing_pos.unsqueeze(0).expand(self.num_envs, -1)    # [N, 6]
+            
+            # 右側腿（索引 0,1,2）：blend_factor=0 時著地，=1 時抬起
+            # 左側腿（索引 3,4,5）：blend_factor=0 時抬起，=1 時著地
+            right_blend = blend_factor.expand(-1, 3)  # [N, 3]
+            left_blend = 1.0 - blend_factor.expand(-1, 3)  # [N, 3]
+            
+            target_pos_right = stance_pos[:, :3] * (1 - right_blend) + swing_pos[:, :3] * right_blend
+            target_pos_left = stance_pos[:, 3:] * (1 - left_blend) + swing_pos[:, 3:] * left_blend
+            target_pos = torch.cat([target_pos_right, target_pos_left], dim=1)  # [N, 6]
+            
+            # ====== 計算速度指令（使用 PD 控制）======
+            current_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
             pos_error = target_pos - current_drive_pos  # [N, 6]
             
-            # ★★★ 降低 Kp 以減少振盪 ★★★
-            # Kp = 1.5 配合 damping=50 應該更穩定
-            lateral_kp = 1.5  # 降低從 5.0 → 1.5
+            # 較低的 Kp 增益以產生平滑動作，減少抖動
+            lateral_kp = 1.5  # 統一增益，較低值
             lateral_vel = lateral_kp * pos_error
             
-            # 限制速度，防止過快
-            max_lateral_vel = 1.5  # 降低從 3.0 → 1.5 rad/s
-            lateral_vel = torch.clamp(lateral_vel, min=-max_lateral_vel, max=max_lateral_vel)
+            # 限制最大速度
+            max_vel = 3.0
+            lateral_vel = torch.clamp(lateral_vel, min=-max_vel, max=max_vel)
             
-            # 當位置誤差很小時（腿已歸位），速度設為 0（死區）
-            # 這樣可以避免在目標位置附近的微小振盪
-            deadzone = 0.05  # 約 3 度的死區
+            # 死區處理
+            deadzone = 0.08  # 約 4.5 度
             lateral_vel = torch.where(
                 torch.abs(pos_error) < deadzone,
                 torch.zeros_like(lateral_vel),
                 lateral_vel
             )
             
-            # 對於純側移的環境，使用這個 P 計算的速度
+            # 對於純側移的環境，使用交替抬腿的速度
             final_drive_vel = torch.where(
                 lateral_mask,
                 lateral_vel,
@@ -896,6 +934,20 @@ class RedrhexEnv(DirectRLEnv):
             
             # 記錄側移狀態供獎勵函數使用
             self._is_lateral_mode = is_pure_lateral.clone()
+            
+            # 記錄哪些腿在抬起（基於相位）
+            # 相位前半段：右側著地，左側抬起（lift_mask 對應左側為 True）
+            right_lift = blend_factor.squeeze(1) > 0.5  # [N]
+            self._lateral_lift_mask = torch.stack([
+                right_lift, right_lift, right_lift,  # 右側三腿
+                ~right_lift, ~right_lift, ~right_lift  # 左側三腿
+            ], dim=1)  # [N, 6]
+            
+            # 詳細診斷（每 500 步）
+            if self._lateral_debug_counter % 500 == 1 and is_pure_lateral[0]:
+                print(f"[側移模式] 環境 0 時間基準步態。相位: {lateral_phase[0]:.2f}, 右抬: {right_lift[0].item()}")
+        else:
+            self._is_lateral_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         # 發送速度指令給所有環境
         self.robot.set_joint_velocity_target(final_drive_vel, joint_ids=self._main_drive_indices)
@@ -1217,14 +1269,15 @@ class RedrhexEnv(DirectRLEnv):
         height_threshold = getattr(self.cfg, 'body_contact_height_threshold', 0.01)
         height_contact = body_height < height_threshold
         
-        # 條件 2：傾斜太大（超過約 60 度）
-        #         body_tilt > 0.5 對應 cos(60°) = 0.5，即傾斜超過 60 度
-        severe_tilt = body_tilt > 0.5
+        # 條件 2：傾斜太大
+        # ★★★ 放寬到 1.2（約 100 度），讓機器人有更多學習機會 ★★★
+        #         body_tilt > 1.2 對應傾斜超過約 100 度（幾乎翻轉）
+        severe_tilt = body_tilt > 1.2
         
         # 任一條件成立 = 身體觸地！
         body_contact = height_contact | severe_tilt
         
-        # 【身體觸地懲罰】超大懲罰！摔倒是很嚴重的錯誤
+        # 【身體觸地懲罰】摔倒是嚴重的錯誤，但不終止讓 AI 學習恢復
         rew_body_contact = body_contact.float() * self.cfg.rew_scale_body_contact * dt
         total_reward += rew_body_contact
         
@@ -1476,74 +1529,179 @@ class RedrhexEnv(DirectRLEnv):
         total_reward += lateral_tracking
 
         # =================================================================
-        # G6.5: 側移專用獎勵 ★★★ 新增 ★★★
+        # G6.5: 側移專用獎勵 ★★★ 時間基準步態版本 ★★★
         # =================================================================
-        # 這些獎勵專門用於純側移（正左/正右）時的步態控制
-        # 目標步態：ABAD 交替外展內收，一組抬腿一組著地
+        # 核心改變：側移現在使用時間基準的交替步態（0.3 Hz 週期）
+        # 
+        # 新策略優勢：
+        # 1. 使用全局步態相位控制左右交替，不依賴 ABAD 角度
+        # 2. 使用 sin 曲線平滑插值，避免硬切換導致的抖動
+        # 3. ABAD 只負責提供側向推力，不控制步態切換
+        # 
+        # 獎勵目標：
+        # 1. 獎勵 ABAD 產生足夠的側向推力
+        # 2. 獎勵跟隨時間基準步態的正確相位
+        # 3. 懲罰高頻動作變化（但不要太嚴格以免凍住）
         
         # 檢測是否處於純側移模式
         is_lateral_mode = getattr(self, '_is_lateral_mode', torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
         
+        # 計算 ABAD 幅度（對所有模式）
+        abad_amplitude = torch.abs(abad_pos).mean(dim=1)
+        
+        # 獲取左右兩側的 ABAD 位置
+        # 右側：索引 0, 1, 2；左側：索引 3, 4, 5
+        abad_right = abad_pos[:, :3]  # 右側 ABAD
+        abad_left = abad_pos[:, 3:]   # 左側 ABAD
+        abad_right_mean = abad_right.mean(dim=1)
+        abad_left_mean = abad_left.mean(dim=1)
+        
         if is_lateral_mode.any():
-            # 獲取左右兩側的 ABAD 位置
-            # 右側：索引 0, 1, 2；左側：索引 3, 4, 5
-            abad_right = abad_pos[:, :3]  # 右側 ABAD
-            abad_left = abad_pos[:, 3:]   # 左側 ABAD
+            # ==============================================================
+            # G6.5.1 ABAD 交替獎勵（外八/內八）
+            # ==============================================================
+            # 獎勵左右 ABAD 反向動作，產生側向推力
+            # 不再是控制步態的核心，只是輔助推力
+            abad_product = abad_right_mean * abad_left_mean
             
-            # G6.5.1 ABAD 交替獎勵：左右兩側應該反向
-            # 理想情況：一側外展（正值），另一側內收（負值）
-            # 使用乘積：如果反向，乘積為負數
-            abad_product = abad_right.mean(dim=1) * abad_left.mean(dim=1)
             # 乘積為負數 = 反向 = 好 → 給獎勵
             abad_alternation_reward = torch.where(
-                abad_product < -0.01,  # 乘積為負且有一定幅度
-                -abad_product * 2.0,   # 負數變正數作為獎勵
+                abad_product < -0.01,  # 降低閾值，更容易達成
+                torch.sqrt(-abad_product + 0.01) * 2.0,
                 torch.zeros_like(abad_product)
             )
             rew_abad_alternation = abad_alternation_reward * getattr(self.cfg, 'rew_scale_abad_alternation', 2.0) * dt
-            # 只對側移模式的環境給獎勵
             rew_abad_alternation = torch.where(is_lateral_mode, rew_abad_alternation, torch.zeros_like(rew_abad_alternation))
             total_reward += rew_abad_alternation
             
-            # G6.5.2 ABAD 幅度獎勵：側移時 ABAD 應該有足夠擺幅
-            min_abad_amplitude = 0.1  # 最小需要的擺幅（約 6 度）
-            abad_amplitude = torch.abs(abad_pos).mean(dim=1)
-            rew_abad_amplitude = torch.where(
-                abad_amplitude > min_abad_amplitude,
-                abad_amplitude * getattr(self.cfg, 'rew_scale_abad_amplitude', 1.0),
-                torch.zeros_like(abad_amplitude)
-            ) * dt
+            # ==============================================================
+            # G6.5.2 ABAD 幅度獎勵
+            # ==============================================================
+            min_abad_amplitude = getattr(self.cfg, 'lateral_min_abad_amplitude', 0.15)
+            
+            # 獎勵公式：幅度超過閾值後給獎勵
+            amplitude_bonus = torch.clamp(abad_amplitude - min_abad_amplitude, min=0.0)
+            rew_abad_amplitude = amplitude_bonus * getattr(self.cfg, 'rew_scale_abad_amplitude', 2.0) * dt
             rew_abad_amplitude = torch.where(is_lateral_mode, rew_abad_amplitude, torch.zeros_like(rew_abad_amplitude))
             total_reward += rew_abad_amplitude
             
-            # G6.5.3 抖動懲罰：檢測 ABAD 的高頻小幅抖動
-            # 計算 ABAD 動作變化率
+            # ==============================================================
+            # G6.5.3 時間基準步態相位獎勵 ★★★ 新增 ★★★
+            # ==============================================================
+            # 獎勵機器人跟隨時間基準步態的正確相位
+            # 使用 _lateral_lift_mask 來判斷腿是否在正確的抬起/著地狀態
+            
+            if hasattr(self, '_lateral_lift_mask') and hasattr(self, '_current_leg_in_stance'):
+                expected_lift = self._lateral_lift_mask  # [N, 6] 根據時間相位，哪些腿應該抬起
+                actual_stance = self._current_leg_in_stance  # [N, 6] 實際哪些腿著地
+                
+                # 正確的狀態：應該抬起的腿不著地，應該著地的腿著地
+                # expected_lift=True → 應該抬起 → actual_stance=False 是正確的
+                # expected_lift=False → 應該著地 → actual_stance=True 是正確的
+                correct_phase = (expected_lift != actual_stance).float()  # [N, 6]
+                phase_correctness = correct_phase.mean(dim=1)  # [N]
+                
+                rew_gait_phase = phase_correctness * getattr(self.cfg, 'rew_scale_lateral_gait_phase', 1.5) * dt
+                rew_gait_phase = torch.where(is_lateral_mode, rew_gait_phase, torch.zeros_like(rew_gait_phase))
+                total_reward += rew_gait_phase
+            else:
+                rew_gait_phase = torch.zeros(self.num_envs, device=self.device)
+            
+            # ==============================================================
+            # G6.5.4 左右交替著地獎勵
+            # ==============================================================
+            # 現在由時間基準步態保證，這裡只是確認
+            if hasattr(self, '_current_leg_in_stance'):
+                right_legs_stance = self._current_leg_in_stance[:, :3].float().mean(dim=1)
+                left_legs_stance = self._current_leg_in_stance[:, 3:].float().mean(dim=1)
+            else:
+                right_legs_stance = leg_in_stance[:, :3].float().mean(dim=1)
+                left_legs_stance = leg_in_stance[:, 3:].float().mean(dim=1)
+            
+            # 獎勵一側著地另一側懸空
+            one_side_stance = (
+                (right_legs_stance > 0.5) & (left_legs_stance < 0.5) |
+                (left_legs_stance > 0.5) & (right_legs_stance < 0.5)
+            ).float()
+            rew_lateral_alternating_stance = one_side_stance * getattr(self.cfg, 'rew_scale_lateral_alternating_stance', 3.0) * dt
+            rew_lateral_alternating_stance = torch.where(is_lateral_mode, rew_lateral_alternating_stance, torch.zeros_like(rew_lateral_alternating_stance))
+            total_reward += rew_lateral_alternating_stance
+            
+            # 懲罰兩側都著地的狀態（抖動特徵）
+            both_stance = (right_legs_stance > 0.7) & (left_legs_stance > 0.7)
+            rew_both_stance_penalty = -both_stance.float() * 3.0 * dt
+            rew_both_stance_penalty = torch.where(is_lateral_mode, rew_both_stance_penalty, torch.zeros_like(rew_both_stance_penalty))
+            total_reward += rew_both_stance_penalty
+            
+            # ==============================================================
+            # G6.5.5 動作平滑獎勵（代替嚴格的抖動懲罰）
+            # ==============================================================
+            # 使用更溫和的方式：獎勵平滑動作而非嚴厲懲罰抖動
             if hasattr(self, 'last_actions'):
                 abad_action_current = self.actions[:, 6:12]
                 abad_action_last = self.last_actions[:, 6:12]
                 abad_action_rate = torch.sum(torch.square(abad_action_current - abad_action_last), dim=1)
                 
-                # 如果變化率高但幅度小 → 抖動
-                is_jitter = (abad_action_rate > 0.1) & (abad_amplitude < 0.15)
-                rew_abad_jitter = is_jitter.float() * getattr(self.cfg, 'rew_scale_abad_jitter', -3.0) * dt
+                # 動作越平滑獎勵越高
+                smoothness = torch.exp(-abad_action_rate * 5.0)  # [0, 1]
+                rew_abad_smooth = smoothness * 0.5 * dt
+                rew_abad_smooth = torch.where(is_lateral_mode, rew_abad_smooth, torch.zeros_like(rew_abad_smooth))
+                total_reward += rew_abad_smooth
+                
+                # 只對極端抖動給予懲罰
+                extreme_jitter = (abad_action_rate > 0.2) & (abad_amplitude < 0.1)
+                rew_abad_jitter = -extreme_jitter.float() * getattr(self.cfg, 'rew_scale_abad_jitter', -5.0) * dt
                 rew_abad_jitter = torch.where(is_lateral_mode, rew_abad_jitter, torch.zeros_like(rew_abad_jitter))
                 total_reward += rew_abad_jitter
+            else:
+                rew_abad_jitter = torch.zeros(self.num_envs, device=self.device)
             
-            # G6.5.4 全身同步抖動懲罰：所有關節同時高頻動作
-            # 計算所有動作的變化率
+            # ==============================================================
+            # G6.5.6 側移方向一致性獎勵
+            # ==============================================================
+            lateral_direction = torch.sign(cmd_vy)
+            abad_direction_correct = (lateral_direction * (abad_right_mean - abad_left_mean)) > 0.05
+            rew_lateral_direction = abad_direction_correct.float() * 1.0 * dt
+            rew_lateral_direction = torch.where(is_lateral_mode, rew_lateral_direction, torch.zeros_like(rew_lateral_direction))
+            total_reward += rew_lateral_direction
+            
+            # 全身同步抖動懲罰（只對極端情況）
             all_action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-            # 如果所有動作變化都很大且幅度小 → 全身抖動
             main_drive_amplitude = torch.abs(main_drive_vel).mean(dim=1)
-            is_sync_jitter = (all_action_rate > 0.5) & (main_drive_amplitude < 1.0) & (abad_amplitude < 0.1)
-            rew_sync_jitter = is_sync_jitter.float() * getattr(self.cfg, 'rew_scale_sync_jitter', -5.0) * dt
+            
+            # 如果所有動作變化都大且沒有有效移動 → 全身抖動
+            is_sync_jitter = (all_action_rate > 0.3) & (main_drive_amplitude < 0.5) & (abad_amplitude < 0.15)
+            rew_sync_jitter = is_sync_jitter.float() * getattr(self.cfg, 'rew_scale_sync_jitter', -20.0) * dt
             rew_sync_jitter = torch.where(is_lateral_mode, rew_sync_jitter, torch.zeros_like(rew_sync_jitter))
             total_reward += rew_sync_jitter
+            
+            # ==============================================================
+            # G6.5.6 側移方向一致性獎勵
+            # ==============================================================
+            # 確保 ABAD 的外展方向與側移方向一致
+            # 向左側移（cmd_vy > 0）：左側應該內收（推動身體向左）
+            # 向右側移（cmd_vy < 0）：右側應該內收（推動身體向右）
+            lateral_direction = torch.sign(cmd_vy)
+            
+            # 正確的 ABAD 配置：
+            # cmd_vy > 0（向左）→ 左側內收（abad_left < 0），右側外展（abad_right > 0）→ 推身體向左
+            # cmd_vy < 0（向右）→ 左側外展（abad_left > 0），右側內收（abad_right < 0）→ 推身體向右
+            abad_direction_correct = (lateral_direction * (abad_right_mean - abad_left_mean)) > 0.1
+            rew_lateral_direction = abad_direction_correct.float() * 1.5 * dt
+            rew_lateral_direction = torch.where(is_lateral_mode, rew_lateral_direction, torch.zeros_like(rew_lateral_direction))
+            total_reward += rew_lateral_direction
         else:
             # 初始化這些獎勵為零
             rew_abad_alternation = torch.zeros(self.num_envs, device=self.device)
             rew_abad_amplitude = torch.zeros(self.num_envs, device=self.device)
             rew_abad_jitter = torch.zeros(self.num_envs, device=self.device)
             rew_sync_jitter = torch.zeros(self.num_envs, device=self.device)
+            rew_lateral_alternating_stance = torch.zeros(self.num_envs, device=self.device)
+            # ★★★ 新增：時間基準步態獎勵初始化 ★★★
+            rew_gait_phase = torch.zeros(self.num_envs, device=self.device)
+            rew_abad_smooth = torch.zeros(self.num_envs, device=self.device)
+            rew_both_stance_penalty = torch.zeros(self.num_envs, device=self.device)
+            rew_lateral_direction = torch.zeros(self.num_envs, device=self.device)
         
         # G6.6 ABAD 動作變化率額外懲罰（對所有模式生效）
         if hasattr(self, 'last_actions'):
@@ -1655,6 +1813,13 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_abad_jitter"] += rew_abad_jitter
         self.episode_sums["rew_sync_jitter"] += rew_sync_jitter
         self.episode_sums["rew_abad_action_rate"] += rew_abad_action_rate
+        self.episode_sums["rew_lateral_alternating_stance"] += rew_lateral_alternating_stance
+        
+        # ★★★ 新增：時間基準步態獎勵記錄 ★★★
+        self.episode_sums["rew_gait_phase"] += rew_gait_phase
+        self.episode_sums["rew_abad_smooth"] += rew_abad_smooth
+        self.episode_sums["rew_both_stance_penalty"] += rew_both_stance_penalty
+        self.episode_sums["rew_lateral_direction"] += rew_lateral_direction
         
         # 診斷
         self.episode_sums["diag_forward_vel"] += actual_vx
@@ -1751,20 +1916,23 @@ class RedrhexEnv(DirectRLEnv):
         # 終止條件 3：翻車（傾斜太大）
         # =================================================================
         # 使用之前計算的 body_tilt 來判斷
+        # ★★★ 放寬到 1.5（約 115 度），配合 config 中的 max_tilt_magnitude ★★★
         if hasattr(self, '_body_tilt'):
-            flipped_over = self._body_tilt > 1.2  # 傾斜 > 1.2 表示翻轉超過約 100°
+            max_tilt = getattr(self.cfg, 'max_tilt_magnitude', 2.0)
+            flipped_over = self._body_tilt > max_tilt
         else:
             # 回退方案：第一次調用時可能還沒有 _body_tilt
             gravity_alignment = torch.sum(
                 self.projected_gravity * self.reference_projected_gravity, dim=1
             )
-            flipped_over = gravity_alignment < -0.2
+            flipped_over = gravity_alignment < -0.5  # 放寬
 
         # =================================================================
         # 終止條件 4：高度異常
         # =================================================================
         base_height = root_pos[:, 2]   # 機身高度（Z 座標）
-        too_low = base_height < -0.1   # 低於地面 10 公分（掉進地下了？）
+        min_height = getattr(self.cfg, 'min_base_height', -0.05)
+        too_low = base_height < min_height  # 使用 config 中的值
         too_high = base_height > 2.0   # 高於 2 公尺（飛上天了？）
         
         # =================================================================

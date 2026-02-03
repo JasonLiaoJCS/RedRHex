@@ -982,30 +982,33 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # 論文：Learning to Walk in Minutes (CoRL 2021)
     #
     # 【設計原則】
-    # 1. 追蹤獎勵使用 exp(-error²/sigma) 形式，sigma=0.25
+    # 1. 追蹤獎勵使用 exp(-error²/sigma) 形式
     # 2. 懲罰項通常使用平方誤差
-    # 3. 權重量級：追蹤 ~1.0, 懲罰 ~0.01-0.1, 碰撞 ~-1.0
+    # 3. 權重量級：追蹤 ~1.0-3.0, 懲罰 ~0.01-0.1, 碰撞 ~-1.0
     # 4. 使用 only_positive_rewards=True 避免早期終止問題
     #
     # =========================================================================
 
     # -------------------------------------------------------------------------
-    # G1: 速度追蹤獎勵（核心目標）
+    # G1: 速度追蹤獎勵（核心目標）★★★ 大幅提高 ★★★
     # -------------------------------------------------------------------------
-    # legged_gym 標準: tracking_lin_vel=1.0, tracking_ang_vel=0.5
-    # 追蹤公式: reward = exp(-error²/sigma), sigma=0.25
+    # 參考 legged_gym 的設計，但根據 RHex 特性調整
+    # 追蹤公式: reward = exp(-error²/sigma)
     # 
-    # ★ 提高權重讓機器人更積極移動 ★
+    # ★★★ 大幅提高追蹤權重讓機器人更積極追蹤命令 ★★★
 
     # 線速度追蹤（前後 + 左右）
-    rew_scale_track_lin_vel = 2.0  # 提高從 1.0 → 2.0
+    # legged_gym 標準: 1.0, 這裡提高到 4.0 以更強調追蹤
+    rew_scale_track_lin_vel = 4.0  # 再次提高：2.5 → 4.0
 
     # 角速度追蹤（旋轉）
-    rew_scale_track_ang_vel = 1.0  # 提高從 0.5 → 1.0
+    # ★ 大幅提高旋轉追蹤權重以改善原地旋轉 ★
+    rew_scale_track_ang_vel = 3.0  # 再次提高：2.5 → 3.0
 
     # 追蹤獎勵的 sigma 參數（控制獎勵衰減速度）
-    # 較小的 sigma 讓獎勵衰減更快，迫使更精確追蹤
-    tracking_sigma = 0.20  # 從 0.25 → 0.20
+    # 較大的 sigma 讓獎勵分佈更平滑，訓練更穩定
+    # legged_gym 使用 0.25，這裡也使用相同值
+    tracking_sigma = 0.25  # 恢復 legged_gym 標準值（之前太小導致獎勵信號不穩定）
 
     # -------------------------------------------------------------------------
     # G2: 姿態穩定性懲罰
@@ -1034,37 +1037,42 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # legged_gym: collision = -1.0
 
     # 身體觸地懲罰
-    rew_scale_body_contact = -1.0
+    rew_scale_body_contact = -5.0  # 加大懲罰
 
     # 是否在身體觸地時終止
+    # ★★★ 直走需要這個，否則會學會躺著不動 ★★★
     terminate_on_body_contact = True
 
     # 觸地高度閾值（公尺）
-    body_contact_height_threshold = 0.02
+    body_contact_height_threshold = 0.01  # 降低到 1 公分
 
     # -------------------------------------------------------------------------
-    # G4: 能耗與動作平滑懲罰
+    # G4: 能耗與動作平滑懲罰 ★★★ 參考 legged_gym 標準值 ★★★
     # -------------------------------------------------------------------------
-    # legged_gym 標準值
+    # 
+    # 重要發現：太高的 action_rate 懲罰會讓機器人「凍住」不敢動
+    # legged_gym 使用相對較小的懲罰值，配合高追蹤獎勵
 
     # 力矩懲罰
     # legged_gym: torques = -0.00001
-    rew_scale_torque = -0.000005  # 降低，讓機器人更敢用力
+    rew_scale_torque = -0.00001  # 恢復 legged_gym 標準值
 
-    # 動作變化率懲罰
+    # 動作變化率懲罰 ★★★ 關鍵調整 ★★★
     # legged_gym: action_rate = -0.01
-    # ★★★ 提高此值以抑制高頻抖動 ★★★
-    rew_scale_action_rate = -0.05  # 提高 10 倍：-0.005 → -0.05
+    # 之前設太高 (-0.5) 導致機器人不敢動
+    # 現在回調但仍高於標準值以抑制抖動
+    rew_scale_action_rate = -0.1  # 回調：-0.5 → -0.1（還是比 legged_gym 高 10 倍）
 
     # 關節加速度懲罰
     # legged_gym: dof_acc = -2.5e-7
-    rew_scale_joint_acc = -1.0e-7  # 降低
+    rew_scale_joint_acc = -2.5e-7  # 恢復 legged_gym 標準值
 
     # 關節速度懲罰（可選，legged_gym: dof_vel = -0.0）
     rew_scale_dof_vel = -0.0
     
     # ABAD 動作變化率額外懲罰（抑制 ABAD 抖動）
-    rew_scale_abad_action_rate = -0.1
+    # 只針對 ABAD 加強，因為它更容易抖動
+    rew_scale_abad_action_rate = -0.2  # 回調：-0.5 → -0.2
 
     # -------------------------------------------------------------------------
     # G5: RHex 步態專用獎勵
@@ -1109,25 +1117,42 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     rew_scale_abad_waste = -0.1  # 提高，直走時不要亂用
 
     # -------------------------------------------------------------------------
-    # G6.5: 側移步態專用獎勵 ★★★ 新增 ★★★
+    # G6.5: 側移步態專用獎勵 ★★★ 時間基準步態版本 ★★★
     # -------------------------------------------------------------------------
-    # 這些獎勵專門用於純側移（正左/正右）時的步態控制
-    # 目標步態：ABAD 交替外展內收，一組抬腿一組著地
+    # 核心改變：側移現在使用時間基準的交替步態（0.3 Hz 週期）
+    # ABAD 不再觸發抬腿，只負責提供側向推力
+    # 這樣可以避免 ABAD-主驅動耦合導致的高頻抖動
     
     # ABAD 交替獎勵：左右兩側 ABAD 動作應該反向（一邊外展一邊內收）
-    rew_scale_abad_alternation = 2.0
+    # 現在這個獎勵只是引導 ABAD 產生推力，不再控制步態
+    rew_scale_abad_alternation = 2.0  # 回調：5.0 → 2.0（不再是主要控制）
     
     # ABAD 幅度獎勵：側移時 ABAD 應該有足夠的擺幅
-    rew_scale_abad_amplitude = 1.0
+    # 確保 ABAD 產生足夠的側向推力
+    rew_scale_abad_amplitude = 2.0  # 回調：3.0 → 2.0
     
     # 抖動懲罰：懲罰 ABAD 的高頻小幅抖動
-    rew_scale_abad_jitter = -3.0
+    # 現在側移步態由時間控制，抖動懲罰可以稍微放鬆
+    rew_scale_abad_jitter = -5.0  # 回調：-15.0 → -5.0
     
     # 同步抖動懲罰：懲罰所有腿同時高頻動作
-    rew_scale_sync_jitter = -5.0
+    # 現在應該不太會發生全身抖動
+    rew_scale_sync_jitter = -5.0  # 回調：-20.0 → -5.0
     
-    # 側移腳離地獎勵：側移時應該有腳離地（通過主驅動相位判斷）
-    rew_scale_lateral_lift = 1.5
+    # 側移腳離地獎勵：時間基準步態會自動控制，這裡給額外獎勵
+    rew_scale_lateral_lift = 2.0  # 回調：3.0 → 2.0
+    
+    # 側移時左右交替著地獎勵
+    # 現在由時間基準步態保證，這裡確認正確執行
+    rew_scale_lateral_alternating_stance = 3.0  # 回調：5.0 → 3.0
+    
+    # 側移最小擺幅閾值
+    # ABAD 擺幅必須超過此閾值才能獲得幅度獎勵
+    lateral_min_abad_amplitude = 0.15  # 放寬：0.2 → 0.15（約 8.6 度）
+    
+    # ★★★ 新增：側移步態週期正確性獎勵 ★★★
+    # 獎勵跟隨時間基準步態的正確相位
+    rew_scale_lateral_gait_phase = 1.5
     
     # -------------------------------------------------------------------------
     # G7: 額外獎勵
@@ -1169,11 +1194,13 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     
     # 最大傾斜角度（弧度）
     # 超過這個角度就視為「翻倒」，結束回合
-    max_tilt_magnitude = 1.5
+    # ★★★ 放寬到 2.0（約 115 度）讓機器人有更多學習機會 ★★★
+    max_tilt_magnitude = 2.0
     
     # 最低高度（公尺）
     # 機身低於這個高度就視為「趴下」，結束回合
-    min_base_height = 0.02
+    # ★★★ 降低到 -0.05 公尺（只有掉到地下才終止）★★★
+    min_base_height = -0.05
     
     # 最高高度（公尺）
     # 機身高於這個高度就視為「異常」（可能是 bug），結束回合
