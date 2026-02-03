@@ -816,8 +816,19 @@ class RedrhexEnv(DirectRLEnv):
         # =====================================================================
         # 步驟 6：發送指令給主驅動關節
         # =====================================================================
-        # 純側移時：使用位置控制，把腳調回預設向下位置
-        # 其他情況：使用速度控制，執行步態
+        # ★★★ 純側移時完全鎖住主驅動關節 ★★★
+        # 
+        # 純側移（正左/正右）時：
+        # 1. 把腳調回預設向下位置（確保六隻腳都接觸地面）
+        # 2. 完全鎖住主驅動關節（使用 PD 控制器把腳固定在預設位置）
+        # 3. 只靠 ABAD 關節產生側向推力
+        #
+        # 其他情況（斜走、正前、旋轉）：
+        # 使用速度控制執行正常步態
+        #
+        # 注意：main_drive 關節的 stiffness=0，是純速度控制模式
+        # 所以我們不能用 set_joint_position_target()
+        # 而是要用 PD 控制器計算「讓腳回到預設位置的速度」
         
         # 預設位置：右側腿 45°，左側腿 -45°（確保六隻腳都接觸地面）
         # 主驅動關節順序：[15, 7, 12, 18, 23, 24]
@@ -829,26 +840,36 @@ class RedrhexEnv(DirectRLEnv):
                 device=self.device
             ) * math.pi / 180.0  # 轉換為弧度
         
-        # 對於純側移的環境，設定位置目標把腳調回預設位置
-        # 這確保六隻腳都接觸地面，然後只靠 ABAD 產生側向推力
+        # 構建最終的速度目標
+        final_drive_vel = target_drive_vel.clone()
+        
+        # 對於純側移的環境，使用 PD 控制器計算速度來把腳固定在預設位置
         if is_pure_lateral.any():
-            lateral_envs = torch.where(is_pure_lateral)[0]
-            lateral_pos_target = self._lateral_default_pos.unsqueeze(0).expand(len(lateral_envs), -1)
-            self.robot.set_joint_position_target(
-                lateral_pos_target,
-                joint_ids=self._main_drive_indices,
-                env_ids=lateral_envs
+            # 獲取當前主驅動關節位置
+            current_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
+            
+            # 計算位置誤差（目標位置 - 當前位置）
+            target_pos = self._lateral_default_pos.unsqueeze(0).expand(self.num_envs, -1)  # [N, 6]
+            pos_error = target_pos - current_drive_pos  # [N, 6]
+            
+            # 使用 P 控制器計算所需速度（Kp = 5.0，讓腳快速回到預設位置）
+            # 速度 = Kp * 位置誤差
+            lateral_kp = 5.0  # 比例增益
+            lateral_vel = lateral_kp * pos_error
+            
+            # 限制速度，防止過快
+            max_lateral_vel = 3.0  # 最大修正速度 rad/s
+            lateral_vel = torch.clamp(lateral_vel, min=-max_lateral_vel, max=max_lateral_vel)
+            
+            # 對於純側移的環境，使用這個 PD 計算的速度
+            final_drive_vel = torch.where(
+                lateral_mask,
+                lateral_vel,
+                final_drive_vel
             )
         
-        # 對於非側移的環境，使用速度控制
-        non_lateral = ~is_pure_lateral
-        if non_lateral.any():
-            non_lateral_envs = torch.where(non_lateral)[0]
-            self.robot.set_joint_velocity_target(
-                target_drive_vel[non_lateral_envs], 
-                joint_ids=self._main_drive_indices,
-                env_ids=non_lateral_envs
-            )
+        # 發送速度指令給所有環境
+        self.robot.set_joint_velocity_target(final_drive_vel, joint_ids=self._main_drive_indices)
         
         # =====================================================================
         # ABAD 關節控制：位置控制模式（與之前相同）
