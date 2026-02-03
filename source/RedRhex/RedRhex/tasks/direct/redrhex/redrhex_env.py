@@ -1838,6 +1838,19 @@ class RedrhexEnv(DirectRLEnv):
         default_root_state[:, 0] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
         default_root_state[:, 1] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
 
+        # ★★★ 關鍵修正：隨機化機器人的初始朝向（yaw）★★★
+        # 這樣訓練時機器人會面向各種方向，迫使它學習「本體座標系」的追蹤
+        # 而不是「世界座標系」的追蹤
+        random_yaw = sample_uniform(-math.pi, math.pi, (num_reset,), device=self.device)
+        
+        # 從 yaw 角度創建四元數（只旋轉 yaw，roll 和 pitch 保持為 0）
+        # 四元數格式 [w, x, y, z] = [cos(yaw/2), 0, 0, sin(yaw/2)]
+        half_yaw = random_yaw * 0.5
+        default_root_state[:, 3] = torch.cos(half_yaw)  # w
+        default_root_state[:, 4] = 0.0                   # x
+        default_root_state[:, 5] = 0.0                   # y
+        default_root_state[:, 6] = torch.sin(half_yaw)  # z
+
         # 寫入模擬
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
@@ -2048,45 +2061,53 @@ class RedrhexEnv(DirectRLEnv):
         arrow_scale[:, 2] = width_height  # 高度固定
         
         # =====================================================================
-        # 箭頭方向計算 - 關鍵區分邏輯！
+        # 箭頭方向計算 - 使用向量旋轉而非角度計算
         # =====================================================================
         # 
-        # 【線性移動】：箭頭指向速度方向（固定）
-        # 【純旋轉】：箭頭持續繞圈旋轉！
+        # 【方法】：將本體座標系的速度向量直接旋轉到世界座標系
+        # 這樣可以避免手動計算 yaw 角度可能出現的錯誤
         #
+        
+        # 獲取機器人的姿態四元數
+        base_quat_w = self.robot.data.root_quat_w
+        
+        # 創建本體座標系的速度向量 (vx, vy, 0)
+        body_vel_3d = torch.zeros(xy_velocity.shape[0], 3, device=self.device)
+        body_vel_3d[:, 0] = xy_velocity[:, 0]  # 本體 X（前方）
+        body_vel_3d[:, 1] = xy_velocity[:, 1]  # 本體 Y（左方）
+        # body_vel_3d[:, 2] = 0  # 保持水平
+        
+        # ★★★ 關鍵：使用 quat_apply 將本體座標系向量轉換到世界座標系 ★★★
+        # 這是最可靠的方法，不需要手動提取 yaw 角度
+        world_vel_3d = math_utils.quat_apply(base_quat_w, body_vel_3d)
+        
+        # 處理純旋轉的特殊情況
         if ang_vel is not None:
             # 使用模擬時間讓箭頭持續旋轉
-            # 旋轉速度 = wz（命令的角速度），這樣箭頭旋轉速度和命令一致
             sim_time = self.episode_length_buf.float() * self.cfg.sim.dt * self.cfg.decimation
             
-            # 純旋轉時的角度：箭頭以 wz 速度持續旋轉
-            # 這會讓箭頭像時鐘指針一樣繞圈！
+            # 純旋轉時的角度：箭頭以 wz 速度持續旋轉（相對於機器人朝向）
             rotation_angle = ang_vel * sim_time * 2.0  # 乘以 2 讓旋轉更明顯
             
-            # 線速度方向（固定角度）
-            linear_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
+            # 從四元數提取 yaw（僅用於純旋轉的箭頭動畫）
+            # Isaac Lab 四元數格式: [w, x, y, z]
+            w = base_quat_w[:, 0]
+            x = base_quat_w[:, 1]
+            y = base_quat_w[:, 2]
+            z = base_quat_w[:, 3]
+            base_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+            
+            # 純旋轉時的世界座標系角度（繞圈動畫）
+            rotation_world_angle = base_yaw + rotation_angle
+            
+            # 線性移動時從世界座標系速度計算角度
+            linear_world_angle = torch.atan2(world_vel_3d[:, 1], world_vel_3d[:, 0])
             
             # 根據是否純旋轉選擇角度
-            # - 純旋轉：使用持續變化的 rotation_angle（繞圈）
-            # - 線性移動：使用固定的 linear_angle（指向移動方向）
-            heading_angle = torch.where(is_pure_rotation, rotation_angle, linear_angle)
+            world_heading = torch.where(is_pure_rotation, rotation_world_angle, linear_world_angle)
         else:
-            heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
-        
-        # 獲取機器人的偏航角（只取 yaw，忽略 roll/pitch）
-        # 這樣箭頭永遠在水平面上
-        base_quat_w = self.robot.data.root_quat_w
-        # 從四元數提取 yaw 角度
-        # quat = [w, x, y, z]
-        # yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
-        w = base_quat_w[:, 0]
-        x = base_quat_w[:, 1]
-        y = base_quat_w[:, 2]
-        z = base_quat_w[:, 3]
-        base_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-        
-        # 組合箭頭方向（本體坐標系）和機器人 yaw（世界坐標系）
-        world_heading = base_yaw + heading_angle
+            # 從世界座標系速度直接計算角度
+            world_heading = torch.atan2(world_vel_3d[:, 1], world_vel_3d[:, 0])
         
         # 創建只有 yaw 旋轉的四元數（箭頭永遠水平）
         zeros = torch.zeros_like(world_heading)
