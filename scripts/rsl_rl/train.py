@@ -33,6 +33,12 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--store_code_state",
+    action="store_true",
+    default=False,
+    help="Store git code-state snapshots in the run folder (disabled by default to avoid unicode git-diff errors).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -194,8 +200,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    # write git state to logs
-    runner.add_git_repo_to_log(__file__)
+    # write git state to logs (opt-in; some repos contain non-UTF8 filenames that can crash logging)
+    if args_cli.store_code_state:
+        runner.add_git_repo_to_log(__file__)
+    else:
+        runner.git_status_repos = []
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")

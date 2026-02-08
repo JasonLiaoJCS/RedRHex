@@ -117,6 +117,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
 
+    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     runner.load(resume_path)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
@@ -199,7 +200,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if hasattr(unwrapped_env, "commands"):
                 unwrapped_env.commands[:] = cmd_tensor
 
-            with torch.inference_mode():
+            # Use no_grad instead of inference_mode: inference tensors can break subsequent env.reset() writes.
+            with torch.no_grad():
                 actions = policy(obs)
                 obs, _, dones, _ = env.step(actions)
                 policy_nn.reset(dones)
