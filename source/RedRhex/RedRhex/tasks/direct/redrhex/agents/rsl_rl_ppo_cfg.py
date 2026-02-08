@@ -36,7 +36,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """RedRhex RHex-style Wheg Locomotion PPO 訓練配置 v3.0"""
+    """RedRhex RHex-style Wheg Locomotion PPO 訓練配置 v3.1"""
 
     num_steps_per_env = 24
     max_iterations = 2000
@@ -46,7 +46,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     logger = "tensorboard"
 
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,  # ★ 從 0.8 → 1.0（更多初始隨機探索）
+        init_noise_std=0.8,  # 降低初始噪音，避免後段 curriculum 發散
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         # ★ 簡化網路：從 [256,128,64] → [128,64]（避免過擬合）
@@ -59,10 +59,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,  # ★ 從 0.005 → 0.01（2倍探索！）
-        num_learning_epochs=8,  # ★ 從 5 → 8（更多更新）
+        entropy_coef=0.005,  # 避免策略標準差爆增
+        num_learning_epochs=6,
         num_mini_batches=4,
-        learning_rate=1.0e-3,  # ★ 從 3e-4 → 1e-3（3倍學習速度！）
+        learning_rate=5.0e-4,  # 降低高階段整合時的不穩定
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

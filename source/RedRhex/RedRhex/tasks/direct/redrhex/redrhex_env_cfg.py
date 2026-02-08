@@ -699,8 +699,9 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # =========================================================================
     # Stage 1: Forward-only
     # Stage 2: Lateral-only
-    # Stage 3: Yaw-only
-    # Stage 4: Mixed (Forward/Lateral/Diagonal/Yaw)
+    # Stage 3: Diagonal-only
+    # Stage 4: Yaw-only
+    # Stage 5: Mixed (Forward/Lateral/Diagonal/Yaw)
     
     # 前後速度範圍（公尺/秒）
     lin_vel_x_range = [0.2, 0.45]
@@ -738,15 +739,16 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     direction_names = ["前", "左", "右", "左前", "右前", "逆時針旋轉", "順時針旋轉"]
 
     # -------------------------------------------------------------------------
-    # Curriculum（Hydra 可直接覆寫：stage=1/2/3/4）
+    # Curriculum（Hydra 可直接覆寫：stage=1/2/3/4/5）
     # -------------------------------------------------------------------------
     curriculum_enable = True
-    stage = 4  # 1:Forward-only, 2:Lateral-only, 3:Yaw-only, 4:Mixed-skills
+    stage = 5  # 1:Forward-only, 2:Lateral-only, 3:Diagonal-only, 4:Yaw-only, 5:Mixed-skills
     curriculum_auto_progress = False
-    curriculum_stage1_steps = 400_000
-    curriculum_stage2_steps = 1_000_000
-    curriculum_stage3_steps = 1_600_000
-    curriculum_stage_scales = [0.25, 0.50, 0.75, 1.00]
+    curriculum_stage1_steps = 800_000
+    curriculum_stage2_steps = 1_800_000
+    curriculum_stage3_steps = 3_000_000
+    curriculum_stage4_steps = 4_200_000
+    curriculum_stage_scales = [0.15, 0.30, 0.50, 0.70, 1.00]
 
     # Stage 專屬命令分佈
     stage1_use_discrete_directions = False
@@ -755,17 +757,46 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
     stage2_use_discrete_directions = False
     stage2_discrete_directions = [[0.0, 0.30, 0.0], [0.0, -0.30, 0.0]]
-    stage2_lateral_vy_abs_range = [0.20, 0.40]
+    stage2_lateral_vy_abs_range = [0.18, 0.38]
 
-    # Stage3: Yaw-only
+    # Stage3: Diagonal-only（融合 stage1 前進 + stage2 側移）
     stage3_use_discrete_directions = True
-    stage3_discrete_directions = [[0.0, 0.0, 0.8], [0.0, 0.0, -0.8]]
-    stage3_yaw_wz_abs_range = [0.45, 1.00]
+    stage3_discrete_directions = [
+        [0.28, 0.24, 0.0],
+        [0.28, -0.24, 0.0],
+        [0.35, 0.28, 0.0],
+        [0.35, -0.28, 0.0],
+    ]
+    stage3_diag_vx_range = [0.22, 0.40]
+    stage3_diag_vy_abs_range = [0.18, 0.30]
 
-    # Stage4: Mixed skills（可覆寫為 False 改用連續範圍）
+    # Stage4: Yaw-only（先把原地旋轉練穩）
     stage4_use_discrete_directions = True
-    stage4_discrete_directions = discrete_directions
-    stage4_mode_probabilities = [0.30, 0.25, 0.20, 0.25]  # [FWD, LAT, DIAG, YAW]
+    stage4_discrete_directions = [
+        [0.0, 0.0, 0.50],
+        [0.0, 0.0, -0.50],
+        [0.0, 0.0, 0.70],
+        [0.0, 0.0, -0.70],
+    ]
+    stage4_yaw_wz_abs_range = [0.35, 0.75]
+
+    # Stage5: Mixed skills（最終整合）
+    stage5_use_discrete_directions = False
+    stage5_discrete_directions = [
+        [0.40, 0.00, 0.00],
+        [0.00, 0.35, 0.00],
+        [0.00, -0.35, 0.00],
+        [0.34, 0.26, 0.00],
+        [0.34, -0.26, 0.00],
+        [0.00, 0.00, 0.80],
+        [0.00, 0.00, -0.80],
+    ]
+    stage5_mode_probabilities = [0.20, 0.30, 0.25, 0.25]  # [FWD, LAT, DIAG, YAW]
+    stage5_forward_vx_range = [0.22, 0.45]
+    stage5_lateral_vy_abs_range = [0.18, 0.38]
+    stage5_diag_vx_range = [0.22, 0.42]
+    stage5_diag_vy_abs_range = [0.16, 0.30]
+    stage5_yaw_wz_abs_range = [0.35, 0.75]
 
     # 若設 True，環境會依 command_resample_time 週期重採樣命令
     command_resample_on_timer = False
@@ -786,24 +817,32 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     lock_abad_in_forward = True
     lock_main_drive_in_lateral = True
     lateral_soft_lock_enable = True
-    lateral_soft_lock_velocity = 0.8
+    lateral_soft_lock_velocity = 1.8
     require_stand_before_lateral = True
     lateral_stand_pos_tol = 0.12
     lateral_contact_pose_tol = 0.18
     lateral_min_contact_count = 6.0
     lateral_go_to_stand_timeout_s = 1.5
     lateral_timeout_cooldown_steps = 80
+    lateral_abad_base_amplitude = 0.40
+    lateral_abad_max_amplitude = 0.60
+    lateral_abad_policy_blend = 0.05
+    diag_abad_bias_scale = 0.20
+    diag_abad_policy_blend = 0.70
+    yaw_abad_action_scale = 0.55
+    abad_pos_limit = 0.60
     
     # Forward tripod 相位鎖定（讓步態更接近 alternating tripod）
     forward_phase_lock_gain = 1.2
     forward_drive_action_scale = 0.35
 
     # Main-drive 映射（bias + residual）
-    main_drive_residual_scale = 0.40
+    main_drive_residual_scale = 0.22
     drive_bias_vx_ref = 0.45
     drive_bias_wz_ref = 1.00
-    yaw_drive_bias_scale = 4.5
+    yaw_drive_bias_scale = 2.4
     yaw_body_pattern_sign = 1.0
+    yaw_stability_tilt_limit = 0.38
 
     # -------------------------------------------------------------------------
     # Forward gait prior（reward shaping 專用）
@@ -1121,7 +1160,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # -------------------------------------------------------------------------
     rew_scale_body_contact = -2.0  # ★ 從 -5.0 降低到 -2.0
     terminate_on_body_contact = True
-    body_contact_height_threshold = 0.01
+    body_contact_height_threshold = 0.12
 
     # -------------------------------------------------------------------------
     # G4: 能耗與動作平滑懲罰 ★★★ 大幅降低！★★★
@@ -1277,13 +1316,13 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     
     # 最大傾斜角度（弧度）
     # 超過這個角度就視為「翻倒」，結束回合
-    # ★★★ 放寬到 2.0（約 115 度）讓機器人有更多學習機會 ★★★
-    max_tilt_magnitude = 2.0
+    # 收斂到可控範圍，避免「翻倒但不終止」污染訓練資料
+    max_tilt_magnitude = 1.2
     
     # 最低高度（公尺）
     # 機身低於這個高度就視為「趴下」，結束回合
-    # ★★★ 降低到 -0.05 公尺（只有掉到地下才終止）★★★
-    min_base_height = -0.05
+    # 低於此高度視為機身接地或明顯失衡
+    min_base_height = 0.10
     
     # 最高高度（公尺）
     # 機身高於這個高度就視為「異常」（可能是 bug），結束回合
@@ -1333,7 +1372,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
     # 地形課程（若 terrain generator 可用，隨 stage 遞進）
     terrain_curriculum_enable = True
-    terrain_curriculum_levels = [0.0, 0.3, 0.6, 1.0]  # flat -> mild -> medium -> rough
+    terrain_curriculum_levels = [0.0, 0.2, 0.45, 0.7, 1.0]  # flat -> mild -> medium -> rougher -> rough
 
     # -------------------------------------------------------------------------
     # 舊版參數別名（向後相容）
@@ -1403,38 +1442,50 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # 設計原則：不同命令（前進/側移/旋轉/斜向）要有明確分流，不允許「直走偷分」
     v2_reward_scales = {
         # 核心追蹤
-        "forward_progress": 5.0,      # 命令方向速度投影（核心）
-        "velocity_tracking": 4.0,     # vx/vy/wz 追蹤精度
-        "mode_specialization": 2.5,   # 側移/旋轉/斜向專屬 shaping
-        "axis_suppression": 1.5,      # 未命令軸速度抑制（防止直走偷分）
-        "lateral_drive_soft_penalty": 1.5,  # 側移時主驅動軟鎖（越小越好）
+        "forward_progress": 4.0,      # 命令方向速度投影（核心）
+        "velocity_tracking": 7.0,     # vx/vy/wz 追蹤精度
+        "mode_specialization": 4.8,   # 側移/旋轉/斜向專屬 shaping
+        "axis_suppression": 1.2,      # 未命令軸速度抑制（防止直走偷分）
+        "lateral_drive_soft_penalty": 0.22,   # 側移時主驅動軟鎖（越小越好）
+        "lateral_speed_deficit_penalty": 5.0, # 側移速度不足懲罰
+        "lateral_speed_target_ratio": 0.85,   # 側移速度至少達命令的比例
+        "diag_sign_bonus": 1.6,       # 斜向時 vx/vy 符號都正確的加分
+        "diag_wrong_sign_penalty": 3.0,  # 斜向符號錯誤懲罰
         
         # Forward gait prior（只在 FWD mode 生效）
         "forward_prior_coherence": 1.2,   # Tripod A/B 組內相位一致
         "forward_prior_antiphase": 1.2,   # A 與 B 相位差接近 π
-        "forward_prior_duty": 0.9,        # duty factor 接近 0.65
-        "forward_prior_vel_ratio": 0.9,   # stance 慢 / swing 快速度比
-        "forward_prior_overlap": 0.7,     # 相位切換附近鼓勵 >=4 腳支撐
+        "forward_prior_duty": 1.3,        # duty factor 接近 0.65
+        "forward_prior_vel_ratio": 1.6,   # stance 慢 / swing 快速度比
+        "forward_prior_overlap": 0.9,     # 相位切換附近鼓勵 >=4 腳支撐
 
         # 穩定與探索
-        "height_maintain": 0.8,       # 維持站立高度
+        "height_maintain": 1.5,       # 維持站立高度
+        "target_base_height": 0.30,   # 以初始站姿附近當高度目標
+        "height_sigma": 0.05,         # 高度追蹤容忍
+        "height_low_penalty": 2.5,    # 高度過低懲罰
         "leg_moving": 0.5,            # 防消極（需與命令一致）
         
         # 負向懲罰
-        "stall_penalty": -2.0,        # 有命令卻幾乎不動
-        "action_smooth": -0.01,       # 動作平滑
-        "fall": -8.0,                 # 摔倒
+        "stall_penalty": -2.5,        # 有命令卻幾乎不動
+        "action_smooth": -0.015,      # 動作平滑
+        "fall": -16.0,                # 摔倒
+        "fall_height_threshold": 0.14,
+        "fall_roll_threshold": 0.90,
+        "fall_pitch_threshold": 0.90,
 
         # Yaw 穩定專項
-        "yaw_mode_track_bonus": 2.0,      # 額外鼓勵旋轉追蹤
-        "yaw_roll_pitch_penalty": 3.0,    # 旋轉時抑制 roll/pitch
-        "yaw_height_penalty": 1.5,        # 旋轉時抑制機身抬升/下沉
-        "yaw_slip_penalty": 1.0,          # 旋轉時抑制平移滑移
-        "yaw_cheat_penalty": 4.0,         # 抑制「抬機身但不轉」作弊
-        "yaw_cheat_min_wz": 0.4,          # 低於此角速度視為未達旋轉目標
-        "yaw_cheat_tilt_thresh": 0.30,    # 超過此傾斜開始視為作弊傾向
+        "yaw_mode_track_bonus": 5.0,      # 額外鼓勵旋轉追蹤
+        "yaw_roll_pitch_penalty": 7.0,    # 旋轉時抑制 roll/pitch
+        "yaw_height_penalty": 3.0,        # 旋轉時抑制機身抬升/下沉
+        "yaw_target_base_height": 0.30,   # 旋轉高度目標
+        "yaw_slip_penalty": 0.8,          # 旋轉時抑制平移滑移
+        "yaw_slip_cap": 2.0,              # 平移滑移 proxy 裁切
+        "yaw_cheat_penalty": 8.0,         # 抑制「抬機身但不轉」作弊
+        "yaw_cheat_min_wz": 0.45,         # 低於此角速度視為未達旋轉目標
+        "yaw_cheat_tilt_thresh": 0.20,    # 超過此傾斜開始視為作弊傾向
         
         # 追蹤曲線寬度（越小越嚴格）
-        "lin_tracking_sigma": 0.30,   # 線速度追蹤容忍
-        "yaw_tracking_sigma": 0.35,   # 旋轉追蹤容忍
+        "lin_tracking_sigma": 0.20,   # 線速度追蹤容忍
+        "yaw_tracking_sigma": 0.18,   # 旋轉追蹤容忍
     }

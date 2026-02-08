@@ -8,6 +8,8 @@ import csv
 import math
 import os
 import sys
+from collections import defaultdict
+from typing import Iterable, Sequence
 
 from isaaclab.app import AppLauncher
 
@@ -24,11 +26,39 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--sweep_steps", type=int, default=600, help="Evaluation steps per command.")
 parser.add_argument("--warmup_steps", type=int, default=120, help="Warm-up steps per command.")
 parser.add_argument("--csv", type=str, default=None, help="Optional command-table CSV path.")
+parser.add_argument(
+    "--eval_profile",
+    type=str,
+    default="stage5",
+    choices=["stage1", "stage2", "stage3", "stage4", "stage5", "full"],
+    help="Command-sweep profile that matches the 5-stage curriculum.",
+)
+parser.add_argument("--command_scale", type=float, default=1.0, help="Scale factor applied to all sweep commands.")
 parser.add_argument("--accept_duration_s", type=float, default=2.0, help="Minimum success duration for lateral/yaw tests.")
+parser.add_argument("--accept_vx_abs", type=float, default=0.15, help="Forward speed threshold for acceptance.")
 parser.add_argument("--accept_vy_abs", type=float, default=0.15, help="Lateral speed threshold for acceptance.")
 parser.add_argument("--accept_wz_abs", type=float, default=0.40, help="Yaw rate threshold for acceptance.")
+parser.add_argument("--accept_lin_ratio", type=float, default=0.55, help="Required |v| / |v_cmd| ratio for linear commands.")
+parser.add_argument("--accept_wz_ratio", type=float, default=0.55, help="Required |wz| / |wz_cmd| ratio for yaw commands.")
 parser.add_argument("--accept_yaw_tilt_bound", type=float, default=0.60, help="Max |roll|/|pitch| bound during yaw acceptance.")
+parser.add_argument("--accept_yaw_tilt_ratio", type=float, default=0.70, help="Required fraction of yaw samples within tilt bound.")
+parser.add_argument("--accept_forward_lateral_leak", type=float, default=0.12, help="Max |vy| allowed in forward acceptance.")
+parser.add_argument("--accept_forward_yaw_leak", type=float, default=0.30, help="Max |wz| allowed in forward acceptance.")
+parser.add_argument("--accept_lateral_forward_leak", type=float, default=0.12, help="Max |vx| allowed in lateral acceptance.")
+parser.add_argument("--accept_lateral_yaw_leak", type=float, default=0.30, help="Max |wz| allowed in lateral acceptance.")
 parser.add_argument("--accept_diag_sign_ratio", type=float, default=0.70, help="Required sign-match ratio for diagonal commands.")
+parser.add_argument(
+    "--accept_diag_component_ratio",
+    type=float,
+    default=0.50,
+    help="Required per-axis speed ratio (|v|/|v_cmd|) for diagonal acceptance.",
+)
+parser.add_argument("--accept_diag_yaw_leak", type=float, default=0.35, help="Max |wz| allowed in diagonal acceptance.")
+parser.add_argument("--accept_yaw_lin_leak", type=float, default=0.18, help="Max linear speed allowed in yaw acceptance.")
+parser.add_argument("--accept_min_base_height", type=float, default=0.12, help="Min base height during yaw acceptance.")
+parser.add_argument("--accept_max_fall_rate", type=float, default=0.20, help="Max fall-rate allowed per command.")
+parser.add_argument("--accept_skill_pass_ratio", type=float, default=0.60, help="Skill-level pass ratio threshold.")
+parser.add_argument("--accept_overall_pass_ratio", type=float, default=0.70, help="Overall command pass-ratio threshold.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -88,6 +118,156 @@ def summarize_contact_hist(contact_hist: torch.Tensor) -> str:
     return " ".join(parts)
 
 
+def classify_command_skill(cmd: Sequence[float], eps: float = 1e-5) -> str:
+    vx, vy, wz = float(cmd[0]), float(cmd[1]), float(cmd[2])
+    if abs(wz) > eps and abs(vx) <= eps and abs(vy) <= eps:
+        return "yaw"
+    if abs(vx) > eps and abs(vy) > eps and abs(wz) <= eps:
+        return "diagonal"
+    if abs(vy) > eps and abs(vx) <= eps and abs(wz) <= eps:
+        return "lateral"
+    if abs(vx) > eps and abs(vy) <= eps and abs(wz) <= eps:
+        return "forward"
+    return "other"
+
+
+def _linspace(lo: float, hi: float, count: int) -> list[float]:
+    lo = float(lo)
+    hi = float(hi)
+    if count <= 1 or abs(hi - lo) < 1e-6:
+        return [0.5 * (lo + hi)]
+    return [lo + (hi - lo) * (float(i) / float(count - 1)) for i in range(count)]
+
+
+def _to_triples(commands: Iterable[Sequence[float]]) -> list[tuple[float, float, float]]:
+    triples: list[tuple[float, float, float]] = []
+    for cmd in commands:
+        if len(cmd) >= 3:
+            triples.append((float(cmd[0]), float(cmd[1]), float(cmd[2])))
+        elif len(cmd) == 2:
+            triples.append((float(cmd[0]), float(cmd[1]), 0.0))
+    return triples
+
+
+def _name_command(cmd: tuple[float, float, float], skill: str, name_counts: dict[str, int]) -> str:
+    vx, vy, wz = cmd
+    if skill == "forward":
+        base = "forward"
+    elif skill == "lateral":
+        base = "left" if vy >= 0.0 else "right"
+    elif skill == "diagonal":
+        base = "diag_left" if vy >= 0.0 else "diag_right"
+    elif skill == "yaw":
+        base = "yaw_ccw" if wz >= 0.0 else "yaw_cw"
+    else:
+        base = "cmd"
+    name_counts[base] += 1
+    if name_counts[base] == 1:
+        return base
+    return f"{base}_{name_counts[base]}"
+
+
+def _generate_named_commands(commands: Iterable[Sequence[float]]) -> list[tuple[str, tuple[float, float, float], str]]:
+    named: list[tuple[str, tuple[float, float, float], str]] = []
+    seen: set[tuple[float, float, float]] = set()
+    name_counts: defaultdict[str, int] = defaultdict(int)
+    for cmd in _to_triples(commands):
+        key = (round(cmd[0], 4), round(cmd[1], 4), round(cmd[2], 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        skill = classify_command_skill(cmd)
+        name = _name_command(cmd, skill, name_counts)
+        named.append((name, cmd, skill))
+    return named
+
+
+def build_command_set(env_cfg, profile: str, command_scale: float) -> list[tuple[str, tuple[float, float, float], str]]:
+    profile = profile.lower()
+    scale = float(command_scale)
+
+    def _scale(commands: Iterable[Sequence[float]]) -> list[tuple[float, float, float]]:
+        out: list[tuple[float, float, float]] = []
+        for vx, vy, wz in _to_triples(commands):
+            out.append((vx * scale, vy * scale, wz * scale))
+        return out
+
+    def _stage1() -> list[tuple[float, float, float]]:
+        if getattr(env_cfg, "stage1_use_discrete_directions", False):
+            dirs = getattr(env_cfg, "stage1_discrete_directions", [[0.4, 0.0, 0.0]])
+            return _scale(dirs)
+        vx_min, vx_max = getattr(env_cfg, "stage1_forward_vx_range", [0.20, 0.45])
+        vx_samples = [v for v in _linspace(vx_min, vx_max, 3) if v > 1e-4]
+        return _scale([(vx, 0.0, 0.0) for vx in vx_samples])
+
+    def _stage2() -> list[tuple[float, float, float]]:
+        if getattr(env_cfg, "stage2_use_discrete_directions", False):
+            dirs = getattr(env_cfg, "stage2_discrete_directions", [[0.0, 0.3, 0.0], [0.0, -0.3, 0.0]])
+            return _scale(dirs)
+        vy_min, vy_max = getattr(env_cfg, "stage2_lateral_vy_abs_range", [0.20, 0.40])
+        vy_samples = [max(1e-4, abs(v)) for v in _linspace(vy_min, vy_max, 2)]
+        cmds: list[tuple[float, float, float]] = []
+        for vy in vy_samples:
+            cmds.append((0.0, vy, 0.0))
+            cmds.append((0.0, -vy, 0.0))
+        return _scale(cmds)
+
+    def _stage3() -> list[tuple[float, float, float]]:
+        if getattr(env_cfg, "stage3_use_discrete_directions", True):
+            dirs = getattr(env_cfg, "stage3_discrete_directions", [[0.3, 0.2, 0.0], [0.3, -0.2, 0.0]])
+            return _scale(dirs)
+        vx_min, vx_max = getattr(env_cfg, "stage3_diag_vx_range", [0.22, 0.40])
+        vy_min, vy_max = getattr(env_cfg, "stage3_diag_vy_abs_range", [0.18, 0.30])
+        vx_samples = _linspace(vx_min, vx_max, 2)
+        vy_samples = _linspace(vy_min, vy_max, 2)
+        cmds = []
+        for vx, vy in zip(vx_samples, vy_samples):
+            cmds.append((vx, abs(vy), 0.0))
+            cmds.append((vx, -abs(vy), 0.0))
+        return _scale(cmds)
+
+    def _stage4() -> list[tuple[float, float, float]]:
+        if getattr(env_cfg, "stage4_use_discrete_directions", True):
+            dirs = getattr(env_cfg, "stage4_discrete_directions", [[0.0, 0.0, 0.65], [0.0, 0.0, -0.65]])
+            return _scale(dirs)
+        wz_min, wz_max = getattr(env_cfg, "stage4_yaw_wz_abs_range", [0.35, 0.75])
+        wz_samples = [max(1e-4, abs(w)) for w in _linspace(wz_min, wz_max, 2)]
+        cmds = []
+        for wz in wz_samples:
+            cmds.append((0.0, 0.0, wz))
+            cmds.append((0.0, 0.0, -wz))
+        return _scale(cmds)
+
+    def _stage5() -> list[tuple[float, float, float]]:
+        dirs = getattr(env_cfg, "stage5_discrete_directions", None)
+        if dirs is None or len(dirs) == 0:
+            dirs = [
+                [0.40, 0.00, 0.00],
+                [0.00, 0.30, 0.00],
+                [0.00, -0.30, 0.00],
+                [0.30, 0.20, 0.00],
+                [0.30, -0.20, 0.00],
+                [0.00, 0.00, 0.70],
+                [0.00, 0.00, -0.70],
+            ]
+        return _scale(dirs)
+
+    if profile == "stage1":
+        commands = _stage1()
+    elif profile == "stage2":
+        commands = _stage2()
+    elif profile == "stage3":
+        commands = _stage3()
+    elif profile == "stage4":
+        commands = _stage4()
+    elif profile == "full":
+        commands = _stage1() + _stage2() + _stage3() + _stage4() + _stage5()
+    else:
+        commands = _stage5()
+
+    return _generate_named_commands(commands)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -130,21 +310,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if hasattr(unwrapped_env, "external_control"):
         unwrapped_env.external_control = True
 
-    command_set = [
-        ("forward", (0.40, 0.00, 0.00)),
-        ("left", (0.00, 0.30, 0.00)),
-        ("right", (0.00, -0.30, 0.00)),
-        ("diag_left", (0.30, 0.20, 0.00)),
-        ("diag_right", (0.30, -0.20, 0.00)),
-        ("yaw_ccw", (0.00, 0.00, 0.80)),
-        ("yaw_cw", (0.00, 0.00, -0.80)),
-    ]
+    command_set = build_command_set(env_cfg, args_cli.eval_profile, args_cli.command_scale)
+    if len(command_set) == 0:
+        raise RuntimeError(f"No commands generated for eval profile: {args_cli.eval_profile}")
+    print(f"[INFO] Eval profile: {args_cli.eval_profile}, command_scale={args_cli.command_scale:.2f}")
+    print("[INFO] Command set:")
+    for name, cmd, skill in command_set:
+        print(f"  - {name:<14} skill={skill:<8} cmd=({cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f})")
 
     results = []
     num_envs = unwrapped_env.num_envs
     device = unwrapped_env.device
     total_steps = args_cli.warmup_steps + args_cli.sweep_steps
     step_dt = float(getattr(unwrapped_env, "step_dt", unwrapped_env.cfg.sim.dt * unwrapped_env.cfg.decimation))
+    eval_duration_s = float(args_cli.sweep_steps) * step_dt
 
     # Global acceptance accumulators
     sample_count = 0
@@ -178,7 +357,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     forward_swing_speed_sum = 0.0
     forward_count = 0
 
-    for name, cmd in command_set:
+    skill_total: defaultdict[str, int] = defaultdict(int)
+    skill_pass: defaultdict[str, int] = defaultdict(int)
+    score_sum = 0.0
+
+    for name, cmd, skill in command_set:
         env.reset()
         obs = env.get_observations()
 
@@ -187,10 +370,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cmd_err_vy = 0.0
         cmd_err_wz = 0.0
         cmd_samples = 0
+        cmd_success_steps = 0
         cmd_success_vy_steps = 0
         cmd_success_wz_steps = 0
         cmd_diag_sign_match = 0
         cmd_diag_sign_total = 0
+        cmd_yaw_tilt_ok_steps = 0
         cmd_fall_events = 0
         cmd_episode_ends = 0
 
@@ -260,7 +445,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             contact_hist += torch.bincount(contact_count.cpu(), minlength=7)
 
             # Forward gait metrics
-            if name == "forward" and hasattr(unwrapped_env, "_main_drive_indices"):
+            if skill == "forward" and hasattr(unwrapped_env, "_main_drive_indices"):
                 main_pos = unwrapped_env.joint_pos[:, unwrapped_env._main_drive_indices]
                 main_vel = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
                 direction_multiplier = unwrapped_env._direction_multiplier
@@ -311,26 +496,60 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             # Per-command acceptance counters
             not_fallen = ~terminated
-            if abs(cmd[1]) > 1e-5 and abs(cmd[0]) < 1e-5 and abs(cmd[2]) < 1e-5:
-                cmd_success_vy_steps += int(torch.count_nonzero((torch.abs(actual_vy) > args_cli.accept_vy_abs) & not_fallen).item())
+            abs_cmd_vx = abs(float(cmd[0]))
+            abs_cmd_vy = abs(float(cmd[1]))
+            abs_cmd_wz = abs(float(cmd[2]))
+            success_mask = not_fallen.clone()
 
-            if abs(cmd[2]) > 1e-5 and abs(cmd[0]) < 1e-5 and abs(cmd[1]) < 1e-5:
-                yaw_ok = (
-                    (torch.abs(actual_wz) > args_cli.accept_wz_abs)
-                    & (torch.abs(roll) < args_cli.accept_yaw_tilt_bound)
-                    & (torch.abs(pitch) < args_cli.accept_yaw_tilt_bound)
+            if skill == "forward":
+                vx_req = max(args_cli.accept_vx_abs, args_cli.accept_lin_ratio * abs_cmd_vx)
+                success_mask = (
+                    (actual_vx * float(cmd[0]) > 0.0)
+                    & (torch.abs(actual_vx) >= vx_req)
+                    & (torch.abs(actual_vy) <= args_cli.accept_forward_lateral_leak)
+                    & (torch.abs(actual_wz) <= args_cli.accept_forward_yaw_leak)
                     & not_fallen
                 )
-                cmd_success_wz_steps += int(torch.count_nonzero(yaw_ok).item())
-
-            if abs(cmd[0]) > 1e-5 and abs(cmd[1]) > 1e-5:
-                diag_sign_ok = (
-                    (torch.sign(actual_vx) == torch.sign(torch.tensor(cmd[0], device=device)))
-                    & (torch.sign(actual_vy) == torch.sign(torch.tensor(cmd[1], device=device)))
+            elif skill == "lateral":
+                vy_req = max(args_cli.accept_vy_abs, args_cli.accept_lin_ratio * abs_cmd_vy)
+                success_mask = (
+                    (actual_vy * float(cmd[1]) > 0.0)
+                    & (torch.abs(actual_vy) >= vy_req)
+                    & (torch.abs(actual_vx) <= args_cli.accept_lateral_forward_leak)
+                    & (torch.abs(actual_wz) <= args_cli.accept_lateral_yaw_leak)
+                    & not_fallen
                 )
-                diag_mag_ok = (torch.abs(actual_vx) > 0.05) & (torch.abs(actual_vy) > 0.05)
-                cmd_diag_sign_match += int(torch.count_nonzero(diag_sign_ok & diag_mag_ok).item())
-                cmd_diag_sign_total += int(torch.count_nonzero(diag_mag_ok).item())
+                cmd_success_vy_steps += int(torch.count_nonzero(success_mask).item())
+            elif skill == "diagonal":
+                vx_req = max(0.08, args_cli.accept_diag_component_ratio * abs_cmd_vx)
+                vy_req = max(0.08, args_cli.accept_diag_component_ratio * abs_cmd_vy)
+                diag_sign_ok = (actual_vx * float(cmd[0]) > 0.0) & (actual_vy * float(cmd[1]) > 0.0)
+                cmd_diag_sign_match += int(torch.count_nonzero(diag_sign_ok).item())
+                cmd_diag_sign_total += int(diag_sign_ok.numel())
+                success_mask = (
+                    diag_sign_ok
+                    & (torch.abs(actual_vx) >= vx_req)
+                    & (torch.abs(actual_vy) >= vy_req)
+                    & (torch.abs(actual_wz) <= args_cli.accept_diag_yaw_leak)
+                    & not_fallen
+                )
+            elif skill == "yaw":
+                wz_req = max(args_cli.accept_wz_abs, args_cli.accept_wz_ratio * abs_cmd_wz)
+                tilt_ok = (torch.abs(roll) <= args_cli.accept_yaw_tilt_bound) & (
+                    torch.abs(pitch) <= args_cli.accept_yaw_tilt_bound
+                )
+                cmd_yaw_tilt_ok_steps += int(torch.count_nonzero(tilt_ok & not_fallen).item())
+                success_mask = (
+                    (actual_wz * float(cmd[2]) > 0.0)
+                    & (torch.abs(actual_wz) >= wz_req)
+                    & tilt_ok
+                    & (actual_lin_speed <= args_cli.accept_yaw_lin_leak)
+                    & (base_h >= args_cli.accept_min_base_height)
+                    & not_fallen
+                )
+                cmd_success_wz_steps += int(torch.count_nonzero(success_mask).item())
+
+            cmd_success_steps += int(torch.count_nonzero(success_mask).item())
 
             if hasattr(unwrapped_env.robot.data, "applied_torque"):
                 effort_proxy_name = "mean(|tau * omega|)"
@@ -358,25 +577,69 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "mae_vy": cmd_err_vy / denom,
             "mae_wz": cmd_err_wz / denom,
         }
+        result["skill"] = skill
+        result["success_duration_s"] = float(cmd_success_steps) * step_dt / float(max(1, num_envs))
+        result["success_ratio"] = result["success_duration_s"] / float(max(1e-6, eval_duration_s))
         result["success_vy_duration_s"] = float(cmd_success_vy_steps) * step_dt / float(max(1, num_envs))
         result["success_wz_duration_s"] = float(cmd_success_wz_steps) * step_dt / float(max(1, num_envs))
         result["diag_sign_match_ratio"] = float(cmd_diag_sign_match) / float(max(1, cmd_diag_sign_total))
+        result["yaw_tilt_ok_ratio"] = float(cmd_yaw_tilt_ok_steps) / float(max(1, args_cli.sweep_steps * num_envs))
         result["fall_rate"] = float(cmd_fall_events) / float(max(1, cmd_episode_ends))
 
-        if abs(cmd[1]) > 1e-5 and abs(cmd[0]) < 1e-5 and abs(cmd[2]) < 1e-5:
-            result["accept_pass"] = (
-                (result["success_vy_duration_s"] >= args_cli.accept_duration_s)
-                and (result["fall_rate"] < 0.2)
-            )
-        elif abs(cmd[2]) > 1e-5 and abs(cmd[0]) < 1e-5 and abs(cmd[1]) < 1e-5:
-            result["accept_pass"] = (
-                (result["success_wz_duration_s"] >= args_cli.accept_duration_s)
-                and (result["fall_rate"] < 0.2)
-            )
-        elif abs(cmd[0]) > 1e-5 and abs(cmd[1]) > 1e-5:
-            result["accept_pass"] = result["diag_sign_match_ratio"] >= args_cli.accept_diag_sign_ratio
+        # Tracking quality (0~1), normalized by command magnitude
+        if skill == "forward":
+            tracking_quality = max(0.0, 1.0 - result["mae_vx"] / max(1e-6, abs(float(cmd[0]))))
+        elif skill == "lateral":
+            tracking_quality = max(0.0, 1.0 - result["mae_vy"] / max(1e-6, abs(float(cmd[1]))))
+        elif skill == "diagonal":
+            qx = max(0.0, 1.0 - result["mae_vx"] / max(1e-6, abs(float(cmd[0]))))
+            qy = max(0.0, 1.0 - result["mae_vy"] / max(1e-6, abs(float(cmd[1]))))
+            tracking_quality = 0.5 * (qx + qy)
+        elif skill == "yaw":
+            tracking_quality = max(0.0, 1.0 - result["mae_wz"] / max(1e-6, abs(float(cmd[2]))))
         else:
-            result["accept_pass"] = True
+            tracking_quality = 0.0
+        result["tracking_quality"] = min(1.0, max(0.0, tracking_quality))
+
+        stability_quality = 1.0 - result["fall_rate"] / max(1e-6, args_cli.accept_max_fall_rate)
+        result["stability_quality"] = min(1.0, max(0.0, stability_quality))
+
+        if skill == "yaw":
+            score = 100.0 * (
+                0.50 * result["success_ratio"]
+                + 0.25 * result["tracking_quality"]
+                + 0.15 * result["stability_quality"]
+                + 0.10 * result["yaw_tilt_ok_ratio"]
+            )
+        elif skill == "diagonal":
+            score = 100.0 * (
+                0.50 * result["success_ratio"]
+                + 0.25 * result["tracking_quality"]
+                + 0.15 * result["stability_quality"]
+                + 0.10 * result["diag_sign_match_ratio"]
+            )
+        else:
+            score = 100.0 * (
+                0.55 * result["success_ratio"]
+                + 0.30 * result["tracking_quality"]
+                + 0.15 * result["stability_quality"]
+            )
+        result["score"] = score
+
+        accept_pass = (
+            (result["success_duration_s"] >= args_cli.accept_duration_s)
+            and (result["fall_rate"] <= args_cli.accept_max_fall_rate)
+        )
+        if skill == "diagonal":
+            accept_pass = accept_pass and (result["diag_sign_match_ratio"] >= args_cli.accept_diag_sign_ratio)
+        if skill == "yaw":
+            accept_pass = accept_pass and (result["yaw_tilt_ok_ratio"] >= args_cli.accept_yaw_tilt_ratio)
+        result["accept_pass"] = accept_pass
+
+        skill_total[skill] += 1
+        if result["accept_pass"]:
+            skill_pass[skill] += 1
+        score_sum += result["score"]
         results.append(result)
 
     safe_samples = max(1, sample_count)
@@ -406,27 +669,68 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     action_rate_mean = action_rate_sum / float(max(1, energy_count))
     effort_proxy_mean = effort_proxy_sum / float(max(1, energy_count))
+    command_pass_ratio = float(sum(1 for row in results if row["accept_pass"])) / float(max(1, len(results)))
+    overall_score_mean = score_sum / float(max(1, len(results)))
+    skill_pass_ratio = {
+        skill: float(skill_pass[skill]) / float(max(1, skill_total[skill])) for skill in sorted(skill_total.keys())
+    }
+    min_skill_pass_ratio = min(skill_pass_ratio.values()) if len(skill_pass_ratio) > 0 else 0.0
+    overall_accept_pass = (
+        (command_pass_ratio >= args_cli.accept_overall_pass_ratio)
+        and (min_skill_pass_ratio >= args_cli.accept_skill_pass_ratio)
+    )
 
     print("\n=== Command Tracking (MAE) ===")
-    print(f"{'command':<12} {'cmd(vx,vy,wz)':<24} {'|vx-vx*|':>10} {'|vy-vy*|':>10} {'|wz-wz*|':>10}")
+    print(
+        f"{'command':<14} {'skill':<9} {'cmd(vx,vy,wz)':<24} "
+        f"{'|vx-vx*|':>10} {'|vy-vy*|':>10} {'|wz-wz*|':>10} {'score':>8}"
+    )
     for row in results:
         cmd_str = f"({row['cmd_vx']:.2f},{row['cmd_vy']:.2f},{row['cmd_wz']:.2f})"
         print(
-            f"{row['command']:<12} {cmd_str:<24} "
-            f"{row['mae_vx']:>10.4f} {row['mae_vy']:>10.4f} {row['mae_wz']:>10.4f}"
+            f"{row['command']:<14} {row['skill']:<9} {cmd_str:<24} "
+            f"{row['mae_vx']:>10.4f} {row['mae_vy']:>10.4f} {row['mae_wz']:>10.4f} {row['score']:>8.2f}"
         )
 
     print("\n=== Skill Acceptance (Command-level) ===")
     for row in results:
         extra = ""
-        if abs(row["cmd_vy"]) > 1e-5 and abs(row["cmd_vx"]) < 1e-5 and abs(row["cmd_wz"]) < 1e-5:
-            extra = f"vy_success_s={row['success_vy_duration_s']:.2f}, fall_rate={row['fall_rate']:.3f}"
-        elif abs(row["cmd_wz"]) > 1e-5 and abs(row["cmd_vx"]) < 1e-5 and abs(row["cmd_vy"]) < 1e-5:
-            extra = f"wz_success_s={row['success_wz_duration_s']:.2f}, fall_rate={row['fall_rate']:.3f}"
-        elif abs(row["cmd_vx"]) > 1e-5 and abs(row["cmd_vy"]) > 1e-5:
-            extra = f"diag_sign_match={row['diag_sign_match_ratio']:.3f}"
+        if row["skill"] == "lateral":
+            extra = (
+                f"success_s={row['success_duration_s']:.2f}, vy_success_s={row['success_vy_duration_s']:.2f}, "
+                f"fall_rate={row['fall_rate']:.3f}"
+            )
+        elif row["skill"] == "yaw":
+            extra = (
+                f"success_s={row['success_duration_s']:.2f}, wz_success_s={row['success_wz_duration_s']:.2f}, "
+                f"tilt_ok_ratio={row['yaw_tilt_ok_ratio']:.3f}, fall_rate={row['fall_rate']:.3f}"
+            )
+        elif row["skill"] == "diagonal":
+            extra = (
+                f"success_s={row['success_duration_s']:.2f}, diag_sign_match={row['diag_sign_match_ratio']:.3f}, "
+                f"fall_rate={row['fall_rate']:.3f}"
+            )
+        elif row["skill"] == "forward":
+            extra = f"success_s={row['success_duration_s']:.2f}, fall_rate={row['fall_rate']:.3f}"
         status = "PASS" if row["accept_pass"] else "FAIL"
-        print(f"{row['command']:<12} {status:<4} {extra}")
+        print(f"{row['command']:<14} {status:<4} {extra}")
+
+    print("\n=== Skill-level Pass Ratio ===")
+    for skill, ratio in skill_pass_ratio.items():
+        status = "PASS" if ratio >= args_cli.accept_skill_pass_ratio else "FAIL"
+        print(
+            f"{skill:<9} {status:<4} pass_ratio={ratio:.3f} "
+            f"(threshold={args_cli.accept_skill_pass_ratio:.2f}, {skill_pass[skill]}/{skill_total[skill]})"
+        )
+
+    overall_status = "PASS" if overall_accept_pass else "FAIL"
+    print(
+        f"\n=== Overall Acceptance ===\n"
+        f"profile={args_cli.eval_profile} status={overall_status} "
+        f"command_pass_ratio={command_pass_ratio:.3f} (threshold={args_cli.accept_overall_pass_ratio:.2f}) "
+        f"min_skill_pass_ratio={min_skill_pass_ratio:.3f} (threshold={args_cli.accept_skill_pass_ratio:.2f}) "
+        f"score_mean={overall_score_mean:.2f}"
+    )
 
     print("\n=== Acceptance Metrics Summary ===")
     print(f"tracking.mean|vx-vx_cmd|: {mean_abs_vx:.6f}")
@@ -449,6 +753,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"contact.transition_ratio_ge4: {transition_ratio_ge4:.6f}")
     print(f"energy.action_rate_mean: {action_rate_mean:.6f}")
     print(f"energy.effort_proxy_mean [{effort_proxy_name}]: {effort_proxy_mean:.6f}")
+    print(f"acceptance.command_pass_ratio: {command_pass_ratio:.6f}")
+    print(f"acceptance.min_skill_pass_ratio: {min_skill_pass_ratio:.6f}")
+    print(f"acceptance.overall_score_mean: {overall_score_mean:.6f}")
 
     if args_cli.csv:
         csv_path = os.path.abspath(args_cli.csv)
@@ -461,16 +768,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 f,
                 fieldnames=[
                     "command",
+                    "skill",
                     "cmd_vx",
                     "cmd_vy",
                     "cmd_wz",
                     "mae_vx",
                     "mae_vy",
                     "mae_wz",
+                    "success_duration_s",
+                    "success_ratio",
                     "success_vy_duration_s",
                     "success_wz_duration_s",
                     "diag_sign_match_ratio",
+                    "yaw_tilt_ok_ratio",
                     "fall_rate",
+                    "tracking_quality",
+                    "stability_quality",
+                    "score",
                     "accept_pass",
                 ],
             )
@@ -479,6 +793,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         summary_path = os.path.splitext(csv_path)[0] + "_summary.csv"
         summary_rows = [
+            {"metric": "eval.profile", "value": args_cli.eval_profile},
             {"metric": "tracking.mean_abs_vx", "value": mean_abs_vx},
             {"metric": "tracking.mean_abs_vy", "value": mean_abs_vy},
             {"metric": "tracking.mean_abs_wz", "value": mean_abs_wz},
@@ -500,7 +815,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             {"metric": "energy.effort_proxy_mean", "value": effort_proxy_mean},
             {"metric": "energy.effort_proxy_name", "value": effort_proxy_name},
             {"metric": "contact.histogram", "value": summarize_contact_hist(contact_hist)},
+            {"metric": "acceptance.command_pass_ratio", "value": command_pass_ratio},
+            {"metric": "acceptance.min_skill_pass_ratio", "value": min_skill_pass_ratio},
+            {"metric": "acceptance.overall_score_mean", "value": overall_score_mean},
+            {"metric": "acceptance.overall_status", "value": "PASS" if overall_accept_pass else "FAIL"},
         ]
+        for skill, ratio in skill_pass_ratio.items():
+            summary_rows.append({"metric": f"acceptance.skill_pass_ratio.{skill}", "value": ratio})
 
         with open(summary_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["metric", "value"])
