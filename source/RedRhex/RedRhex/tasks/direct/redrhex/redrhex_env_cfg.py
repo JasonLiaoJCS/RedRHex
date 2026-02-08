@@ -1293,17 +1293,25 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "leg_moving": True,       # 腿轉動獎勵
     }
 
-    # 簡化模式的獎勵權重 v2.0（6 項核心獎勵）
-    # 設計原則：正向獎勵主導，線性獎勵避免梯度消失
+    # 簡化模式的獎勵權重 v4.0（命令感知獎勵）
+    # 設計原則：不同命令（前進/側移/旋轉/斜向）要有明確分流，不允許「直走偷分」
     v2_reward_scales = {
-        # 正向獎勵（鼓勵好行為）
-        "forward_progress": 5.0,      # 往命令方向移動就給獎勵（最重要！）
-        "velocity_tracking": 3.0,     # 追蹤速度越準獎勵越多
-        "height_maintain": 1.0,       # 站穩給獎勵
-        "leg_moving": 0.5,            # 腿在轉就給獎勵
+        # 核心追蹤
+        "forward_progress": 5.0,      # 命令方向速度投影（核心）
+        "velocity_tracking": 4.0,     # vx/vy/wz 追蹤精度
+        "mode_specialization": 2.5,   # 側移/旋轉/斜向專屬 shaping
+        "axis_suppression": 1.5,      # 未命令軸速度抑制（防止直走偷分）
         
-        # 負向懲罰（權重要輕！）
-        "action_smooth": -0.005,      # 動作平滑
-        "fall": -5.0,                 # 摔倒
+        # 穩定與探索
+        "height_maintain": 0.8,       # 維持站立高度
+        "leg_moving": 0.5,            # 防消極（需與命令一致）
+        
+        # 負向懲罰
+        "stall_penalty": -2.0,        # 有命令卻幾乎不動
+        "action_smooth": -0.01,       # 動作平滑
+        "fall": -8.0,                 # 摔倒
+        
+        # 追蹤曲線寬度（越小越嚴格）
+        "lin_tracking_sigma": 0.30,   # 線速度追蹤容忍
+        "yaw_tracking_sigma": 0.35,   # 旋轉追蹤容忍
     }
-

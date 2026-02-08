@@ -1153,91 +1153,167 @@ class RedrhexEnv(DirectRLEnv):
     def _compute_simplified_rewards(self) -> torch.Tensor:
         """
         =================================================================
-        【獎勵系統 v3.0】★★★ 大刀闘斧改革版 ★★★
+        【獎勵系統 v4.0】命令感知獎勵（修正側走/旋轉/斜走退化）
         =================================================================
         
-        v3.0 改變：
-        1. 移除 × dt：讓獎勵更顯著（原本 × 0.004 太小）
-        2. 增加獎勵權重：讓 gradient 更明確
-        3. 簡化結構：只有 6 項獎勵
+        核心改動：
+        1. 修正 cmd=0 時 sign 錯誤導致「總是獎勵直走」的問題
+        2. 以「命令方向投影」計算線速度進度，避免側移/斜走被直走偷分
+        3. 新增模式專屬 shaping（純側移 / 純旋轉 / 斜走）
+        4. 新增未命令軸抑制與卡住懲罰，減少 reward hacking
         
         獎勵結構：
-        1. forward_progress  - 往命令方向移動就給獎勵（核心！）
-        2. velocity_tracking - 速度越準獎勵越多
-        3. height_maintain   - 站穩給獎勵
-        4. leg_moving        - 腿在轉就給獎勵（防消極）
-        5. action_smooth     - 動作平滑懲罰
-        6. fall              - 摔倒懲罰
+        1. forward_progress    - 沿命令方向的速度投影（核心）
+        2. velocity_tracking   - vx/vy/wz 精準追蹤
+        3. mode_specialization - 側走/旋轉/斜走專屬強化
+        4. axis_suppression    - 未命令軸速度抑制
+        5. height_maintain     - 站立高度
+        6. leg_moving          - 防消極（但需與命令一致）
+        7. stall_penalty       - 有命令卻不動
+        8. action_smooth/fall  - 平滑與倒地
         """
         total_reward = torch.zeros(self.num_envs, device=self.device)
         
-        # 獲取獎勵權重（v3.0 - 更大的權重！）
+        # v4.0: 命令感知權重
         scales = getattr(self.cfg, 'v2_reward_scales', {
             "forward_progress": 5.0,
-            "velocity_tracking": 3.0,
-            "height_maintain": 1.0,
-            "leg_moving": 1.0,
+            "velocity_tracking": 4.0,
+            "mode_specialization": 2.5,
+            "axis_suppression": 1.5,
+            "height_maintain": 0.8,
+            "leg_moving": 0.5,
+            "stall_penalty": -2.0,
             "action_smooth": -0.01,
-            "fall": -10.0,
+            "fall": -8.0,
+            "lin_tracking_sigma": 0.30,
+            "yaw_tracking_sigma": 0.35,
         })
         
         # =================================================================
-        # 獲取狀態
+        # 狀態讀取
         # =================================================================
         main_drive_vel = self.joint_vel[:, self._main_drive_indices]
         
         cmd_vx = self.commands[:, 0]
-        cmd_vy = self.commands[:, 1]  
+        cmd_vy = self.commands[:, 1]
         cmd_wz = self.commands[:, 2]
         
         actual_vx = self.base_lin_vel[:, 0]
         actual_vy = self.base_lin_vel[:, 1]
         actual_wz = self.base_ang_vel[:, 2]
         
+        cmd_lin = self.commands[:, :2]
+        actual_lin = self.base_lin_vel[:, :2]
+        cmd_lin_speed = torch.linalg.norm(cmd_lin, dim=1)
+        actual_lin_speed = torch.linalg.norm(actual_lin, dim=1)
+        
         base_height = self.robot.data.root_pos_w[:, 2]
         
         # =================================================================
-        # R1: 前進獎勵 ★★★ 最重要！★★★
+        # R1: 命令方向進度（核心）
         # =================================================================
-        # 往命令方向移動就給獎勵，反向就扣分
+        lin_eps = 0.05
+        yaw_eps = 0.08
         
-        forward_sign = torch.sign(cmd_vx + 1e-8)
-        forward_progress = actual_vx * forward_sign
+        # 只有有命令時才給 sign；cmd≈0 時 sign=0，避免偷分
+        cmd_vx_sign = torch.where(torch.abs(cmd_vx) > lin_eps, torch.sign(cmd_vx), torch.zeros_like(cmd_vx))
+        cmd_vy_sign = torch.where(torch.abs(cmd_vy) > lin_eps, torch.sign(cmd_vy), torch.zeros_like(cmd_vy))
+        cmd_wz_sign = torch.where(torch.abs(cmd_wz) > yaw_eps, torch.sign(cmd_wz), torch.zeros_like(cmd_wz))
         
-        lateral_sign = torch.sign(cmd_vy + 1e-8)
-        lateral_progress = actual_vy * lateral_sign
+        safe_cmd_lin_speed = torch.clamp(cmd_lin_speed, min=1e-5)
+        cmd_dir = cmd_lin / safe_cmd_lin_speed.unsqueeze(1)
         
-        rotation_sign = torch.sign(cmd_wz + 1e-8)
-        rotation_progress = actual_wz * rotation_sign
+        # 沿命令方向的速度投影（正值=往正確方向）
+        lin_progress = torch.sum(actual_lin * cmd_dir, dim=1)
+        lin_progress = torch.where(cmd_lin_speed > lin_eps, lin_progress, torch.zeros_like(lin_progress))
         
-        # ★★★ 移除 dt，直接給獎勵 ★★★
+        # 橫向偏移（與命令方向垂直）
+        cross_track_error = torch.abs(actual_lin[:, 0] * cmd_dir[:, 1] - actual_lin[:, 1] * cmd_dir[:, 0])
+        cross_track_error = torch.where(cmd_lin_speed > lin_eps, cross_track_error, torch.zeros_like(cross_track_error))
+        
+        backward_slip = torch.clamp(-lin_progress, min=0.0)
         rew_forward = (
-            forward_progress * 5.0 +
-            lateral_progress * 3.0 +
-            rotation_progress * 2.0
-        ) * scales.get("forward_progress", 5.0) / 5.0
-        
+            lin_progress
+            - 0.5 * cross_track_error
+            - 1.0 * backward_slip
+        ) * scales.get("forward_progress", 5.0)
         total_reward += rew_forward
         
         # =================================================================
-        # R2: 速度追蹤獎勵（線性）
+        # R2: 速度追蹤（各軸）
         # =================================================================
+        lin_sigma = max(scales.get("lin_tracking_sigma", 0.30), 1e-3)
+        yaw_sigma = max(scales.get("yaw_tracking_sigma", 0.35), 1e-3)
+        
         vel_error_x = torch.abs(cmd_vx - actual_vx)
         vel_error_y = torch.abs(cmd_vy - actual_vy)
         wz_error = torch.abs(cmd_wz - actual_wz)
         
-        tolerance = 0.5
+        tracking_x = torch.exp(-torch.square(vel_error_x / lin_sigma))
+        tracking_y = torch.exp(-torch.square(vel_error_y / lin_sigma))
+        tracking_wz = torch.exp(-torch.square(wz_error / yaw_sigma))
         
-        tracking_x = torch.clamp(1.0 - vel_error_x / tolerance, min=0.0)
-        tracking_y = torch.clamp(1.0 - vel_error_y / tolerance, min=0.0)
-        tracking_wz = torch.clamp(1.0 - wz_error / 1.0, min=0.0)
+        # 線速度追蹤採命令幅值加權，斜向時同時追蹤 vx/vy
+        lin_weight_x = torch.abs(cmd_vx) / (safe_cmd_lin_speed + 1e-5)
+        lin_weight_y = torch.abs(cmd_vy) / (safe_cmd_lin_speed + 1e-5)
+        lin_tracking_reward = tracking_x * lin_weight_x + tracking_y * lin_weight_y
         
-        # ★★★ 移除 dt ★★★
-        rew_tracking = (tracking_x + tracking_y * 0.5 + tracking_wz * 0.3) * scales.get("velocity_tracking", 3.0)
+        # 沒有線速度命令時，改獎勵「線速度接近 0」
+        lin_stop_reward = torch.exp(-torch.square(actual_lin_speed / lin_sigma))
+        lin_tracking_reward = torch.where(cmd_lin_speed > lin_eps, lin_tracking_reward, lin_stop_reward)
+        
+        # 沒有旋轉命令時，改獎勵「角速度接近 0」
+        yaw_stop_reward = torch.exp(-torch.square(actual_wz / yaw_sigma))
+        yaw_tracking_reward = torch.where(torch.abs(cmd_wz) > yaw_eps, tracking_wz, yaw_stop_reward)
+        
+        rew_tracking = (lin_tracking_reward + yaw_tracking_reward) * scales.get("velocity_tracking", 4.0)
         total_reward += rew_tracking
         
         # =================================================================
-        # R3: 站立高度獎勵
+        # R3: 模式專屬 shaping（純側移 / 純旋轉 / 斜向）
+        # =================================================================
+        has_rotation_cmd = torch.abs(cmd_wz) > 0.15
+        pure_rotation = has_rotation_cmd & (cmd_lin_speed < 0.08)
+        pure_lateral = (torch.abs(cmd_vy) > 0.12) & (torch.abs(cmd_vx) < 0.08) & (~has_rotation_cmd)
+        diagonal_mode = (torch.abs(cmd_vx) > 0.10) & (torch.abs(cmd_vy) > 0.10) & (~has_rotation_cmd)
+        
+        signed_vx = cmd_vx_sign * actual_vx
+        signed_vy = cmd_vy_sign * actual_vy
+        signed_wz = cmd_wz_sign * actual_wz
+        
+        rew_mode = torch.zeros(self.num_envs, device=self.device)
+        
+        # 純側移：獎勵 vy 正確方向，懲罰 vx 漂移
+        lateral_mode_reward = signed_vy - 0.8 * torch.abs(actual_vx) - 0.3 * torch.abs(actual_wz)
+        rew_mode += torch.where(pure_lateral, lateral_mode_reward, torch.zeros_like(lateral_mode_reward))
+        
+        # 純旋轉：獎勵 yaw 正確方向，懲罰平移
+        rotation_mode_reward = signed_wz - 0.7 * actual_lin_speed
+        rew_mode += torch.where(pure_rotation, rotation_mode_reward, torch.zeros_like(rotation_mode_reward))
+        
+        # 斜向：同時要有前向和側向分量，且比例接近命令
+        cmd_ratio = torch.abs(cmd_vy) / (torch.abs(cmd_vx) + 1e-5)
+        actual_ratio = torch.abs(actual_vy) / (torch.abs(actual_vx) + 1e-5)
+        ratio_match = torch.exp(-2.0 * torch.abs(actual_ratio - cmd_ratio))
+        diagonal_reward = torch.clamp(lin_progress, min=0.0) * ratio_match - 0.5 * torch.clamp(-signed_vy, min=0.0)
+        rew_mode += torch.where(diagonal_mode, diagonal_reward, torch.zeros_like(diagonal_reward))
+        
+        rew_mode = rew_mode * scales.get("mode_specialization", 2.5)
+        total_reward += rew_mode
+        
+        # =================================================================
+        # R4: 未命令軸抑制（避免命令=0 軸亂動）
+        # =================================================================
+        no_cmd_axis_penalty = (
+            torch.where(torch.abs(cmd_vx) <= lin_eps, torch.abs(actual_vx), torch.zeros_like(actual_vx))
+            + torch.where(torch.abs(cmd_vy) <= lin_eps, torch.abs(actual_vy), torch.zeros_like(actual_vy))
+            + 0.5 * torch.where(torch.abs(cmd_wz) <= yaw_eps, torch.abs(actual_wz), torch.zeros_like(actual_wz))
+        )
+        rew_axis_suppression = -no_cmd_axis_penalty * scales.get("axis_suppression", 1.5)
+        total_reward += rew_axis_suppression
+        
+        # =================================================================
+        # R5: 站立高度獎勵
         # =================================================================
         min_height = 0.05
         target_height = 0.15
@@ -1246,28 +1322,51 @@ class RedrhexEnv(DirectRLEnv):
             (base_height - min_height) / (target_height - min_height),
             min=0.0, max=1.0
         )
-        # ★★★ 移除 dt ★★★
-        rew_height = height_ratio * scales.get("height_maintain", 1.0)
+        rew_height = height_ratio * scales.get("height_maintain", 0.8)
         total_reward += rew_height
         
         # =================================================================
-        # R4: 腿轉動獎勵（防消極）
+        # R6: 腿轉動獎勵（防消極，但要求與命令一致）
         # =================================================================
         leg_speed = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
-        # ★★★ 移除 dt，增加權重 ★★★
-        rew_leg_moving = torch.clamp(leg_speed * scales.get("leg_moving", 1.0), max=5.0)
+        cmd_activity = torch.sqrt(cmd_vx**2 + cmd_vy**2 + 0.25 * cmd_wz**2)
+        cmd_gate = torch.clamp(cmd_activity / 0.15, min=0.0, max=1.0)
+        
+        motion_alignment = torch.where(
+            cmd_lin_speed > lin_eps,
+            torch.clamp(lin_progress, min=0.0, max=1.0),
+            torch.clamp(signed_wz, min=0.0, max=1.0),
+        )
+        rew_leg_moving = (
+            torch.clamp(leg_speed, max=5.0)
+            * cmd_gate
+            * (0.3 + 0.7 * motion_alignment)
+            * scales.get("leg_moving", 0.5)
+        )
         total_reward += rew_leg_moving
         
         # =================================================================
-        # R5: 動作平滑懲罰
+        # R7: 有命令卻卡住懲罰
+        # =================================================================
+        target_activity = cmd_lin_speed + 0.5 * torch.abs(cmd_wz)
+        achieved_activity = torch.where(
+            cmd_lin_speed > lin_eps,
+            torch.clamp(lin_progress, min=0.0),
+            torch.abs(actual_wz) * 0.5,
+        )
+        is_stalled = (target_activity > 0.1) & (achieved_activity < 0.03)
+        rew_stall = is_stalled.float() * scales.get("stall_penalty", -2.0)
+        total_reward += rew_stall
+        
+        # =================================================================
+        # R8: 動作平滑懲罰
         # =================================================================
         action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-        # ★★★ 移除 dt ★★★
         rew_smooth = action_rate * scales.get("action_smooth", -0.01)
         total_reward += rew_smooth
         
         # =================================================================
-        # R6: 摔倒懲罰
+        # R9: 摔倒懲罰
         # =================================================================
         gravity_alignment = torch.sum(
             self.projected_gravity * self.reference_projected_gravity, dim=1
@@ -1275,8 +1374,7 @@ class RedrhexEnv(DirectRLEnv):
         body_tilt = 1.0 - gravity_alignment
         
         is_fallen = (base_height < 0.03) | (body_tilt > 1.5)
-        # ★★★ 移除 dt，增加懲罰 ★★★
-        rew_fall = is_fallen.float() * scales.get("fall", -10.0)
+        rew_fall = is_fallen.float() * scales.get("fall", -8.0)
         total_reward += rew_fall
         
         # 保存用於終止條件
@@ -1289,8 +1387,11 @@ class RedrhexEnv(DirectRLEnv):
         # TensorBoard 記錄
         self.episode_sums["rew_forward"] = self.episode_sums.get("rew_forward", torch.zeros_like(total_reward)) + rew_forward
         self.episode_sums["rew_tracking"] = self.episode_sums.get("rew_tracking", torch.zeros_like(total_reward)) + rew_tracking
+        self.episode_sums["rew_mode"] = self.episode_sums.get("rew_mode", torch.zeros_like(total_reward)) + rew_mode
+        self.episode_sums["rew_axis_suppression"] = self.episode_sums.get("rew_axis_suppression", torch.zeros_like(total_reward)) + rew_axis_suppression
         self.episode_sums["rew_height"] = self.episode_sums.get("rew_height", torch.zeros_like(total_reward)) + rew_height
         self.episode_sums["rew_leg_moving"] = self.episode_sums.get("rew_leg_moving", torch.zeros_like(total_reward)) + rew_leg_moving
+        self.episode_sums["rew_stall"] = self.episode_sums.get("rew_stall", torch.zeros_like(total_reward)) + rew_stall
         self.episode_sums["rew_smooth"] = self.episode_sums.get("rew_smooth", torch.zeros_like(total_reward)) + rew_smooth
         self.episode_sums["rew_fall"] = self.episode_sums.get("rew_fall", torch.zeros_like(total_reward)) + rew_fall
         
@@ -1299,7 +1400,11 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_lateral_vel"] = self.episode_sums.get("diag_lateral_vel", torch.zeros_like(total_reward)) + actual_vy
         self.episode_sums["diag_cmd_vx"] = self.episode_sums.get("diag_cmd_vx", torch.zeros_like(total_reward)) + cmd_vx
         self.episode_sums["diag_cmd_vy"] = self.episode_sums.get("diag_cmd_vy", torch.zeros_like(total_reward)) + cmd_vy
-        self.episode_sums["diag_vel_error"] = self.episode_sums.get("diag_vel_error", torch.zeros_like(total_reward)) + vel_error_x
+        self.episode_sums["diag_cmd_wz"] = self.episode_sums.get("diag_cmd_wz", torch.zeros_like(total_reward)) + cmd_wz
+        self.episode_sums["diag_actual_wz"] = self.episode_sums.get("diag_actual_wz", torch.zeros_like(total_reward)) + actual_wz
+        self.episode_sums["diag_wz_error"] = self.episode_sums.get("diag_wz_error", torch.zeros_like(total_reward)) + wz_error
+        lin_vel_error = torch.linalg.norm(cmd_lin - actual_lin, dim=1)
+        self.episode_sums["diag_vel_error"] = self.episode_sums.get("diag_vel_error", torch.zeros_like(total_reward)) + lin_vel_error
         self.episode_sums["diag_base_height"] = self.episode_sums.get("diag_base_height", torch.zeros_like(total_reward)) + base_height
         self.episode_sums["diag_tilt"] = self.episode_sums.get("diag_tilt", torch.zeros_like(total_reward)) + body_tilt
         self.episode_sums["diag_leg_speed"] = self.episode_sums.get("diag_leg_speed", torch.zeros_like(total_reward)) + leg_speed
