@@ -147,6 +147,20 @@ class RedrhexEnv(DirectRLEnv):
                 print("[RedrhexEnv] Debug visualization 已啟用")
             else:
                 print("[RedrhexEnv] 無 GUI 模式，跳過 debug visualization")
+        
+        # ★★★ 簡化獎勵模式初始化 ★★★
+        self._use_simplified_rewards = getattr(self.cfg, 'use_simplified_rewards', False)
+        self._ablation_flags = getattr(self.cfg, 'ablation_flags', {})
+        
+        if self._use_simplified_rewards:
+            print("=" * 70)
+            print("[RedrhexEnv] ★★★ 簡化獎勵模式已啟用 ★★★")
+            print("[RedrhexEnv] 只使用 8 項核心獎勵，移除 20+ 項冗餘/衝突獎勵")
+            active_rewards = [k for k, v in self._ablation_flags.items() if v]
+            print(f"[RedrhexEnv] 啟用的獎勵: {active_rewards}")
+            print("=" * 70)
+        else:
+            print("[RedrhexEnv] 使用完整獎勵模式（向後相容）")
 
     def _setup_joint_indices(self):
         """
@@ -689,6 +703,22 @@ class RedrhexEnv(DirectRLEnv):
         print(f"   支撐: ████████████████████████  (始終有支撐!)")
         print("=" * 70 + "\n")
 
+    def _is_reward_enabled(self, reward_name: str) -> bool:
+        """
+        檢查獎勵是否啟用（用於 ablation 測試）
+        
+        Args:
+            reward_name: 獎勵名稱（對應 ablation_flags 中的 key）
+            
+        Returns:
+            bool: True 表示啟用，False 表示禁用
+        """
+        # 如果使用簡化模式，檢查 ablation_flags
+        if self._use_simplified_rewards:
+            return self._ablation_flags.get(reward_name, False)
+        # 完整模式下所有獎勵都啟用
+        return True
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """
         【物理模擬前的準備工作】
@@ -1120,49 +1150,184 @@ class RedrhexEnv(DirectRLEnv):
         # 更新速度命令（定期切換方向）
         self._update_commands()
 
+    def _compute_simplified_rewards(self) -> torch.Tensor:
+        """
+        =================================================================
+        【獎勵系統 v3.0】★★★ 大刀闘斧改革版 ★★★
+        =================================================================
+        
+        v3.0 改變：
+        1. 移除 × dt：讓獎勵更顯著（原本 × 0.004 太小）
+        2. 增加獎勵權重：讓 gradient 更明確
+        3. 簡化結構：只有 6 項獎勵
+        
+        獎勵結構：
+        1. forward_progress  - 往命令方向移動就給獎勵（核心！）
+        2. velocity_tracking - 速度越準獎勵越多
+        3. height_maintain   - 站穩給獎勵
+        4. leg_moving        - 腿在轉就給獎勵（防消極）
+        5. action_smooth     - 動作平滑懲罰
+        6. fall              - 摔倒懲罰
+        """
+        total_reward = torch.zeros(self.num_envs, device=self.device)
+        
+        # 獲取獎勵權重（v3.0 - 更大的權重！）
+        scales = getattr(self.cfg, 'v2_reward_scales', {
+            "forward_progress": 5.0,
+            "velocity_tracking": 3.0,
+            "height_maintain": 1.0,
+            "leg_moving": 1.0,
+            "action_smooth": -0.01,
+            "fall": -10.0,
+        })
+        
+        # =================================================================
+        # 獲取狀態
+        # =================================================================
+        main_drive_vel = self.joint_vel[:, self._main_drive_indices]
+        
+        cmd_vx = self.commands[:, 0]
+        cmd_vy = self.commands[:, 1]  
+        cmd_wz = self.commands[:, 2]
+        
+        actual_vx = self.base_lin_vel[:, 0]
+        actual_vy = self.base_lin_vel[:, 1]
+        actual_wz = self.base_ang_vel[:, 2]
+        
+        base_height = self.robot.data.root_pos_w[:, 2]
+        
+        # =================================================================
+        # R1: 前進獎勵 ★★★ 最重要！★★★
+        # =================================================================
+        # 往命令方向移動就給獎勵，反向就扣分
+        
+        forward_sign = torch.sign(cmd_vx + 1e-8)
+        forward_progress = actual_vx * forward_sign
+        
+        lateral_sign = torch.sign(cmd_vy + 1e-8)
+        lateral_progress = actual_vy * lateral_sign
+        
+        rotation_sign = torch.sign(cmd_wz + 1e-8)
+        rotation_progress = actual_wz * rotation_sign
+        
+        # ★★★ 移除 dt，直接給獎勵 ★★★
+        rew_forward = (
+            forward_progress * 5.0 +
+            lateral_progress * 3.0 +
+            rotation_progress * 2.0
+        ) * scales.get("forward_progress", 5.0) / 5.0
+        
+        total_reward += rew_forward
+        
+        # =================================================================
+        # R2: 速度追蹤獎勵（線性）
+        # =================================================================
+        vel_error_x = torch.abs(cmd_vx - actual_vx)
+        vel_error_y = torch.abs(cmd_vy - actual_vy)
+        wz_error = torch.abs(cmd_wz - actual_wz)
+        
+        tolerance = 0.5
+        
+        tracking_x = torch.clamp(1.0 - vel_error_x / tolerance, min=0.0)
+        tracking_y = torch.clamp(1.0 - vel_error_y / tolerance, min=0.0)
+        tracking_wz = torch.clamp(1.0 - wz_error / 1.0, min=0.0)
+        
+        # ★★★ 移除 dt ★★★
+        rew_tracking = (tracking_x + tracking_y * 0.5 + tracking_wz * 0.3) * scales.get("velocity_tracking", 3.0)
+        total_reward += rew_tracking
+        
+        # =================================================================
+        # R3: 站立高度獎勵
+        # =================================================================
+        min_height = 0.05
+        target_height = 0.15
+        
+        height_ratio = torch.clamp(
+            (base_height - min_height) / (target_height - min_height),
+            min=0.0, max=1.0
+        )
+        # ★★★ 移除 dt ★★★
+        rew_height = height_ratio * scales.get("height_maintain", 1.0)
+        total_reward += rew_height
+        
+        # =================================================================
+        # R4: 腿轉動獎勵（防消極）
+        # =================================================================
+        leg_speed = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
+        # ★★★ 移除 dt，增加權重 ★★★
+        rew_leg_moving = torch.clamp(leg_speed * scales.get("leg_moving", 1.0), max=5.0)
+        total_reward += rew_leg_moving
+        
+        # =================================================================
+        # R5: 動作平滑懲罰
+        # =================================================================
+        action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        # ★★★ 移除 dt ★★★
+        rew_smooth = action_rate * scales.get("action_smooth", -0.01)
+        total_reward += rew_smooth
+        
+        # =================================================================
+        # R6: 摔倒懲罰
+        # =================================================================
+        gravity_alignment = torch.sum(
+            self.projected_gravity * self.reference_projected_gravity, dim=1
+        )
+        body_tilt = 1.0 - gravity_alignment
+        
+        is_fallen = (base_height < 0.03) | (body_tilt > 1.5)
+        # ★★★ 移除 dt，增加懲罰 ★★★
+        rew_fall = is_fallen.float() * scales.get("fall", -10.0)
+        total_reward += rew_fall
+        
+        # 保存用於終止條件
+        self._body_contact = is_fallen
+        self._body_tilt = body_tilt
+        
+        # NaN 保護
+        total_reward = torch.nan_to_num(total_reward, nan=0.0, posinf=20.0, neginf=-20.0)
+        
+        # TensorBoard 記錄
+        self.episode_sums["rew_forward"] = self.episode_sums.get("rew_forward", torch.zeros_like(total_reward)) + rew_forward
+        self.episode_sums["rew_tracking"] = self.episode_sums.get("rew_tracking", torch.zeros_like(total_reward)) + rew_tracking
+        self.episode_sums["rew_height"] = self.episode_sums.get("rew_height", torch.zeros_like(total_reward)) + rew_height
+        self.episode_sums["rew_leg_moving"] = self.episode_sums.get("rew_leg_moving", torch.zeros_like(total_reward)) + rew_leg_moving
+        self.episode_sums["rew_smooth"] = self.episode_sums.get("rew_smooth", torch.zeros_like(total_reward)) + rew_smooth
+        self.episode_sums["rew_fall"] = self.episode_sums.get("rew_fall", torch.zeros_like(total_reward)) + rew_fall
+        
+        # 診斷
+        self.episode_sums["diag_forward_vel"] = self.episode_sums.get("diag_forward_vel", torch.zeros_like(total_reward)) + actual_vx
+        self.episode_sums["diag_lateral_vel"] = self.episode_sums.get("diag_lateral_vel", torch.zeros_like(total_reward)) + actual_vy
+        self.episode_sums["diag_cmd_vx"] = self.episode_sums.get("diag_cmd_vx", torch.zeros_like(total_reward)) + cmd_vx
+        self.episode_sums["diag_cmd_vy"] = self.episode_sums.get("diag_cmd_vy", torch.zeros_like(total_reward)) + cmd_vy
+        self.episode_sums["diag_vel_error"] = self.episode_sums.get("diag_vel_error", torch.zeros_like(total_reward)) + vel_error_x
+        self.episode_sums["diag_base_height"] = self.episode_sums.get("diag_base_height", torch.zeros_like(total_reward)) + base_height
+        self.episode_sums["diag_tilt"] = self.episode_sums.get("diag_tilt", torch.zeros_like(total_reward)) + body_tilt
+        self.episode_sums["diag_leg_speed"] = self.episode_sums.get("diag_leg_speed", torch.zeros_like(total_reward)) + leg_speed
+        
+        self.last_main_drive_vel = main_drive_vel.clone()
+        
+        return total_reward
+
+
     def _get_rewards(self) -> torch.Tensor:
         """
         =================================================================
         【獎勵函數】強化學習的核心！！
         =================================================================
         
-        【什麼是獎勵函數？】
-        這是教機器人「什麼是對、什麼是錯」的方法。
-        
-        想像你在訓練一隻小狗：
-        • 做對了 → 給零食（正獎勵）→ 小狗會多做這個動作
-        • 做錯了 → 扣分（負獎勵/懲罰）→ 小狗會避免這個動作
-        
-        機器人也是一樣！AI 會嘗試最大化「總獎勵」，
-        所以我們要仔細設計獎勵，讓機器人學會我們想要的行為。
-        
-        =================================================================
-        【獎勵設計總覽】
-        =================================================================
-        
-        ┌───────────────────────────────────────────────────────────────┐
-        │ G1: 速度追蹤獎勵 ⭐ 最重要！                                 │
-        │     → 跟著命令走就給獎勵（前進、側移、轉彎）                │
-        ├───────────────────────────────────────────────────────────────┤
-        │ G2: 姿態穩定性懲罰                                           │
-        │     → 傾斜、亂跳、亂晃就扣分                                │
-        ├───────────────────────────────────────────────────────────────┤
-        │ G3: 身體觸地懲罰 ⚠️ 超級重要！                               │
-        │     → 摔倒就大扣分（甚至直接結束）                          │
-        ├───────────────────────────────────────────────────────────────┤
-        │ G4: 能耗與平滑懲罰                                           │
-        │     → 浪費力氣、動作抖動就扣分                              │
-        ├───────────────────────────────────────────────────────────────┤
-        │ G5: 步態結構獎勵                                             │
-        │     → 六隻腳協調運動就給獎勵                                │
-        ├───────────────────────────────────────────────────────────────┤
-        │ G6: ABAD 使用獎勵                                            │
-        │     → 需要轉彎時用 ABAD 給獎勵，不需要時亂用就扣分         │
-        └───────────────────────────────────────────────────────────────┘
+        根據 use_simplified_rewards 配置選擇：
+        - True: 使用簡化的 8 項核心獎勵
+        - False: 使用完整的 50+ 項獎勵（向後相容）
         """
+        # ★★★ 簡化模式 ★★★
+        if self._use_simplified_rewards:
+            return self._compute_simplified_rewards()
+        
+        # ★★★ 完整模式（向後相容）★★★
         # 初始化總獎勵（所有環境都從 0 開始累加）
         total_reward = torch.zeros(self.num_envs, device=self.device)
         dt = self.step_dt  # 時間步長（用於把獎勵縮放到正確的量級）
+
 
         # =================================================================
         # 【獲取當前狀態】
@@ -1227,14 +1392,16 @@ class RedrhexEnv(DirectRLEnv):
         # sigma 控制衰減速度
         lin_vel_error_mapped = torch.exp(-lin_vel_error / tracking_sigma)
         rew_track_lin_vel = lin_vel_error_mapped * self.cfg.rew_scale_track_lin_vel * dt
-        total_reward += rew_track_lin_vel
+        if self._is_reward_enabled("track_lin_vel"):
+            total_reward += rew_track_lin_vel
 
         # G1.2 角速度追蹤（旋轉）
         # 計算旋轉速度的誤差
         yaw_rate_error = torch.square(cmd_wz - actual_wz)
         yaw_rate_error_mapped = torch.exp(-yaw_rate_error / tracking_sigma)
         rew_track_ang_vel = yaw_rate_error_mapped * self.cfg.rew_scale_track_ang_vel * dt
-        total_reward += rew_track_ang_vel
+        if self._is_reward_enabled("track_ang_vel"):
+            total_reward += rew_track_ang_vel
         
         # ★★★ G1.3 新增：旋轉專用獎勵（用戶說旋轉太慢）★★★
         # 判斷是否為純旋轉模式：只有旋轉命令，沒有線速度
@@ -1249,7 +1416,8 @@ class RedrhexEnv(DirectRLEnv):
         rotation_speed_ratio = torch.abs(actual_wz) / (torch.abs(cmd_wz) + 0.01)
         rotation_too_slow = (rotation_speed_ratio < 0.5) & is_pure_rotation
         rew_rotation_slow_penalty = rotation_too_slow.float() * getattr(self.cfg, 'rew_scale_rotation_slow_penalty', -2.0) * dt
-        total_reward += rew_rotation_slow_penalty
+        if self._is_reward_enabled("rotation_slow_penalty"):  # 簡化模式下禁用
+            total_reward += rew_rotation_slow_penalty
         
         # G1.3.2 旋轉時 ABAD 輔助獎勵
         # 原地旋轉時，用 ABAD 可以幫助產生旋轉力矩
@@ -1262,7 +1430,8 @@ class RedrhexEnv(DirectRLEnv):
             abad_for_rotation * getattr(self.cfg, 'rew_scale_rotation_abad_assist', 2.0),
             torch.zeros_like(abad_for_rotation)
         ) * dt
-        total_reward += rew_rotation_abad_assist
+        if self._is_reward_enabled("rotation_abad_assist"):  # 簡化模式下禁用
+            total_reward += rew_rotation_abad_assist
         
         # G1.3.3 旋轉方向正確大獎勵
         # 確保旋轉方向與命令一致
@@ -1288,19 +1457,22 @@ class RedrhexEnv(DirectRLEnv):
         # 所以：xy 分量越大 = 傾斜越多 = 懲罰越重
         flat_orientation = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
         rew_upright = flat_orientation * self.cfg.rew_scale_upright * dt
-        total_reward += rew_upright
+        if self._is_reward_enabled("upright"):  # 簡化模式下禁用
+            total_reward += rew_upright
         
         # G2.2 垂直彈跳懲罰（不要亂跳）
         # 機器人應該平穩移動，上下速度（vz）應該接近 0
         z_vel_error = torch.square(actual_vz)
         rew_z_vel = z_vel_error * self.cfg.rew_scale_z_vel * dt
-        total_reward += rew_z_vel
+        if self._is_reward_enabled("z_vel"):  # 簡化模式下禁用
+            total_reward += rew_z_vel
         
         # G2.3 XY 軸角速度懲罰（不要翻滾）
         # 機器人不應該繞 X 軸或 Y 軸旋轉（那是翻滾），只允許繞 Z 軸旋轉（正常轉彎）
         ang_vel_xy_error = torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
         rew_ang_vel_xy = ang_vel_xy_error * self.cfg.rew_scale_ang_vel_xy * dt
-        total_reward += rew_ang_vel_xy
+        if self._is_reward_enabled("ang_vel_xy"):  # 簡化模式下禁用
+            total_reward += rew_ang_vel_xy
         
         # G2.4 高度維持懲罰（保持正常站立高度）
         # 正常站立高度約 0.12 公尺，偏離太多就扣分
@@ -1308,7 +1480,8 @@ class RedrhexEnv(DirectRLEnv):
         target_height = getattr(self.cfg, 'target_base_height', 0.12)  # 目標高度
         height_error = torch.square(base_height - target_height)
         rew_base_height = height_error * self.cfg.rew_scale_base_height * dt
-        total_reward += rew_base_height
+        if self._is_reward_enabled("base_height"):  # 簡化模式下禁用
+            total_reward += rew_base_height
         
         # ★★★ G2.5 新增：直走時高站姿獎勵 ★★★
         # 當命令是直走（|vx| 大，|vy| 和 |wz| 小）時，獎勵身體抬高
@@ -1390,7 +1563,8 @@ class RedrhexEnv(DirectRLEnv):
         
         # 【身體觸地懲罰】摔倒是嚴重的錯誤，但不終止讓 AI 學習恢復
         rew_body_contact = body_contact.float() * self.cfg.rew_scale_body_contact * dt
-        total_reward += rew_body_contact
+        if self._is_reward_enabled("body_contact"):  # 簡化模式下保留
+            total_reward += rew_body_contact
         
         # 【連續傾斜懲罰】傾斜越多扣分越多（鼓勵保持平衡）
         # ★ 降低懲罰強度，讓機器人更敢動
@@ -1418,14 +1592,16 @@ class RedrhexEnv(DirectRLEnv):
         if hasattr(self.robot.data, 'applied_torque'):
             joint_torques = torch.sum(torch.square(self.robot.data.applied_torque), dim=1)
             rew_torque = joint_torques * self.cfg.rew_scale_torque * dt
-            total_reward += rew_torque
+            if self._is_reward_enabled("torque"):  # 簡化模式下保留
+                total_reward += rew_torque
         
         # G4.2 動作變化率懲罰（不要抖動）
         # 比較這次動作和上次動作，變化越大懲罰越重
         # 這樣可以讓動作更平滑，不會忽大忽小
         action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         rew_action_rate = action_rate * self.cfg.rew_scale_action_rate * dt
-        total_reward += rew_action_rate
+        if self._is_reward_enabled("action_rate"):  # 簡化模式下保留
+            total_reward += rew_action_rate
         
         # G4.3 關節加速度懲罰（不要急加速）
         # 加速度太大 = 動作太劇烈，對機械結構不好
@@ -1527,12 +1703,14 @@ class RedrhexEnv(DirectRLEnv):
         # ★ 連續支撐獎勵：至少一組有效著地
         at_least_one_stance = (a_in_stance | b_in_stance).float()
         rew_tripod_support = at_least_one_stance * self.cfg.rew_scale_tripod_support * dt
-        total_reward += rew_tripod_support
+        if self._is_reward_enabled("tripod_support"):  # 簡化模式下保留
+            total_reward += rew_tripod_support
         
         # ★★ 騰空懲罰：如果兩組都不在著地相位 → 大懲罰！
         both_airborne = (~a_in_stance & ~b_in_stance).float()
         rew_airborne_penalty = both_airborne * getattr(self.cfg, 'rew_scale_airborne_penalty', -10.0) * dt
-        total_reward += rew_airborne_penalty
+        if self._is_reward_enabled("airborne_penalty"):  # 簡化模式下禁用
+            total_reward += rew_airborne_penalty
         
         # ★★★ 雙支撐獎勵：兩組都著地時是超級穩定狀態
         both_in_stance = (a_in_stance & b_in_stance).float()
@@ -1949,7 +2127,8 @@ class RedrhexEnv(DirectRLEnv):
         # 存活獎勵
         # ========================================================
         rew_alive = torch.ones(self.num_envs, device=self.device) * self.cfg.rew_scale_alive * dt
-        total_reward += rew_alive
+        if self._is_reward_enabled("alive"):  # 簡化模式下保留
+            total_reward += rew_alive
 
         # =================================================================
         # ★★★ G9: 移動獎勵（防止消極的關鍵！）★★★
@@ -1973,9 +2152,10 @@ class RedrhexEnv(DirectRLEnv):
         # 這會讓機器人願意嘗試移動
         actual_leg_vel = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
         
-        # 線性獎勵：腿轉越快獎勵越高（有上限）
+        # 線性獎勵：腳轉越快獎勵越高（有上限）
         rew_leg_moving = torch.clamp(actual_leg_vel * getattr(self.cfg, 'rew_scale_leg_moving', 2.0), max=3.0) * dt
-        total_reward += rew_leg_moving
+        if self._is_reward_enabled("leg_moving"):  # 簡化模式下保留
+            total_reward += rew_leg_moving
         
         # G9.3 方向正確的移動額外獎勵
         # 如果實際速度方向與命令一致，給更大獎勵
