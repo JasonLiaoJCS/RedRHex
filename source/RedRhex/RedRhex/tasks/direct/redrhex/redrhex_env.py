@@ -352,6 +352,12 @@ class RedrhexEnv(DirectRLEnv):
             "rew_high_stance": torch.zeros(self.num_envs, device=self.device),         # 高站姿獎勵
             "rew_abad_zero_forward": torch.zeros(self.num_envs, device=self.device),   # 直走 ABAD 歸零
             "rew_abad_diagonal": torch.zeros(self.num_envs, device=self.device),       # 斜向 ABAD 使用
+            # Forward gait prior（只在 FWD mode 生效）
+            "rew_forward_prior_coherence": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_prior_antiphase": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_prior_duty": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_prior_vel_ratio": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_prior_overlap": torch.zeros(self.num_envs, device=self.device),
             # ★★★ 新增：側移專用獎勵 ★★★
             "rew_lateral_drive_lock": torch.zeros(self.num_envs, device=self.device),  # 側移主驅動鎖定
             "rew_lateral_low_freq": torch.zeros(self.num_envs, device=self.device),    # 側移低頻獎勵
@@ -360,6 +366,10 @@ class RedrhexEnv(DirectRLEnv):
             "rew_rotation_slow_penalty": torch.zeros(self.num_envs, device=self.device),  # 旋轉太慢懲罰
             "rew_rotation_abad_assist": torch.zeros(self.num_envs, device=self.device),   # 旋轉 ABAD 輔助
             "rew_rotation_correct": torch.zeros(self.num_envs, device=self.device),       # 旋轉方向正確
+            "rew_yaw_track": torch.zeros(self.num_envs, device=self.device),              # 旋轉追蹤專項
+            "rew_yaw_stability": torch.zeros(self.num_envs, device=self.device),          # 旋轉穩定專項
+            "rew_yaw_cheat": torch.zeros(self.num_envs, device=self.device),              # 旋轉作弊懲罰
+            "rew_lateral_soft_lock": torch.zeros(self.num_envs, device=self.device),      # 側移主驅動軟鎖
             # ★★★ 新增：移動獎勵（防消極）★★★
             "rew_leg_moving": torch.zeros(self.num_envs, device=self.device),            # 腿轉動獎勵
             "rew_direction_bonus": torch.zeros(self.num_envs, device=self.device),       # 方向正確額外獎勵
@@ -393,11 +403,104 @@ class RedrhexEnv(DirectRLEnv):
             "diag_swing_velocity": torch.zeros(self.num_envs, device=self.device),    # 擺動組速度
             "diag_airborne_count": torch.zeros(self.num_envs, device=self.device),    # 騰空次數
             "diag_lateral_lift_count": torch.zeros(self.num_envs, device=self.device),  # 側移抬腿數
+            "diag_forward_duty_ema": torch.zeros(self.num_envs, device=self.device),
+            "diag_forward_vel_ratio_proxy": torch.zeros(self.num_envs, device=self.device),
+            "diag_forward_transition_weight": torch.zeros(self.num_envs, device=self.device),
+            # 模式與 gating 診斷（TensorBoard）
+            "diag_mode_id": torch.zeros(self.num_envs, device=self.device),
+            "diag_contact_count": torch.zeros(self.num_envs, device=self.device),
+            "diag_pose_error": torch.zeros(self.num_envs, device=self.device),
+            "diag_lateral_fsm_state": torch.zeros(self.num_envs, device=self.device),
+            "diag_lateral_time_in_state": torch.zeros(self.num_envs, device=self.device),
+            "diag_masked_action_norm_main": torch.zeros(self.num_envs, device=self.device),
+            "diag_masked_action_norm_abad": torch.zeros(self.num_envs, device=self.device),
+            "diag_roll_rms": torch.zeros(self.num_envs, device=self.device),
+            "diag_pitch_rms": torch.zeros(self.num_envs, device=self.device),
+            "diag_yaw_slip_proxy": torch.zeros(self.num_envs, device=self.device),
+            "diag_curriculum_stage": torch.zeros(self.num_envs, device=self.device),
+            "diag_dr_mass_scale": torch.zeros(self.num_envs, device=self.device),
+            "diag_dr_friction_scale": torch.zeros(self.num_envs, device=self.device),
+            "diag_dr_main_strength": torch.zeros(self.num_envs, device=self.device),
+            "diag_dr_abad_strength": torch.zeros(self.num_envs, device=self.device),
+            "diag_obs_latency_steps": torch.zeros(self.num_envs, device=self.device),
+            "diag_push_events": torch.zeros(self.num_envs, device=self.device),
+            "diag_terrain_level": torch.zeros(self.num_envs, device=self.device),
         }
 
         # 初始化目標速度緩衝
         self._target_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
         self._base_velocity = torch.zeros(self.num_envs, 6, device=self.device)  # 基礎速度（未經AI調節）
+        
+        # 模式與 gating 狀態緩衝
+        self._mode_id = torch.full((self.num_envs,), 4, dtype=torch.long, device=self.device)  # 0:FWD 1:LAT 2:DIAG 3:YAW 4:OTHER
+        self._mode_fwd = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._mode_lat = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._mode_diag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._mode_yaw = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # 側移模式 state machine
+        self._is_lateral_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._is_lateral_preparing = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._lateral_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._lateral_gait_phase = torch.zeros(self.num_envs, device=self.device)
+        self._lateral_gait_freq = getattr(self.cfg, 'lateral_gait_frequency', 0.5)
+        self._lateral_fsm_state = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # 0:NORMAL 1:GO_TO_STAND 2:LATERAL_STEP
+        self._lateral_state_time = torch.zeros(self.num_envs, device=self.device)
+        self._lateral_timeout_cooldown = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._contact_count = torch.zeros(self.num_envs, device=self.device)
+        self._stand_pose_error = torch.zeros(self.num_envs, device=self.device)
+        self._masked_action_norm_main = torch.zeros(self.num_envs, device=self.device)
+        self._masked_action_norm_abad = torch.zeros(self.num_envs, device=self.device)
+        self._roll_rms = torch.zeros(self.num_envs, device=self.device)
+        self._pitch_rms = torch.zeros(self.num_envs, device=self.device)
+        self._yaw_slip_proxy = torch.zeros(self.num_envs, device=self.device)
+        # Forward gait prior 的狀態估計（duty/contact/transition）
+        self._forward_stance_frac_ema = torch.full(
+            (self.num_envs,),
+            float(getattr(self.cfg, "forward_duty_target", self.cfg.stance_duty_cycle)),
+            device=self.device,
+        )
+        self._forward_vel_ratio_proxy = torch.zeros(self.num_envs, device=self.device)
+        self._forward_transition_weight = torch.zeros(self.num_envs, device=self.device)
+        
+        # 側移前回站姿：主驅動目標角（右側 +45°，左側 -45°）
+        self._main_drive_initial_pos = torch.tensor(
+            [45.0, 45.0, 45.0, -45.0, -45.0, -45.0],
+            device=self.device
+        ).unsqueeze(0) * (math.pi / 180.0)
+
+        # Curriculum + domain randomization 狀態
+        self._global_step_count = 0
+        self._curriculum_stage = int(getattr(self.cfg, "stage", 4))
+        self._last_curriculum_stage = self._curriculum_stage
+        self._dr_stage_id = torch.full((self.num_envs,), float(self._curriculum_stage), device=self.device)
+        self._dr_stage_scale = torch.ones(self.num_envs, device=self.device)
+        self._mass_scale = torch.ones(self.num_envs, device=self.device)
+        self._friction_scale = torch.ones(self.num_envs, device=self.device)
+        self._main_strength_scale = torch.ones(self.num_envs, device=self.device)
+        self._abad_strength_scale = torch.ones(self.num_envs, device=self.device)
+        self._obs_noise_scale = torch.ones(self.num_envs, device=self.device)
+        self._terrain_level = torch.zeros(self.num_envs, device=self.device)
+
+        latency_cfg = getattr(self.cfg, "dr_obs_latency_steps_range", [0, 0])
+        self._obs_latency_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        max_latency = int(max(latency_cfg))
+        obs_history_len = max(1, max_latency + 1)
+        self._obs_history = torch.zeros(
+            self.num_envs, obs_history_len, self.cfg.observation_space, device=self.device
+        )
+
+        self._last_push_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._push_events = torch.zeros(self.num_envs, device=self.device)
+        self._push_events_step = torch.zeros(self.num_envs, device=self.device)
+
+        # 預設關閉物理層 material DR，避免在不相容的 PhysX device 組態下刷錯誤。
+        self._physical_dr_enabled = bool(getattr(self.cfg, "dr_try_physical_material_randomization", False))
+        self._physical_dr_warned = False
+        self._mass_physical_randomized = False
+        self._friction_physical_randomized = False
+        self._default_body_masses = None
+        self._default_material_properties = None
 
     def _setup_commands(self):
         """
@@ -469,60 +572,399 @@ class RedrhexEnv(DirectRLEnv):
         """
         if len(env_ids) == 0:
             return
-            
+
         # 重置計時器
         self.command_time_left[env_ids] = self.cfg.command_resample_time
-        
-        if self.discrete_directions is not None and self.cfg.use_discrete_directions:
-            # 離散方向模式：隨機選擇一個方向
-            dir_indices = torch.randint(0, self.num_directions, (len(env_ids),), device=self.device)
-            self.current_direction_idx[env_ids] = dir_indices
-            
-            # 設置 vx, vy, wz（直接從 discrete_directions 獲取全部三個值）
-            self.commands[env_ids, 0] = self.discrete_directions[dir_indices, 0]
-            self.commands[env_ids, 1] = self.discrete_directions[dir_indices, 1]
-            self.commands[env_ids, 2] = self.discrete_directions[dir_indices, 2]
-            
-            # 打印方向切換信息（只打印前幾個環境，避免刷屏）
-            if len(env_ids) > 0 and env_ids[0] == 0 and hasattr(self.cfg, 'direction_names'):
-                idx = dir_indices[0].item()
-                name = self.cfg.direction_names[idx] if idx < len(self.cfg.direction_names) else f"Dir{idx}"
-                print(f"[命令切換] env0 → {name} (vx={self.commands[0,0]:.2f}, vy={self.commands[0,1]:.2f}, wz={self.commands[0,2]:.2f})")
+
+        stage = self._update_curriculum_stage()
+
+        # Stage 1: Forward-only
+        if stage == 1:
+            if getattr(self.cfg, "stage1_use_discrete_directions", False):
+                self._sample_commands_from_table(env_ids, getattr(self.cfg, "stage1_discrete_directions", [[0.4, 0.0, 0.0]]))
+            else:
+                vx_min, vx_max = getattr(self.cfg, "stage1_forward_vx_range", self.cfg.lin_vel_x_range)
+                vx_min = max(vx_min, 0.0)
+                vx_max = max(vx_max, vx_min + 1e-3)
+                self.commands[env_ids, 0] = sample_uniform(vx_min, vx_max, (len(env_ids),), self.device)
+                self.commands[env_ids, 1] = 0.0
+                self.commands[env_ids, 2] = 0.0
+
+        # Stage 2: Lateral-only
+        elif stage == 2:
+            if getattr(self.cfg, "stage2_use_discrete_directions", False):
+                self._sample_commands_from_table(env_ids, getattr(self.cfg, "stage2_discrete_directions", [[0.0, 0.3, 0.0], [0.0, -0.3, 0.0]]))
+            else:
+                vy_min, vy_max = getattr(self.cfg, "stage2_lateral_vy_abs_range", [0.2, 0.4])
+                vy_min = max(vy_min, 1e-3)
+                vy_max = max(vy_max, vy_min + 1e-3)
+                vy_abs = sample_uniform(vy_min, vy_max, (len(env_ids),), self.device)
+                signs = torch.where(torch.rand(len(env_ids), device=self.device) > 0.5, 1.0, -1.0)
+                self.commands[env_ids, 0] = 0.0
+                self.commands[env_ids, 1] = vy_abs * signs
+                self.commands[env_ids, 2] = 0.0
+
+        # Stage 3: Yaw-only
+        elif stage == 3:
+            if getattr(self.cfg, "stage3_use_discrete_directions", True):
+                self._sample_commands_from_table(
+                    env_ids,
+                    getattr(self.cfg, "stage3_discrete_directions", [[0.0, 0.0, 0.8], [0.0, 0.0, -0.8]]),
+                )
+            else:
+                wz_min, wz_max = getattr(self.cfg, "stage3_yaw_wz_abs_range", [0.45, 1.00])
+                wz_min = max(float(wz_min), 1e-3)
+                wz_max = max(float(wz_max), wz_min + 1e-3)
+                wz_abs = sample_uniform(wz_min, wz_max, (len(env_ids),), self.device)
+                signs = torch.where(torch.rand(len(env_ids), device=self.device) > 0.5, 1.0, -1.0)
+                self.commands[env_ids, 0] = 0.0
+                self.commands[env_ids, 1] = 0.0
+                self.commands[env_ids, 2] = wz_abs * signs
+
+        # Stage 4: Mixed skills (FWD/LAT/DIAG/YAW)
         else:
-            # 連續範圍模式
-            self.commands[env_ids, 0] = sample_uniform(
-                self.cfg.lin_vel_x_range[0],
-                self.cfg.lin_vel_x_range[1],
-                (len(env_ids),),
-                self.device
+            use_discrete = getattr(
+                self.cfg,
+                "stage4_use_discrete_directions",
+                getattr(self.cfg, "stage3_use_discrete_directions", True),
             )
-            self.commands[env_ids, 1] = sample_uniform(
-                self.cfg.lin_vel_y_range[0],
-                self.cfg.lin_vel_y_range[1],
-                (len(env_ids),),
-                self.device
-            )
-            self.commands[env_ids, 2] = sample_uniform(
-                self.cfg.ang_vel_z_range[0],
-                self.cfg.ang_vel_z_range[1],
-                (len(env_ids),),
-                self.device
-            )
+            if use_discrete:
+                default_dirs = getattr(self.cfg, "discrete_directions", [[0.4, 0.0, 0.0]])
+                self._sample_commands_from_table(
+                    env_ids,
+                    getattr(
+                        self.cfg,
+                        "stage4_discrete_directions",
+                        getattr(self.cfg, "stage3_discrete_directions", default_dirs),
+                    ),
+                )
+            elif self.discrete_directions is not None and self.cfg.use_discrete_directions:
+                dir_indices = torch.randint(0, self.num_directions, (len(env_ids),), device=self.device)
+                self.current_direction_idx[env_ids] = dir_indices
+                self.commands[env_ids, 0] = self.discrete_directions[dir_indices, 0]
+                self.commands[env_ids, 1] = self.discrete_directions[dir_indices, 1]
+                self.commands[env_ids, 2] = self.discrete_directions[dir_indices, 2]
+            else:
+                self._sample_stage4_continuous(env_ids)
 
     def _update_commands(self):
         """更新命令
-        
-        ★★★ 重大改變：不再定期切換方向！★★★
-        每個環境專注訓練同一個方向，直到被重置
         """
         # 外部控制時跳過
         if self.external_control:
             return
-        
-        # ★★★ 新模式：不再定期切換，只在重置時切換 ★★★
-        # 這樣每個環境可以專注學習當前方向，直到失敗或超時
-        # 命令重採樣只在 _reset_idx 中進行
-        pass
+
+        self._global_step_count += 1
+        stage = self._update_curriculum_stage()
+        if stage != self._last_curriculum_stage:
+            self._last_curriculum_stage = stage
+            self._apply_terrain_curriculum_if_available(stage)
+
+        if not getattr(self.cfg, "command_resample_on_timer", False):
+            return
+
+        self.command_time_left -= self.step_dt
+        resample_mask = self.command_time_left <= 0.0
+        if torch.any(resample_mask):
+            env_ids = torch.nonzero(resample_mask, as_tuple=False).squeeze(-1)
+            self._resample_commands(env_ids)
+
+    def _update_curriculum_stage(self) -> int:
+        """解析當前 curriculum stage（可固定 stage，或按步數自動遞進）。"""
+        if not getattr(self.cfg, "curriculum_enable", True):
+            self._curriculum_stage = 4
+            return self._curriculum_stage
+
+        if getattr(self.cfg, "curriculum_auto_progress", False):
+            stage1_steps = int(getattr(self.cfg, "curriculum_stage1_steps", 400_000))
+            stage2_steps = int(getattr(self.cfg, "curriculum_stage2_steps", 1_000_000))
+            stage3_steps = int(getattr(self.cfg, "curriculum_stage3_steps", 1_600_000))
+            if self._global_step_count < stage1_steps:
+                stage = 1
+            elif self._global_step_count < stage2_steps:
+                stage = 2
+            elif self._global_step_count < stage3_steps:
+                stage = 3
+            else:
+                stage = 4
+        else:
+            stage = int(getattr(self.cfg, "stage", 4))
+
+        self._curriculum_stage = int(max(1, min(4, stage)))
+        return self._curriculum_stage
+
+    def _get_stage_scale(self, stage: int | None = None) -> float:
+        if stage is None:
+            stage = self._curriculum_stage
+        scales = getattr(self.cfg, "curriculum_stage_scales", [0.25, 0.50, 0.75, 1.0])
+        idx = max(0, min(len(scales) - 1, int(stage) - 1))
+        return float(scales[idx])
+
+    def _sample_commands_from_table(self, env_ids: torch.Tensor, directions: Sequence[Sequence[float]]) -> None:
+        table = torch.tensor(directions, device=self.device, dtype=torch.float32)
+        if table.numel() == 0:
+            return
+        if table.shape[1] == 2:
+            zeros = torch.zeros(table.shape[0], 1, device=self.device, dtype=torch.float32)
+            table = torch.cat([table, zeros], dim=1)
+        pick = torch.randint(0, table.shape[0], (len(env_ids),), device=self.device)
+        self.current_direction_idx[env_ids] = pick
+        self.commands[env_ids, :] = table[pick]
+
+    def _sample_stage4_continuous(self, env_ids: torch.Tensor) -> None:
+        """Stage4 的連續命令採樣，保證含 FWD/LAT/DIAG/YAW。"""
+        probs = torch.tensor(
+            getattr(
+                self.cfg,
+                "stage4_mode_probabilities",
+                getattr(self.cfg, "stage3_mode_probabilities", [0.30, 0.25, 0.20, 0.25]),
+            ),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        probs = probs / torch.clamp(probs.sum(), min=1e-6)
+        modes = torch.multinomial(probs, len(env_ids), replacement=True)
+
+        self.commands[env_ids, :] = 0.0
+
+        fwd_ids = env_ids[modes == 0]
+        lat_ids = env_ids[modes == 1]
+        diag_ids = env_ids[modes == 2]
+        yaw_ids = env_ids[modes == 3]
+
+        if len(fwd_ids) > 0:
+            vx_min = max(float(self.cfg.lin_vel_x_range[0]), 0.05)
+            vx_max = max(float(self.cfg.lin_vel_x_range[1]), vx_min + 1e-3)
+            self.commands[fwd_ids, 0] = sample_uniform(vx_min, vx_max, (len(fwd_ids),), self.device)
+
+        if len(lat_ids) > 0:
+            vy_abs_min = max(abs(float(self.cfg.lin_vel_y_range[0])), abs(float(self.cfg.lin_vel_y_range[1])), 0.20)
+            vy_abs_max = max(vy_abs_min, 0.45)
+            vy = sample_uniform(vy_abs_min, vy_abs_max, (len(lat_ids),), self.device)
+            sign = torch.where(torch.rand(len(lat_ids), device=self.device) > 0.5, 1.0, -1.0)
+            self.commands[lat_ids, 1] = vy * sign
+
+        if len(diag_ids) > 0:
+            vx = sample_uniform(0.20, 0.45, (len(diag_ids),), self.device)
+            vy = sample_uniform(0.15, 0.35, (len(diag_ids),), self.device)
+            sign = torch.where(torch.rand(len(diag_ids), device=self.device) > 0.5, 1.0, -1.0)
+            self.commands[diag_ids, 0] = vx
+            self.commands[diag_ids, 1] = vy * sign
+
+        if len(yaw_ids) > 0:
+            wz_abs_min = max(abs(float(self.cfg.ang_vel_z_range[0])), abs(float(self.cfg.ang_vel_z_range[1])), 0.45)
+            wz_abs_max = max(wz_abs_min, 1.0)
+            wz = sample_uniform(wz_abs_min, wz_abs_max, (len(yaw_ids),), self.device)
+            sign = torch.where(torch.rand(len(yaw_ids), device=self.device) > 0.5, 1.0, -1.0)
+            self.commands[yaw_ids, 2] = wz * sign
+
+    def _sample_domain_randomization(self, env_ids: torch.Tensor) -> None:
+        """每次 reset 後重採樣 DR 參數。"""
+        if len(env_ids) == 0:
+            return
+
+        stage = self._update_curriculum_stage()
+        stage_scale = self._get_stage_scale(stage)
+        self._dr_stage_id[env_ids] = float(stage)
+        self._dr_stage_scale[env_ids] = stage_scale
+
+        if not getattr(self.cfg, "domain_randomization_enable", True):
+            self._mass_scale[env_ids] = 1.0
+            self._friction_scale[env_ids] = 1.0
+            self._main_strength_scale[env_ids] = 1.0
+            self._abad_strength_scale[env_ids] = 1.0
+            self._obs_noise_scale[env_ids] = 1.0
+            self._obs_latency_steps[env_ids] = 0
+            return
+
+        def _scaled_range(base_range: Sequence[float]) -> tuple[float, float]:
+            low, high = float(base_range[0]), float(base_range[1])
+            low_eff = 1.0 - (1.0 - low) * stage_scale
+            high_eff = 1.0 + (high - 1.0) * stage_scale
+            return low_eff, max(high_eff, low_eff + 1e-6)
+
+        if getattr(self.cfg, "dr_randomize_mass", True):
+            low, high = _scaled_range(getattr(self.cfg, "dr_mass_range", [0.9, 1.1]))
+            self._mass_scale[env_ids] = sample_uniform(low, high, (len(env_ids),), self.device)
+        else:
+            self._mass_scale[env_ids] = 1.0
+
+        if getattr(self.cfg, "dr_randomize_friction", True):
+            low, high = _scaled_range(getattr(self.cfg, "dr_friction_range", [0.5, 1.25]))
+            self._friction_scale[env_ids] = sample_uniform(low, high, (len(env_ids),), self.device)
+        else:
+            self._friction_scale[env_ids] = 1.0
+
+        if getattr(self.cfg, "dr_randomize_actuator_strength", True):
+            main_low, main_high = _scaled_range(getattr(self.cfg, "dr_main_actuator_strength_range", [0.85, 1.15]))
+            abad_low, abad_high = _scaled_range(getattr(self.cfg, "dr_abad_actuator_strength_range", [0.85, 1.15]))
+            self._main_strength_scale[env_ids] = sample_uniform(main_low, main_high, (len(env_ids),), self.device)
+            self._abad_strength_scale[env_ids] = sample_uniform(abad_low, abad_high, (len(env_ids),), self.device)
+        else:
+            self._main_strength_scale[env_ids] = 1.0
+            self._abad_strength_scale[env_ids] = 1.0
+
+        if getattr(self.cfg, "dr_obs_noise_enable", True):
+            noise_low = max(0.25, 1.0 - 0.4 * stage_scale)
+            noise_high = 1.0 + 0.4 * stage_scale
+            self._obs_noise_scale[env_ids] = sample_uniform(noise_low, noise_high, (len(env_ids),), self.device)
+        else:
+            self._obs_noise_scale[env_ids] = 1.0
+
+        if getattr(self.cfg, "dr_obs_latency_enable", True):
+            lat_min, lat_max = getattr(self.cfg, "dr_obs_latency_steps_range", [0, 2])
+            lat_min = int(lat_min)
+            lat_max = int(lat_max)
+            lat_max_eff = max(lat_min, int(round(lat_min + (lat_max - lat_min) * stage_scale)))
+            if lat_max_eff > lat_min:
+                self._obs_latency_steps[env_ids] = torch.randint(lat_min, lat_max_eff + 1, (len(env_ids),), device=self.device)
+            else:
+                self._obs_latency_steps[env_ids] = lat_min
+        else:
+            self._obs_latency_steps[env_ids] = 0
+
+        self._terrain_level[env_ids] = self._resolve_terrain_level(stage)
+        self._last_push_step[env_ids] = self._global_step_count
+        self._try_apply_physical_domain_randomization(env_ids)
+
+    def _resolve_terrain_level(self, stage: int | None = None) -> float:
+        if stage is None:
+            stage = self._curriculum_stage
+        levels = getattr(self.cfg, "terrain_curriculum_levels", [0.0, 0.3, 0.6, 1.0])
+        idx = max(0, min(len(levels) - 1, int(stage) - 1))
+        return float(levels[idx])
+
+    def _apply_terrain_curriculum_if_available(self, stage: int) -> None:
+        if not getattr(self.cfg, "terrain_curriculum_enable", True):
+            return
+        level = self._resolve_terrain_level(stage)
+        self._terrain_level[:] = level
+        terrain_generator = getattr(self.cfg.terrain, "terrain_generator", None)
+        if terrain_generator is not None and hasattr(terrain_generator, "difficulty_range"):
+            try:
+                terrain_generator.difficulty_range = (0.0, level)
+            except Exception:
+                pass
+
+    def _try_apply_physical_domain_randomization(self, env_ids: torch.Tensor) -> None:
+        """嘗試把 mass/friction DR 直接寫到物理層，不支援則自動 fallback。"""
+        if (not self._physical_dr_enabled) or len(env_ids) == 0:
+            return
+        view = getattr(self.robot, "root_physx_view", None)
+        if view is None:
+            return
+
+        # mass
+        if getattr(self.cfg, "dr_randomize_mass", True):
+            try:
+                if self._default_body_masses is None and hasattr(view, "get_masses"):
+                    default_masses = view.get_masses()
+                    # 保留 PhysX 回傳 tensor 的原生 device（避免 setMasses device mismatch）
+                    self._default_body_masses = torch.as_tensor(default_masses).clone()
+                if self._default_body_masses is not None and hasattr(view, "set_masses"):
+                    masses = self._default_body_masses.clone()
+                    physx_ids = env_ids.to(device=masses.device, dtype=torch.long)
+                    mass_scale = self._mass_scale[env_ids].to(device=masses.device, dtype=masses.dtype)
+                    masses[physx_ids] = masses[physx_ids] * mass_scale.unsqueeze(1)
+                    view.set_masses(masses, physx_ids)
+                    self._mass_physical_randomized = True
+            except Exception as exc:
+                self._mass_physical_randomized = False
+                self._physical_dr_enabled = False
+                if not self._physical_dr_warned:
+                    print(f"[DR] physical mass randomization disabled due to device mismatch: {exc}")
+                    self._physical_dr_warned = True
+                return
+
+        # friction
+        if getattr(self.cfg, "dr_randomize_friction", True):
+            try:
+                if self._default_material_properties is None and hasattr(view, "get_material_properties"):
+                    props = view.get_material_properties()
+                    # 保留 PhysX 回傳 tensor 的原生 device（避免 setMaterialProperties device mismatch）
+                    self._default_material_properties = torch.as_tensor(props).clone()
+                if self._default_material_properties is not None and hasattr(view, "set_material_properties"):
+                    props = self._default_material_properties.clone()
+                    physx_ids = env_ids.to(device=props.device, dtype=torch.long)
+                    friction_scale = self._friction_scale[env_ids].to(device=props.device, dtype=props.dtype)
+                    props[physx_ids, :, 0] = props[physx_ids, :, 0] * friction_scale.unsqueeze(1)
+                    props[physx_ids, :, 1] = props[physx_ids, :, 1] * friction_scale.unsqueeze(1)
+                    view.set_material_properties(props, physx_ids)
+                    self._friction_physical_randomized = True
+            except Exception as exc:
+                self._friction_physical_randomized = False
+                self._physical_dr_enabled = False
+                if not self._physical_dr_warned:
+                    print(f"[DR] physical friction randomization disabled due to device mismatch: {exc}")
+                    self._physical_dr_warned = True
+                return
+
+    def _apply_observation_domain_randomization(self, obs: torch.Tensor) -> torch.Tensor:
+        if obs.shape[-1] != self._obs_history.shape[-1]:
+            self._obs_history = torch.zeros(
+                self.num_envs, self._obs_history.shape[1], obs.shape[-1], device=self.device
+            )
+
+        if getattr(self.cfg, "domain_randomization_enable", True) and getattr(self.cfg, "dr_obs_noise_enable", True):
+            noise_scale = (self._dr_stage_scale * self._obs_noise_scale).unsqueeze(1)
+
+            obs[:, 0:3] += torch.randn_like(obs[:, 0:3]) * float(getattr(self.cfg, "noise_lin_vel", 0.1)) * noise_scale
+            obs[:, 3:6] += torch.randn_like(obs[:, 3:6]) * float(getattr(self.cfg, "noise_ang_vel", 0.2)) * noise_scale
+            obs[:, 6:9] += torch.randn_like(obs[:, 6:9]) * float(getattr(self.cfg, "noise_gravity", 0.05)) * noise_scale
+            obs[:, 9:21] += torch.randn_like(obs[:, 9:21]) * float(getattr(self.cfg, "noise_joint_pos", 0.01)) * noise_scale
+            obs[:, 21:39] += torch.randn_like(obs[:, 21:39]) * float(getattr(self.cfg, "noise_joint_vel", 1.5)) * noise_scale
+
+            if getattr(self.cfg, "dr_obs_noise_bias_enable", False):
+                bias = (torch.rand(self.num_envs, 1, device=self.device) - 0.5) * 0.02 * noise_scale
+                obs = obs + bias
+
+        if self.cfg.add_noise:
+            noise = torch.randn_like(obs) * 0.01 * float(getattr(self.cfg, "noise_level", 1.0))
+            obs = obs + noise
+
+        # latency: 先寫入當前，再按每個 env 的延遲步數讀出
+        self._obs_history = torch.roll(self._obs_history, shifts=1, dims=1)
+        self._obs_history[:, 0, :] = obs
+        latency = torch.clamp(self._obs_latency_steps, min=0, max=self._obs_history.shape[1] - 1)
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        return self._obs_history[env_ids, latency, :]
+
+    def _maybe_apply_random_pushes(self) -> None:
+        self._push_events_step[:] = 0.0
+
+        if (not getattr(self.cfg, "domain_randomization_enable", True)) or (not getattr(self.cfg, "dr_push_enable", True)):
+            return
+
+        interval_s = float(getattr(self.cfg, "dr_push_interval_s", 12.0))
+        interval_steps = max(1, int(round(interval_s / max(self.step_dt, 1e-6))))
+        elapsed = self._global_step_count - self._last_push_step
+        eligible = elapsed >= interval_steps
+        if not torch.any(eligible):
+            return
+
+        candidate_ids = torch.nonzero(eligible, as_tuple=False).squeeze(-1)
+        stage_prob = float(getattr(self.cfg, "dr_push_probability", 0.5))
+        random_vals = torch.rand(len(candidate_ids), device=self.device)
+        push_mask = random_vals < (stage_prob * self._dr_stage_scale[candidate_ids])
+        push_ids = candidate_ids[push_mask]
+        if len(push_ids) == 0:
+            return
+
+        max_xy = float(getattr(self.cfg, "dr_push_max_vel_xy", 0.6))
+        max_z = float(getattr(self.cfg, "dr_push_max_vel_z", 0.0))
+        push_scale = self._dr_stage_scale[push_ids]
+        delta_xy = (torch.rand(len(push_ids), 2, device=self.device) * 2.0 - 1.0) * (max_xy * push_scale).unsqueeze(1)
+        delta_z = (torch.rand(len(push_ids), 1, device=self.device) * 2.0 - 1.0) * (max_z * push_scale).unsqueeze(1)
+        delta_lin = torch.cat([delta_xy, delta_z], dim=1)
+
+        root_lin_vel = self.robot.data.root_lin_vel_w[push_ids].clone()
+        root_ang_vel = self.robot.data.root_ang_vel_w[push_ids].clone()
+        new_root_vel = torch.cat([root_lin_vel + delta_lin, root_ang_vel], dim=1)
+        self.robot.write_root_velocity_to_sim(new_root_vel, push_ids)
+
+        self._last_push_step[push_ids] = self._global_step_count
+        self._push_events[push_ids] += 1.0
+        self._push_events_step[push_ids] = 1.0
 
     def _setup_gait(self):
         """
@@ -736,311 +1178,416 @@ class RedrhexEnv(DirectRLEnv):
         self.last_actions = self.actions.clone()           # 記住舊動作
         self.actions = actions.clone().clamp(-1.0, 1.0)    # 接收並限制新動作
 
-    def _apply_action(self) -> None:
-        """
-        【將 AI 的動作指令轉換成實際的關節控制】
+    def _resolve_command_modes(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """根據命令分出 FWD/LAT/DIAG/YAW/OTHER 五種模式。"""
+        cmd_vx = self.commands[:, 0]
+        cmd_vy = self.commands[:, 1]
+        cmd_wz = self.commands[:, 2]
         
-        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        ★ RHex 非對稱 Duty Cycle 步態控制邏輯                               ★
-        ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        lin_zero = getattr(self.cfg, "mode_lin_zero_thresh", 0.08)
+        yaw_zero = getattr(self.cfg, "mode_yaw_zero_thresh", 0.10)
+        fwd_min = getattr(self.cfg, "mode_forward_min_vx", 0.10)
+        lat_min = getattr(self.cfg, "mode_lateral_min_vy", 0.12)
+        diag_min = getattr(self.cfg, "mode_diagonal_min", 0.10)
+        yaw_min = getattr(self.cfg, "mode_yaw_min_wz", 0.15)
         
-        【控制架構】
-        ┌─────────────────────────────────────────────────────────────────┐
-        │ AI 動作 [0:6]  → 速度調節因子（微調基礎速度 ±50%）             │
-        │ AI 動作 [6:12] → ABAD 關節目標位置                              │
-        └─────────────────────────────────────────────────────────────────┘
+        mode_fwd = (
+            (cmd_vx > fwd_min)
+            & (torch.abs(cmd_vy) < lin_zero)
+            & (torch.abs(cmd_wz) < yaw_zero)
+        )
+        mode_lat = (
+            (torch.abs(cmd_vx) < lin_zero)
+            & (torch.abs(cmd_vy) > lat_min)
+            & (torch.abs(cmd_wz) < yaw_zero)
+        )
+        mode_diag = (
+            (cmd_vx > diag_min)
+            & (torch.abs(cmd_vy) > diag_min)
+            & (torch.abs(cmd_wz) < yaw_zero)
+        )
+        mode_yaw = (
+            (torch.abs(cmd_vx) < lin_zero)
+            & (torch.abs(cmd_vy) < lin_zero)
+            & (torch.abs(cmd_wz) > yaw_min)
+        )
         
-        【核心邏輯：根據相位決定基礎速度】
-        1. 計算每隻腿當前的相位角度
-        2. 判斷是在「著地相位」還是「擺動相位」
-        3. 著地相位 → 使用慢速 (stance_velocity)
-        4. 擺動相位 → 使用快速 (swing_velocity)
-        5. AI 只能微調（±50%），不能完全停止
+        mode_other = ~(mode_fwd | mode_lat | mode_diag | mode_yaw)
         
-        【為什麼這樣設計？】
-        - 確保步態結構正確（著地慢、擺動快）
-        - 給 AI 調整空間（適應不同地形和速度需求）
-        - 防止 AI 學會「停下來偷懶」的策略
-        """
-        # =====================================================================
-        # 步驟 1：計算每隻腿的當前相位
-        # =====================================================================
-        # 從關節角度計算相位（考慮方向乘數）
-        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
-        effective_pos = main_drive_pos * self._direction_multiplier   # 修正左右方向
+        mode_id = torch.full((self.num_envs,), 4, dtype=torch.long, device=self.device)  # OTHER
+        mode_id = torch.where(mode_fwd, torch.zeros_like(mode_id), mode_id)
+        mode_id = torch.where(mode_lat, torch.ones_like(mode_id), mode_id)
+        mode_id = torch.where(mode_diag, torch.full_like(mode_id, 2), mode_id)
+        mode_id = torch.where(mode_yaw, torch.full_like(mode_id, 3), mode_id)
         
-        # 將角度正規化到 [0, 2π] 範圍
-        leg_phase = torch.remainder(effective_pos, 2 * math.pi)  # [N, 6]
+        return mode_fwd, mode_lat, mode_diag, mode_yaw, mode_id
+    
+    def _mask_actions_by_mode(
+        self, mode_fwd: torch.Tensor, mode_lat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """依模式硬限制 action 通道（FWD 鎖 ABAD；LAT 鎖 main-drive）。"""
+        main_actions = self.actions[:, :6].clone()
+        abad_actions = self.actions[:, 6:12].clone()
         
-        # =====================================================================
-        # 步驟 2：判斷每隻腿是否在著地相位
-        # =====================================================================
-        # 著地相位範圍可能跨越 0°/360° 邊界
-        # 例如：stance_phase_start = -30° (-π/6), stance_phase_end = +30° (π/6)
-        # 需要特殊處理！
+        # Pure lateral: main-drive policy output disabled
+        main_actions = torch.where(mode_lat.unsqueeze(1), torch.zeros_like(main_actions), main_actions)
+        
+        # Forward: ABAD policy output disabled
+        if getattr(self.cfg, "lock_abad_in_forward", True):
+            abad_actions = torch.where(mode_fwd.unsqueeze(1), torch.zeros_like(abad_actions), abad_actions)
+        
+        self._masked_action_norm_main = torch.linalg.vector_norm(main_actions, dim=1)
+        self._masked_action_norm_abad = torch.linalg.vector_norm(abad_actions, dim=1)
+        
+        return main_actions, abad_actions
 
+    def _in_stance_phase(self, phase: torch.Tensor) -> torch.Tensor:
+        """判斷相位是否落在 stance 區間（處理跨 0 邊界）。"""
         if self.stance_phase_start < 0:
-            # 著地區間跨越 0° 邊界：例如 330° ~ 30° (即 -30° ~ +30°)
-            # 正規化 start 到 [0, 2π]
-            normalized_start = self.stance_phase_start + 2 * math.pi  # 如 330° (11π/6)
+            normalized_start = self.stance_phase_start + 2 * math.pi
+            return (phase >= normalized_start) | (phase < self.stance_phase_end)
+        return (phase >= self.stance_phase_start) & (phase < self.stance_phase_end)
 
-            # 腿相位在著地區間內的條件：
-            # phase >= normalized_start (如 >= 330°) 或 phase < stance_phase_end (如 < 30°)
-            in_stance_phase = (leg_phase >= normalized_start) | (leg_phase < self.stance_phase_end)
-        else:
-            # 著地區間不跨越邊界：正常比較
-            in_stance_phase = (leg_phase >= self.stance_phase_start) & (leg_phase < self.stance_phase_end)
+    @staticmethod
+    def _phase_circular_distance(phase_a: torch.Tensor, phase_b: float | torch.Tensor) -> torch.Tensor:
+        """圓周相位距離（範圍 [0, π]）。"""
+        return torch.abs(torch.atan2(torch.sin(phase_a - phase_b), torch.cos(phase_a - phase_b)))
 
-        # in_stance_phase: [N, 6] 布林張量
+    def _compute_forward_gait_prior_terms(
+        self,
+        leg_phase: torch.Tensor,
+        main_drive_vel: torch.Tensor,
+        mode_fwd: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Forward gait prior（僅 FWD mode）的五個子項。"""
+        mode_mask = mode_fwd.float()
+        leg_in_stance = self._in_stance_phase(leg_phase)
 
-        # 記錄相位狀態（用於獎勵計算）
-        self._current_leg_in_stance = in_stance_phase
+        phase_a = leg_phase[:, self._tripod_a_indices]
+        phase_b = leg_phase[:, self._tripod_b_indices]
+
+        # 1) Tripod 組內相位一致性
+        sin_a = torch.sin(phase_a).mean(dim=1)
+        cos_a = torch.cos(phase_a).mean(dim=1)
+        sin_b = torch.sin(phase_b).mean(dim=1)
+        cos_b = torch.cos(phase_b).mean(dim=1)
+        coherence_a = torch.sqrt(sin_a**2 + cos_a**2)
+        coherence_b = torch.sqrt(sin_b**2 + cos_b**2)
+        term_coherence = 0.5 * (coherence_a + coherence_b)
+
+        # 2) 兩組反相（相位差接近 π）
+        mean_phase_a = torch.atan2(sin_a, cos_a)
+        mean_phase_b = torch.atan2(sin_b, cos_b)
+        phase_diff = self._phase_circular_distance(mean_phase_a, mean_phase_b)
+        anti_sigma = max(float(getattr(self.cfg, "forward_antiphase_sigma", 0.35)), 1e-4)
+        term_antiphase = torch.exp(-0.5 * torch.square((phase_diff - math.pi) / anti_sigma))
+
+        # 3) Duty factor（65/35）對齊：用 phase-gating 的時間平均代理
+        stance_fraction_inst = leg_in_stance.float().mean(dim=1)
+        ema_alpha = float(getattr(self.cfg, "forward_duty_ema_alpha", 0.05))
+        ema_alpha = min(max(ema_alpha, 0.0), 1.0)
+        updated_ema = (1.0 - ema_alpha) * self._forward_stance_frac_ema + ema_alpha * stance_fraction_inst
+        self._forward_stance_frac_ema = torch.where(mode_fwd, updated_ema, self._forward_stance_frac_ema)
+        duty_target = float(getattr(self.cfg, "forward_duty_target", self.cfg.stance_duty_cycle))
+        duty_sigma = max(float(getattr(self.cfg, "forward_duty_sigma", 0.08)), 1e-4)
+        term_duty = torch.exp(-0.5 * torch.square((self._forward_stance_frac_ema - duty_target) / duty_sigma))
+
+        # 4) Stance 慢 / Swing 快 的角速度比例代理
+        signed_speed = torch.abs(main_drive_vel * self._direction_multiplier)
+        stance_mask = leg_in_stance.float()
+        swing_mask = (~leg_in_stance).float()
+        stance_speed = (signed_speed * stance_mask).sum(dim=1) / stance_mask.sum(dim=1).clamp(min=1.0)
+        swing_speed = (signed_speed * swing_mask).sum(dim=1) / swing_mask.sum(dim=1).clamp(min=1.0)
+        ratio_proxy = swing_speed / torch.clamp(stance_speed, min=1e-4)
+
+        stance_angle = max(float(getattr(self.cfg, "forward_stance_angle_deg", 60.0)), 1e-3)
+        swing_angle = max(float(getattr(self.cfg, "forward_swing_angle_deg", 300.0)), 1e-3)
+        duty_clamped = min(max(duty_target, 1e-3), 1.0 - 1e-3)
+        ratio_target = (swing_angle / (1.0 - duty_clamped)) / (stance_angle / duty_clamped)
+        ratio_sigma = max(float(getattr(self.cfg, "forward_velocity_ratio_sigma", 2.0)), 1e-4)
+        term_vel_ratio = torch.exp(-0.5 * torch.square((ratio_proxy - ratio_target) / ratio_sigma))
+
+        # 5) 轉換邊界附近重疊支撐：鼓勵 contact_count >= 4，但只在邊界附近
+        # ContactSensor 目前禁用，使用 phase-based stance_count 當 contact proxy。
+        contact_count = leg_in_stance.float().sum(dim=1)
+        self._contact_count = torch.where(mode_fwd, contact_count, self._contact_count)
+
+        start_phase = self.stance_phase_start + (2 * math.pi if self.stance_phase_start < 0 else 0.0)
+        end_phase = self.stance_phase_end
+        dist_a = torch.minimum(
+            self._phase_circular_distance(mean_phase_a, start_phase),
+            self._phase_circular_distance(mean_phase_a, end_phase),
+        )
+        dist_b = torch.minimum(
+            self._phase_circular_distance(mean_phase_b, start_phase),
+            self._phase_circular_distance(mean_phase_b, end_phase),
+        )
+        transition_dist = torch.minimum(dist_a, dist_b)
+        transition_window = max(float(getattr(self.cfg, "forward_transition_window", 0.35)), 1e-4)
+        transition_weight = torch.exp(-0.5 * torch.square(transition_dist / transition_window))
+        overlap_target = float(getattr(self.cfg, "forward_overlap_contact_target", 4.0))
+        overlap_scale = max(float(getattr(self.cfg, "forward_overlap_contact_scale", 0.5)), 1e-4)
+        overlap_quality = torch.sigmoid((contact_count - overlap_target) / overlap_scale)
+        term_overlap = transition_weight * overlap_quality
+
+        self._forward_vel_ratio_proxy = torch.where(mode_fwd, ratio_proxy, self._forward_vel_ratio_proxy)
+        self._forward_transition_weight = torch.where(mode_fwd, transition_weight, self._forward_transition_weight)
+
+        return {
+            "coherence": term_coherence * mode_mask,
+            "antiphase": term_antiphase * mode_mask,
+            "duty": term_duty * mode_mask,
+            "vel_ratio": term_vel_ratio * mode_mask,
+            "overlap": term_overlap * mode_mask,
+            "stance_count": contact_count * mode_mask,
+            "phase_diff": phase_diff * mode_mask,
+            "ratio_proxy": ratio_proxy * mode_mask,
+        }
+
+    def _apply_action(self) -> None:
+        """將策略輸出轉為關節控制（含 FWD/LAT/DIAG/YAW 模式 gating）。"""
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]
+        effective_pos = main_drive_pos * self._direction_multiplier
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)
         
-        # =====================================================================
-        # 步驟 3：根據相位選擇基礎速度
-        # =====================================================================
-        # 著地相位 → 很慢 (stance_velocity ≈ 0.94 rad/s ≈ 54°/s)
-        #           只轉一小段角度 (60°)，但花 65% 的時間
-        # 擺動相位 → 很快 (swing_velocity ≈ 9.42 rad/s ≈ 540°/s)
-        #           要轉大段角度 (300°)，只花 35% 的時間
+        # 命令模式解析
+        mode_fwd, mode_lat, mode_diag, mode_yaw, mode_id = self._resolve_command_modes()
+        self._mode_fwd = mode_fwd
+        self._mode_lat = mode_lat
+        self._mode_diag = mode_diag
+        self._mode_yaw = mode_yaw
+        self._mode_id = mode_id
+        self._is_pure_lateral = mode_lat
+        
+        # 先做 action gating（硬限制）
+        masked_drive_actions, masked_abad_actions = self._mask_actions_by_mode(mode_fwd, mode_lat)
+        
+        in_stance_phase = self._in_stance_phase(leg_phase)
+        self._current_leg_in_stance = in_stance_phase
+        self._contact_count = in_stance_phase.float().sum(dim=1)
+        
+        # 基礎速度：著地慢、擺動快
         base_velocity = torch.where(
             in_stance_phase,
-            torch.full_like(leg_phase, self.stance_velocity),   # 著地：很慢
-            torch.full_like(leg_phase, self.swing_velocity)     # 擺動：很快
-        )  # [N, 6]
-        
-        # =====================================================================
-        # 步驟 4：應用 AI 的速度調節因子
-        # =====================================================================
-        # AI 動作 [0:6] 範圍 [-1, 1]
-        # 轉換成速度乘數 [0.5, 1.5]，讓 AI 可以微調但不能停下來
-        drive_actions = self.actions[:, :6]
-        speed_scale = 1.0 + drive_actions * 0.5  # 範圍 [0.5, 1.5]
-        
-        # 計算目標速度
-        target_speed = base_velocity * speed_scale  # [N, 6]
-        
-        # =====================================================================
-        # 步驟 5：應用方向乘數（左右腿轉向相反）
-        # =====================================================================
-        # 右側腿（索引 0,1,2）乘以 -1 → 逆時針轉
-        # 左側腿（索引 3,4,5）乘以 +1 → 順時針轉
-        target_drive_vel = target_speed * self._direction_multiplier
-        
-        # 安全限制：防止速度過快
-        max_vel = self.swing_velocity * 1.5  # 允許最大 1.5 倍擺動速度
+            torch.full_like(leg_phase, self.stance_velocity),
+            torch.full_like(leg_phase, self.swing_velocity),
+        )
+
+        # FWD/DIAG：以 CPG 相位鎖定建立 forward bias（穩定 forward gait）
+        desired_phase = torch.remainder(
+            self.gait_phase.unsqueeze(1) + self.leg_phase_offsets.unsqueeze(0),
+            2 * math.pi,
+        )
+        desired_in_stance = self._in_stance_phase(desired_phase)
+        forward_base_velocity = torch.where(
+            desired_in_stance,
+            torch.full_like(desired_phase, self.stance_velocity),
+            torch.full_like(desired_phase, self.swing_velocity),
+        )
+        phase_error = torch.atan2(
+            torch.sin(leg_phase - desired_phase),
+            torch.cos(leg_phase - desired_phase),
+        )
+        phase_lock_gain = getattr(self.cfg, "forward_phase_lock_gain", 1.2)
+        phase_correction = torch.clamp(-phase_lock_gain * phase_error, min=-2.0, max=2.0)
+        forward_profile = torch.where(
+            (mode_fwd | mode_diag).unsqueeze(1),
+            forward_base_velocity + phase_correction,
+            torch.zeros_like(base_velocity),
+        )
+
+        cmd_vx = self.commands[:, 0]
+        cmd_wz = self.commands[:, 2]
+        vx_ref = max(float(getattr(self.cfg, "drive_bias_vx_ref", 0.45)), 1e-3)
+        wz_ref = max(float(getattr(self.cfg, "drive_bias_wz_ref", 1.00)), 1e-3)
+        vx_norm = torch.clamp(cmd_vx / vx_ref, min=-1.0, max=1.0)
+        wz_norm = torch.clamp(cmd_wz / wz_ref, min=-1.0, max=1.0)
+
+        # Main-drive signed mapping: target = command bias + residual(policy)
+        forward_bias_joint = forward_profile * self._direction_multiplier * vx_norm.unsqueeze(1)
+
+        # Yaw bias在「body-space」是左右反向，轉到 joint-space 後可允許反轉驅動。
+        yaw_body_pattern = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device=self.device).unsqueeze(0)
+        yaw_body_pattern = yaw_body_pattern * float(getattr(self.cfg, "yaw_body_pattern_sign", 1.0))
+        yaw_bias_body = yaw_body_pattern * (wz_norm.unsqueeze(1) * float(getattr(self.cfg, "yaw_drive_bias_scale", 4.5)))
+        yaw_bias_joint = yaw_bias_body * self._direction_multiplier
+
+        drive_vel_scale = float(getattr(self.cfg, "main_drive_vel_scale", 8.0))
+        residual_scale = float(getattr(self.cfg, "main_drive_residual_scale", 0.40))
+        drive_residual = masked_drive_actions * drive_vel_scale * residual_scale
+
+        target_drive_vel = forward_bias_joint + yaw_bias_joint + drive_residual
+        max_vel = max(self.swing_velocity * 1.5, drive_vel_scale * 1.5)
         target_drive_vel = torch.clamp(target_drive_vel, min=-max_vel, max=max_vel)
-        
-        # =====================================================================
-        # ★★★ 正左/正右側移時鎖住主驅動關節 ★★★
-        # =====================================================================
-        # 當命令是純側移（X 速度 ≈ 0，Y 速度 ≠ 0，旋轉 ≈ 0）時，
-        # 主驅動關節轉動會產生前進速度，這與目標衝突！
-        # 純側移應該只靠 ABAD 關節（腳往外擺）來推動。
-        #
-        # 重要：側移前要先把腳調回預設位置，確保六隻腳都接觸地面！
-        # 右側腿：45°，左側腿：-45°
-        #
-        # 判斷條件：
-        # - |cmd_x| < 0.05 (前後速度接近零)
-        # - |cmd_y| > 0.1  (有明顯的側移需求)
-        # - |cmd_yaw| < 0.1 (不旋轉)
-        
-        cmd_x = self.commands[:, 0]    # 前後速度指令
-        cmd_y = self.commands[:, 1]    # 左右速度指令
-        cmd_yaw = self.commands[:, 2]  # 旋轉速度指令
-        
-        # 判斷是否為純側移模式
-        is_pure_lateral = (
-            (torch.abs(cmd_x) < 0.05) &      # 前後速度接近零
-            (torch.abs(cmd_y) > 0.1) &       # 有側移需求
-            (torch.abs(cmd_yaw) < 0.1)       # 不旋轉
-        )  # [N]
-        
-        # =====================================================================
-        # ★★★ 側移步態控制邏輯 - 完全重寫版 ★★★
-        # =====================================================================
-        # 
-        # 核心設計理念（根據用戶反饋）：
-        # 
-        # 側移 ≠ 腿快速轉動 + 摩擦滑動（這是 reward exploit！）
-        # 側移 = 類似「側併步」的步態
-        # 
-        # 正確的側移動作：
-        # 1. 先讓主驅動回到初始位置（六腳著地）
-        # 2. 確認到位後，鎖住主驅動（腿保持在著地位置不轉）
-        # 3. 左右交替進行：
-        #    - 一側的腿踩穩地面，ABAD 內收（向身體內側推）
-        #    - 另一側的腿稍微抬起（可選），ABAD 外展（準備跨出）
-        # 4. 頻率要慢（約 0.25 Hz = 4秒一週期），一步一步來
-        # 
-        # AI 的控制權：
-        # - 主驅動：側移時 AI 完全沒有控制權（硬編碼鎖住速度=0）
-        # - ABAD：AI 有部分控制權，但受到相位引導
-        # =====================================================================
-        
-        lateral_mask = is_pure_lateral.unsqueeze(1).expand(-1, 6)  # [N, 6]
-        
-        # 保存側移狀態（用於診斷）
-        self._is_pure_lateral = is_pure_lateral
-        
-        # 診斷計數器
-        if not hasattr(self, '_lateral_debug_counter'):
-            self._lateral_debug_counter = 0
-        self._lateral_debug_counter += 1
-        
-        # 保存目標速度（用於獎勵計算和診斷）
+
+        # 保存診斷
+        self._base_velocity = (forward_bias_joint + yaw_bias_joint).clone()
         self._target_drive_vel = target_drive_vel.clone()
-        self._base_velocity = base_velocity.clone()
-        
-        # =====================================================================
-        # 初始化側移相關狀態
-        # =====================================================================
-        if not hasattr(self, '_lateral_gait_phase'):
-            self._lateral_gait_phase = torch.zeros(self.num_envs, device=self.device)
-            self._lateral_gait_freq = 0.25  # 0.25 Hz = 4 秒一個完整週期
-        
-        # 主驅動初始位置（側移時腿要回到的目標位置）
-        # 順序：[右前, 右中, 右後, 左前, 左中, 左後]
-        # 右側 45°，左側 -45°，確保六腳都向下著地
-        if not hasattr(self, '_main_drive_initial_pos'):
-            self._main_drive_initial_pos = torch.tensor(
-                [45.0, 45.0, 45.0, -45.0, -45.0, -45.0],
-                device=self.device
-            ) * math.pi / 180.0  # 轉換為弧度
-            self._main_drive_initial_pos = self._main_drive_initial_pos.unsqueeze(0)  # [1, 6]
-        
-        # 側移準備狀態追蹤（是否已到達初始位置）
-        if not hasattr(self, '_lateral_ready'):
-            self._lateral_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        
-        # 構建最終的速度目標
+
+        # LAT FSM: NORMAL(0) -> GO_TO_STAND(1) -> LATERAL_STEP(2)
         final_drive_vel = target_drive_vel.clone()
-        
-        if is_pure_lateral.any():
-            # ====== 讀取當前主驅動位置 ======
-            current_main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
-            
-            # ====== 計算與初始位置的誤差 ======
-            # 注意：角度是循環的，需要處理 wrap-around
-            pos_error = current_main_drive_pos - self._main_drive_initial_pos  # [N, 6]
-            # 將誤差限制在 [-π, π] 範圍內
+        dt_sim = self.cfg.sim.dt * self.cfg.decimation
+        require_stand = getattr(self.cfg, "require_stand_before_lateral", True)
+        lock_main_lateral = getattr(self.cfg, "lock_main_drive_in_lateral", True)
+        soft_lock_enable = getattr(self.cfg, "lateral_soft_lock_enable", True)
+        soft_lock_vel = float(getattr(self.cfg, "lateral_soft_lock_velocity", 0.8))
+        stand_timeout_s = float(getattr(self.cfg, "lateral_go_to_stand_timeout_s", 1.5))
+        timeout_cooldown_steps = int(getattr(self.cfg, "lateral_timeout_cooldown_steps", 80))
+
+        # 先衰減 timeout cooldown，離開側移模式時清零
+        self._lateral_timeout_cooldown = torch.where(
+            mode_lat,
+            torch.clamp(self._lateral_timeout_cooldown - 1, min=0),
+            torch.zeros_like(self._lateral_timeout_cooldown),
+        )
+        self._lateral_state_time = torch.where(
+            mode_lat,
+            self._lateral_state_time + dt_sim,
+            torch.zeros_like(self._lateral_state_time),
+        )
+
+        if mode_lat.any():
+            current_main_drive_pos = self.joint_pos[:, self._main_drive_indices]
+            pos_error = current_main_drive_pos - self._main_drive_initial_pos
             pos_error = torch.atan2(torch.sin(pos_error), torch.cos(pos_error))
-            pos_error_abs = torch.abs(pos_error)  # [N, 6]
-            
-            # ====== 判斷是否已到達初始位置 ======
-            # 所有腿的誤差都小於閾值才算準備好
-            pos_threshold = 0.15  # 約 8.6 度的容許誤差
-            all_legs_ready = (pos_error_abs.max(dim=1).values < pos_threshold)  # [N]
-            
-            # 更新準備狀態（一旦準備好就保持，直到離開側移模式）
-            self._lateral_ready = torch.where(
-                is_pure_lateral,
-                self._lateral_ready | all_legs_ready,  # 保持或更新
-                torch.zeros_like(self._lateral_ready)  # 離開側移模式時重置
+            pose_error = torch.abs(pos_error).max(dim=1).values
+            self._stand_pose_error = torch.where(mode_lat, pose_error, torch.zeros_like(self._stand_pose_error))
+
+            # ContactSensor 暫未可用：以「腿接近站姿」作為 grounded proxy
+            contact_pose_tol = getattr(self.cfg, "lateral_contact_pose_tol", 0.18)
+            contact_count = (torch.abs(pos_error) < contact_pose_tol).float().sum(dim=1)
+            self._contact_count = torch.where(mode_lat, contact_count, self._contact_count)
+
+            pos_threshold = getattr(self.cfg, "lateral_stand_pos_tol", 0.12)
+            min_contact_count = getattr(self.cfg, "lateral_min_contact_count", 6.0)
+            all_legs_ready = (pose_error < pos_threshold) & (contact_count >= min_contact_count)
+
+            # state 進出邏輯
+            state = torch.where(mode_lat, self._lateral_fsm_state, torch.zeros_like(self._lateral_fsm_state))
+            enter_go = mode_lat & (state == 0) & require_stand & (self._lateral_timeout_cooldown == 0)
+            state = torch.where(enter_go, torch.ones_like(state), state)
+            self._lateral_state_time = torch.where(enter_go, torch.zeros_like(self._lateral_state_time), self._lateral_state_time)
+
+            if not require_stand:
+                state = torch.where(mode_lat, torch.full_like(state, 2), state)
+
+            go_mask = mode_lat & (state == 1)
+            go_success = go_mask & all_legs_ready
+            go_timeout = go_mask & (self._lateral_state_time > stand_timeout_s)
+            state = torch.where(go_success, torch.full_like(state, 2), state)
+            state = torch.where(go_timeout, torch.zeros_like(state), state)
+            self._lateral_state_time = torch.where(
+                go_success | go_timeout,
+                torch.zeros_like(self._lateral_state_time),
+                self._lateral_state_time,
             )
-            
-            # ====== 準備階段：驅動腿回到初始位置 ======
-            # 對於還沒準備好的環境，使用位置控制讓腿回到初始位置
-            preparing_mask = is_pure_lateral & (~self._lateral_ready)  # [N]
-            
+            self._lateral_timeout_cooldown = torch.where(
+                go_timeout,
+                torch.full_like(self._lateral_timeout_cooldown, timeout_cooldown_steps),
+                self._lateral_timeout_cooldown,
+            )
+
+            self._lateral_fsm_state = state
+            preparing_mask = mode_lat & (state == 1)
+            ready_mask = mode_lat & (state == 2)
+            self._is_lateral_preparing = preparing_mask
+            self._is_lateral_mode = ready_mask
+            self._lateral_ready = ready_mask
+
+            # GO_TO_STAND：先把主驅動拉回站姿
             if preparing_mask.any():
-                # 計算回到初始位置所需的速度
-                # 使用 P 控制器：速度 ∝ 位置誤差
-                p_gain = 3.0  # 比例增益
-                return_vel = -pos_error * p_gain  # [N, 6]
-                # 限制最大速度，避免過快
-                return_vel = torch.clamp(return_vel, min=-2.0, max=2.0)
-                
-                # 準備中的環境使用回歸速度
-                preparing_mask_expanded = preparing_mask.unsqueeze(1).expand(-1, 6)
-                final_drive_vel = torch.where(
-                    preparing_mask_expanded,
-                    return_vel,
-                    final_drive_vel
+                return_vel = torch.clamp(-3.0 * pos_error, min=-2.0, max=2.0)
+                final_drive_vel = torch.where(preparing_mask.unsqueeze(1), return_vel, final_drive_vel)
+
+            # LATERAL_STEP：主驅動 hard-lock 或 soft-lock（避免完全凍結）
+            phase_inc = 2 * math.pi * self._lateral_gait_freq * dt_sim
+            next_lateral_phase = (self._lateral_gait_phase + phase_inc) % (2 * math.pi)
+            self._lateral_gait_phase = torch.where(ready_mask, next_lateral_phase, torch.zeros_like(self._lateral_gait_phase))
+            if lock_main_lateral and ready_mask.any():
+                if soft_lock_enable:
+                    phase_with_offsets = self._lateral_gait_phase.unsqueeze(1) + self.leg_phase_offsets.unsqueeze(0)
+                    clearance_wave = torch.sin(phase_with_offsets)
+                    soft_drive = soft_lock_vel * clearance_wave * self._direction_multiplier
+                    final_drive_vel = torch.where(ready_mask.unsqueeze(1), soft_drive, final_drive_vel)
+                else:
+                    final_drive_vel = torch.where(ready_mask.unsqueeze(1), torch.zeros_like(final_drive_vel), final_drive_vel)
+
+            if not hasattr(self, "_lateral_debug_counter"):
+                self._lateral_debug_counter = 0
+            self._lateral_debug_counter += 1
+            if self._lateral_debug_counter % 500 == 1 and mode_lat[0]:
+                state_name = ["NORMAL", "GO_TO_STAND", "LATERAL_STEP"][int(self._lateral_fsm_state[0].item())]
+                print(
+                    f"[側移模式] state={state_name}, t={self._lateral_state_time[0].item():.2f}s, "
+                    f"pose_err={pose_error[0].item():.3f}, contact_count={contact_count[0].item():.0f}"
                 )
-            
-            # ====== 側移執行階段：鎖住主驅動 ======
-            # 對於已準備好的環境，主驅動完全停止
-            ready_mask = is_pure_lateral & self._lateral_ready  # [N]
-            
-            if ready_mask.any():
-                # 更新側移步態相位
-                dt_sim = self.cfg.sim.dt * self.cfg.decimation
-                phase_increment = 2 * math.pi * self._lateral_gait_freq * dt_sim
-                
-                self._lateral_gait_phase = torch.where(
-                    ready_mask,
-                    (self._lateral_gait_phase + phase_increment) % (2 * math.pi),
-                    self._lateral_gait_phase
-                )
-                
-                # ★★★ 核心：側移時主驅動完全停止（速度=0）！★★★
-                ready_mask_expanded = ready_mask.unsqueeze(1).expand(-1, 6)
-                final_drive_vel = torch.where(
-                    ready_mask_expanded,
-                    torch.zeros(self.num_envs, 6, device=self.device),
-                    final_drive_vel
-                )
-            
-            # 記錄側移狀態
-            self._is_lateral_mode = ready_mask.clone()  # 只有準備好的才算真正側移模式
-            self._lateral_phase_for_abad = self._lateral_gait_phase.clone()
-            
-            # 診斷
-            if self._lateral_debug_counter % 500 == 1 and is_pure_lateral[0]:
-                max_err = pos_error_abs[0].max().item() * 180 / math.pi
-                ready_status = "✓ 已就位" if self._lateral_ready[0] else f"準備中 (誤差: {max_err:.1f}°)"
-                print(f"[側移模式] {ready_status}, 相位: {self._lateral_gait_phase[0]:.2f}")
         else:
-            self._is_lateral_mode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            # 離開側移模式時重置準備狀態
-            self._lateral_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        
-        # 發送速度指令
+            self._is_lateral_mode[:] = False
+            self._is_lateral_preparing[:] = False
+            self._lateral_ready[:] = False
+            self._lateral_gait_phase[:] = 0.0
+            self._lateral_fsm_state[:] = 0
+            self._lateral_state_time[:] = 0.0
+            self._lateral_timeout_cooldown[:] = 0
+            self._stand_pose_error[:] = 0.0
+
+        # Domain randomization：作用在控制層的 proxy
+        final_drive_vel = final_drive_vel * self._main_strength_scale.unsqueeze(1)
+        if not self._mass_physical_randomized:
+            final_drive_vel = final_drive_vel / torch.clamp(self._mass_scale.unsqueeze(1), min=0.2)
+        if not self._friction_physical_randomized:
+            final_drive_vel = final_drive_vel * self._friction_scale.unsqueeze(1)
+        final_drive_vel = torch.clamp(final_drive_vel, min=-max_vel, max=max_vel)
+        self._target_drive_vel = final_drive_vel.clone()
+
         self.robot.set_joint_velocity_target(final_drive_vel, joint_ids=self._main_drive_indices)
         
-        # =====================================================================
-        # ABAD 關節控制 - 根據模式調整
-        # =====================================================================
-        abad_actions = self.actions[:, 6:12]
+        # ABAD：FWD 鎖住，LAT 準備期歸零，LAT 執行期交替並步，DIAG/YAW 全開
+        abad_actions = masked_abad_actions
         base_abad_pos = abad_actions * self.cfg.abad_pos_scale
+        target_abad_pos = base_abad_pos.clone()
         
-        # ★★★ 側移時的 ABAD 特殊處理 ★★★
-        # 只有在準備好後才執行側移 ABAD 動作
-        if hasattr(self, '_is_lateral_mode') and self._is_lateral_mode.any():
-            ready_mask = self._is_lateral_mode  # 只處理已準備好的環境
-            lateral_mask_for_abad = ready_mask.unsqueeze(1).expand(-1, 6)
-            
-            lateral_dir = torch.sign(cmd_y)  # +1 = 向左，-1 = 向右
+        if getattr(self.cfg, "lock_abad_in_forward", True):
+            target_abad_pos = torch.where(
+                mode_fwd.unsqueeze(1),
+                torch.zeros_like(target_abad_pos),
+                target_abad_pos,
+            )
+        
+        if self._is_lateral_preparing.any():
+            target_abad_pos = torch.where(
+                self._is_lateral_preparing.unsqueeze(1),
+                torch.zeros_like(target_abad_pos),
+                target_abad_pos,
+            )
+        
+        if self._is_lateral_mode.any():
+            lateral_dir = torch.sign(self.commands[:, 1])
             phase_sin = torch.sin(self._lateral_gait_phase)
-            abad_amplitude = 0.3  # 約 17 度
-            
-            # 計算側移的理想 ABAD 位置
+            abad_amplitude = 0.30
             right_abad_target = -lateral_dir * phase_sin * abad_amplitude
             left_abad_target = lateral_dir * phase_sin * abad_amplitude
-            
-            lateral_abad_pos = torch.stack([
-                right_abad_target, right_abad_target, right_abad_target,
-                left_abad_target, left_abad_target, left_abad_target
-            ], dim=1)
-            
-            # 混合：60% 硬編碼 + 40% AI
-            blended_abad = 0.6 * lateral_abad_pos + 0.4 * base_abad_pos
-            
-            target_abad_pos = torch.where(lateral_mask_for_abad, blended_abad, base_abad_pos)
-        else:
-            target_abad_pos = base_abad_pos
+            lateral_abad_pos = torch.stack(
+                [
+                    right_abad_target, right_abad_target, right_abad_target,
+                    left_abad_target, left_abad_target, left_abad_target,
+                ],
+                dim=1,
+            )
+            blended_abad = 0.7 * lateral_abad_pos + 0.3 * base_abad_pos
+            target_abad_pos = torch.where(
+                self._is_lateral_mode.unsqueeze(1),
+                blended_abad,
+                target_abad_pos,
+            )
         
+        target_abad_pos = target_abad_pos * self._abad_strength_scale.unsqueeze(1)
         target_abad_pos = torch.clamp(target_abad_pos, min=-0.5, max=0.5)
         self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
         
-        # =====================================================================
-        # 避震關節控制：保持固定位置
-        # =====================================================================
         self.robot.set_joint_position_target(
-            self._damper_initial_pos.expand(self.num_envs, -1), 
-            joint_ids=self._damper_indices
+            self._damper_initial_pos.expand(self.num_envs, -1),
+            joint_ids=self._damper_indices,
         )
 
     def _get_observations(self) -> dict:
@@ -1101,12 +1648,8 @@ class RedrhexEnv(DirectRLEnv):
             self.last_actions,                              # (12)
         ], dim=-1)
 
-        # 【添加觀測噪音】
-        # 為什麼要加噪音？模擬真實世界感測器的誤差！
-        # 這樣訓練出來的 AI 更能適應真實環境的不完美感測。
-        if self.cfg.add_noise:
-            noise = torch.randn_like(obs) * 0.01 * self.cfg.noise_level
-            obs = obs + noise
+        # Domain randomization：觀測噪音 + latency
+        obs = self._apply_observation_domain_randomization(obs)
 
         # 【數值保護：防止異常值】
         # nan = 「不是數字」（計算錯誤時會出現）
@@ -1147,39 +1690,26 @@ class RedrhexEnv(DirectRLEnv):
         dt = self.cfg.sim.dt * self.cfg.decimation
         self.gait_phase = (self.gait_phase + 2 * math.pi * self.cfg.base_gait_frequency * dt) % (2 * math.pi)
         
-        # 更新速度命令（定期切換方向）
+        # 更新速度命令 / curriculum stage
         self._update_commands()
 
+        # Episode 內隨機推擠
+        self._maybe_apply_random_pushes()
+
     def _compute_simplified_rewards(self) -> torch.Tensor:
-        """
-        =================================================================
-        【獎勵系統 v4.0】命令感知獎勵（修正側走/旋轉/斜走退化）
-        =================================================================
-        
-        核心改動：
-        1. 修正 cmd=0 時 sign 錯誤導致「總是獎勵直走」的問題
-        2. 以「命令方向投影」計算線速度進度，避免側移/斜走被直走偷分
-        3. 新增模式專屬 shaping（純側移 / 純旋轉 / 斜走）
-        4. 新增未命令軸抑制與卡住懲罰，減少 reward hacking
-        
-        獎勵結構：
-        1. forward_progress    - 沿命令方向的速度投影（核心）
-        2. velocity_tracking   - vx/vy/wz 精準追蹤
-        3. mode_specialization - 側走/旋轉/斜走專屬強化
-        4. axis_suppression    - 未命令軸速度抑制
-        5. height_maintain     - 站立高度
-        6. leg_moving          - 防消極（但需與命令一致）
-        7. stall_penalty       - 有命令卻不動
-        8. action_smooth/fall  - 平滑與倒地
-        """
+        """簡化獎勵：命令追蹤 + 模式專屬 + forward tripod 結構。"""
         total_reward = torch.zeros(self.num_envs, device=self.device)
         
-        # v4.0: 命令感知權重
-        scales = getattr(self.cfg, 'v2_reward_scales', {
+        scales = getattr(self.cfg, "v2_reward_scales", {
             "forward_progress": 5.0,
             "velocity_tracking": 4.0,
             "mode_specialization": 2.5,
             "axis_suppression": 1.5,
+            "forward_prior_coherence": 1.0,
+            "forward_prior_antiphase": 1.0,
+            "forward_prior_duty": 0.9,
+            "forward_prior_vel_ratio": 0.9,
+            "forward_prior_overlap": 0.7,
             "height_maintain": 0.8,
             "leg_moving": 0.5,
             "stall_penalty": -2.0,
@@ -1189,9 +1719,9 @@ class RedrhexEnv(DirectRLEnv):
             "yaw_tracking_sigma": 0.35,
         })
         
-        # =================================================================
-        # 狀態讀取
-        # =================================================================
+        mode_fwd, mode_lat, mode_diag, mode_yaw, _ = self._resolve_command_modes()
+        
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]
         main_drive_vel = self.joint_vel[:, self._main_drive_indices]
         
         cmd_vx = self.commands[:, 0]
@@ -1206,16 +1736,21 @@ class RedrhexEnv(DirectRLEnv):
         actual_lin = self.base_lin_vel[:, :2]
         cmd_lin_speed = torch.linalg.norm(cmd_lin, dim=1)
         actual_lin_speed = torch.linalg.norm(actual_lin, dim=1)
-        
         base_height = self.robot.data.root_pos_w[:, 2]
+        gravity_body = self.projected_gravity
+        roll = torch.atan2(gravity_body[:, 1], -gravity_body[:, 2])
+        pitch = torch.atan2(-gravity_body[:, 0], torch.sqrt(gravity_body[:, 1] ** 2 + gravity_body[:, 2] ** 2))
+        roll_rms = torch.abs(roll)
+        pitch_rms = torch.abs(pitch)
+        roll_pitch_rms = torch.sqrt(0.5 * (roll**2 + pitch**2))
+        yaw_slip_proxy = actual_lin_speed / torch.clamp(torch.abs(actual_wz), min=0.05)
+        self._roll_rms = roll_rms
+        self._pitch_rms = pitch_rms
+        self._yaw_slip_proxy = yaw_slip_proxy
         
-        # =================================================================
-        # R1: 命令方向進度（核心）
-        # =================================================================
-        lin_eps = 0.05
-        yaw_eps = 0.08
+        lin_eps = getattr(self.cfg, "mode_lin_zero_thresh", 0.08)
+        yaw_eps = getattr(self.cfg, "mode_yaw_zero_thresh", 0.10)
         
-        # 只有有命令時才給 sign；cmd≈0 時 sign=0，避免偷分
         cmd_vx_sign = torch.where(torch.abs(cmd_vx) > lin_eps, torch.sign(cmd_vx), torch.zeros_like(cmd_vx))
         cmd_vy_sign = torch.where(torch.abs(cmd_vy) > lin_eps, torch.sign(cmd_vy), torch.zeros_like(cmd_vy))
         cmd_wz_sign = torch.where(torch.abs(cmd_wz) > yaw_eps, torch.sign(cmd_wz), torch.zeros_like(cmd_wz))
@@ -1223,14 +1758,11 @@ class RedrhexEnv(DirectRLEnv):
         safe_cmd_lin_speed = torch.clamp(cmd_lin_speed, min=1e-5)
         cmd_dir = cmd_lin / safe_cmd_lin_speed.unsqueeze(1)
         
-        # 沿命令方向的速度投影（正值=往正確方向）
+        # R1: 沿命令方向的移動進度
         lin_progress = torch.sum(actual_lin * cmd_dir, dim=1)
         lin_progress = torch.where(cmd_lin_speed > lin_eps, lin_progress, torch.zeros_like(lin_progress))
-        
-        # 橫向偏移（與命令方向垂直）
         cross_track_error = torch.abs(actual_lin[:, 0] * cmd_dir[:, 1] - actual_lin[:, 1] * cmd_dir[:, 0])
         cross_track_error = torch.where(cmd_lin_speed > lin_eps, cross_track_error, torch.zeros_like(cross_track_error))
-        
         backward_slip = torch.clamp(-lin_progress, min=0.0)
         rew_forward = (
             lin_progress
@@ -1239,9 +1771,7 @@ class RedrhexEnv(DirectRLEnv):
         ) * scales.get("forward_progress", 5.0)
         total_reward += rew_forward
         
-        # =================================================================
-        # R2: 速度追蹤（各軸）
-        # =================================================================
+        # R2: 速度追蹤
         lin_sigma = max(scales.get("lin_tracking_sigma", 0.30), 1e-3)
         yaw_sigma = max(scales.get("yaw_tracking_sigma", 0.35), 1e-3)
         
@@ -1253,57 +1783,98 @@ class RedrhexEnv(DirectRLEnv):
         tracking_y = torch.exp(-torch.square(vel_error_y / lin_sigma))
         tracking_wz = torch.exp(-torch.square(wz_error / yaw_sigma))
         
-        # 線速度追蹤採命令幅值加權，斜向時同時追蹤 vx/vy
         lin_weight_x = torch.abs(cmd_vx) / (safe_cmd_lin_speed + 1e-5)
         lin_weight_y = torch.abs(cmd_vy) / (safe_cmd_lin_speed + 1e-5)
         lin_tracking_reward = tracking_x * lin_weight_x + tracking_y * lin_weight_y
-        
-        # 沒有線速度命令時，改獎勵「線速度接近 0」
         lin_stop_reward = torch.exp(-torch.square(actual_lin_speed / lin_sigma))
         lin_tracking_reward = torch.where(cmd_lin_speed > lin_eps, lin_tracking_reward, lin_stop_reward)
         
-        # 沒有旋轉命令時，改獎勵「角速度接近 0」
         yaw_stop_reward = torch.exp(-torch.square(actual_wz / yaw_sigma))
         yaw_tracking_reward = torch.where(torch.abs(cmd_wz) > yaw_eps, tracking_wz, yaw_stop_reward)
         
         rew_tracking = (lin_tracking_reward + yaw_tracking_reward) * scales.get("velocity_tracking", 4.0)
         total_reward += rew_tracking
         
-        # =================================================================
-        # R3: 模式專屬 shaping（純側移 / 純旋轉 / 斜向）
-        # =================================================================
-        has_rotation_cmd = torch.abs(cmd_wz) > 0.15
-        pure_rotation = has_rotation_cmd & (cmd_lin_speed < 0.08)
-        pure_lateral = (torch.abs(cmd_vy) > 0.12) & (torch.abs(cmd_vx) < 0.08) & (~has_rotation_cmd)
-        diagonal_mode = (torch.abs(cmd_vx) > 0.10) & (torch.abs(cmd_vy) > 0.10) & (~has_rotation_cmd)
-        
+        # R3: 模式專屬 shaping（LAT / YAW / DIAG）
         signed_vx = cmd_vx_sign * actual_vx
         signed_vy = cmd_vy_sign * actual_vy
         signed_wz = cmd_wz_sign * actual_wz
         
         rew_mode = torch.zeros(self.num_envs, device=self.device)
-        
-        # 純側移：獎勵 vy 正確方向，懲罰 vx 漂移
         lateral_mode_reward = signed_vy - 0.8 * torch.abs(actual_vx) - 0.3 * torch.abs(actual_wz)
-        rew_mode += torch.where(pure_lateral, lateral_mode_reward, torch.zeros_like(lateral_mode_reward))
+        rew_mode += torch.where(mode_lat, lateral_mode_reward, torch.zeros_like(lateral_mode_reward))
         
-        # 純旋轉：獎勵 yaw 正確方向，懲罰平移
         rotation_mode_reward = signed_wz - 0.7 * actual_lin_speed
-        rew_mode += torch.where(pure_rotation, rotation_mode_reward, torch.zeros_like(rotation_mode_reward))
+        rew_mode += torch.where(mode_yaw, rotation_mode_reward, torch.zeros_like(rotation_mode_reward))
         
-        # 斜向：同時要有前向和側向分量，且比例接近命令
         cmd_ratio = torch.abs(cmd_vy) / (torch.abs(cmd_vx) + 1e-5)
         actual_ratio = torch.abs(actual_vy) / (torch.abs(actual_vx) + 1e-5)
         ratio_match = torch.exp(-2.0 * torch.abs(actual_ratio - cmd_ratio))
         diagonal_reward = torch.clamp(lin_progress, min=0.0) * ratio_match - 0.5 * torch.clamp(-signed_vy, min=0.0)
-        rew_mode += torch.where(diagonal_mode, diagonal_reward, torch.zeros_like(diagonal_reward))
+        rew_mode += torch.where(mode_diag, diagonal_reward, torch.zeros_like(diagonal_reward))
         
         rew_mode = rew_mode * scales.get("mode_specialization", 2.5)
         total_reward += rew_mode
+
+        # R3.1: 側移 soft-lock（主驅動越大懲罰越重，避免 lateral 靠主驅動亂轉）
+        lateral_drive_mag = torch.abs(main_drive_vel).mean(dim=1)
+        rew_lateral_soft_lock = torch.where(
+            mode_lat,
+            -lateral_drive_mag * scales.get("lateral_drive_soft_penalty", 1.5),
+            torch.zeros_like(lateral_drive_mag),
+        )
+        total_reward += rew_lateral_soft_lock
+
+        # R3.2: Yaw 專項（追蹤 + 穩定 + 防作弊抬升）
+        yaw_track_bonus = torch.where(
+            mode_yaw,
+            tracking_wz * scales.get("yaw_mode_track_bonus", 2.0),
+            torch.zeros_like(tracking_wz),
+        )
+        yaw_stability_penalty = torch.where(
+            mode_yaw,
+            (
+                roll_pitch_rms * scales.get("yaw_roll_pitch_penalty", 3.0)
+                + torch.abs(base_height - 0.15) * scales.get("yaw_height_penalty", 1.5)
+                + yaw_slip_proxy * scales.get("yaw_slip_penalty", 1.0)
+            ),
+            torch.zeros_like(roll_pitch_rms),
+        )
+        yaw_tilt_thresh = scales.get("yaw_cheat_tilt_thresh", 0.30)
+        yaw_min_wz = scales.get("yaw_cheat_min_wz", 0.40)
+        yaw_cheat_penalty = torch.where(
+            mode_yaw,
+            torch.relu(roll_pitch_rms - yaw_tilt_thresh)
+            * torch.relu(yaw_min_wz - torch.abs(actual_wz))
+            * scales.get("yaw_cheat_penalty", 4.0),
+            torch.zeros_like(roll_pitch_rms),
+        )
+        rew_yaw_track = yaw_track_bonus
+        rew_yaw_stability = -yaw_stability_penalty
+        rew_yaw_cheat = -yaw_cheat_penalty
+        total_reward += rew_yaw_track + rew_yaw_stability + rew_yaw_cheat
         
-        # =================================================================
-        # R4: 未命令軸抑制（避免命令=0 軸亂動）
-        # =================================================================
+        # R3.5: Forward gait prior（僅 FWD mode）
+        effective_pos = main_drive_pos * self._direction_multiplier
+        leg_phase = torch.remainder(effective_pos, 2 * math.pi)
+        forward_terms = self._compute_forward_gait_prior_terms(leg_phase, main_drive_vel, mode_fwd)
+        rew_forward_prior_coherence = forward_terms["coherence"] * scales.get("forward_prior_coherence", 1.0)
+        rew_forward_prior_antiphase = forward_terms["antiphase"] * scales.get("forward_prior_antiphase", 1.0)
+        rew_forward_prior_duty = forward_terms["duty"] * scales.get("forward_prior_duty", 0.9)
+        rew_forward_prior_vel_ratio = forward_terms["vel_ratio"] * scales.get("forward_prior_vel_ratio", 0.9)
+        rew_forward_prior_overlap = forward_terms["overlap"] * scales.get("forward_prior_overlap", 0.7)
+        rew_forward_gait = (
+            rew_forward_prior_coherence
+            + rew_forward_prior_antiphase
+            + rew_forward_prior_duty
+            + rew_forward_prior_vel_ratio
+            + rew_forward_prior_overlap
+        )
+        total_reward += rew_forward_gait
+        stance_count = forward_terms["stance_count"]
+        phase_diff = forward_terms["phase_diff"]
+        
+        # R4: 未命令軸抑制
         no_cmd_axis_penalty = (
             torch.where(torch.abs(cmd_vx) <= lin_eps, torch.abs(actual_vx), torch.zeros_like(actual_vx))
             + torch.where(torch.abs(cmd_vy) <= lin_eps, torch.abs(actual_vy), torch.zeros_like(actual_vy))
@@ -1312,26 +1883,17 @@ class RedrhexEnv(DirectRLEnv):
         rew_axis_suppression = -no_cmd_axis_penalty * scales.get("axis_suppression", 1.5)
         total_reward += rew_axis_suppression
         
-        # =================================================================
-        # R5: 站立高度獎勵
-        # =================================================================
+        # R5: 高度
         min_height = 0.05
         target_height = 0.15
-        
-        height_ratio = torch.clamp(
-            (base_height - min_height) / (target_height - min_height),
-            min=0.0, max=1.0
-        )
+        height_ratio = torch.clamp((base_height - min_height) / (target_height - min_height), min=0.0, max=1.0)
         rew_height = height_ratio * scales.get("height_maintain", 0.8)
         total_reward += rew_height
         
-        # =================================================================
-        # R6: 腿轉動獎勵（防消極，但要求與命令一致）
-        # =================================================================
+        # R6: 腿轉動（防消極）
         leg_speed = torch.abs(main_drive_vel * self._direction_multiplier).mean(dim=1)
-        cmd_activity = torch.sqrt(cmd_vx**2 + cmd_vy**2 + 0.25 * cmd_wz**2)
+        cmd_activity = torch.sqrt(cmd_vx ** 2 + cmd_vy ** 2 + 0.25 * cmd_wz ** 2)
         cmd_gate = torch.clamp(cmd_activity / 0.15, min=0.0, max=1.0)
-        
         motion_alignment = torch.where(
             cmd_lin_speed > lin_eps,
             torch.clamp(lin_progress, min=0.0, max=1.0),
@@ -1345,9 +1907,7 @@ class RedrhexEnv(DirectRLEnv):
         )
         total_reward += rew_leg_moving
         
-        # =================================================================
-        # R7: 有命令卻卡住懲罰
-        # =================================================================
+        # R7: 有命令卻不動
         target_activity = cmd_lin_speed + 0.5 * torch.abs(cmd_wz)
         achieved_activity = torch.where(
             cmd_lin_speed > lin_eps,
@@ -1358,44 +1918,43 @@ class RedrhexEnv(DirectRLEnv):
         rew_stall = is_stalled.float() * scales.get("stall_penalty", -2.0)
         total_reward += rew_stall
         
-        # =================================================================
-        # R8: 動作平滑懲罰
-        # =================================================================
+        # R8: 平滑懲罰
         action_rate = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         rew_smooth = action_rate * scales.get("action_smooth", -0.01)
         total_reward += rew_smooth
         
-        # =================================================================
-        # R9: 摔倒懲罰
-        # =================================================================
-        gravity_alignment = torch.sum(
-            self.projected_gravity * self.reference_projected_gravity, dim=1
-        )
+        # R9: 倒地懲罰
+        gravity_alignment = torch.sum(self.projected_gravity * self.reference_projected_gravity, dim=1)
         body_tilt = 1.0 - gravity_alignment
-        
         is_fallen = (base_height < 0.03) | (body_tilt > 1.5)
         rew_fall = is_fallen.float() * scales.get("fall", -8.0)
         total_reward += rew_fall
         
-        # 保存用於終止條件
         self._body_contact = is_fallen
         self._body_tilt = body_tilt
         
-        # NaN 保護
         total_reward = torch.nan_to_num(total_reward, nan=0.0, posinf=20.0, neginf=-20.0)
         
-        # TensorBoard 記錄
         self.episode_sums["rew_forward"] = self.episode_sums.get("rew_forward", torch.zeros_like(total_reward)) + rew_forward
         self.episode_sums["rew_tracking"] = self.episode_sums.get("rew_tracking", torch.zeros_like(total_reward)) + rew_tracking
         self.episode_sums["rew_mode"] = self.episode_sums.get("rew_mode", torch.zeros_like(total_reward)) + rew_mode
+        self.episode_sums["rew_forward_gait"] = self.episode_sums.get("rew_forward_gait", torch.zeros_like(total_reward)) + rew_forward_gait
+        self.episode_sums["rew_forward_prior_coherence"] = self.episode_sums.get("rew_forward_prior_coherence", torch.zeros_like(total_reward)) + rew_forward_prior_coherence
+        self.episode_sums["rew_forward_prior_antiphase"] = self.episode_sums.get("rew_forward_prior_antiphase", torch.zeros_like(total_reward)) + rew_forward_prior_antiphase
+        self.episode_sums["rew_forward_prior_duty"] = self.episode_sums.get("rew_forward_prior_duty", torch.zeros_like(total_reward)) + rew_forward_prior_duty
+        self.episode_sums["rew_forward_prior_vel_ratio"] = self.episode_sums.get("rew_forward_prior_vel_ratio", torch.zeros_like(total_reward)) + rew_forward_prior_vel_ratio
+        self.episode_sums["rew_forward_prior_overlap"] = self.episode_sums.get("rew_forward_prior_overlap", torch.zeros_like(total_reward)) + rew_forward_prior_overlap
         self.episode_sums["rew_axis_suppression"] = self.episode_sums.get("rew_axis_suppression", torch.zeros_like(total_reward)) + rew_axis_suppression
+        self.episode_sums["rew_lateral_soft_lock"] = self.episode_sums.get("rew_lateral_soft_lock", torch.zeros_like(total_reward)) + rew_lateral_soft_lock
+        self.episode_sums["rew_yaw_track"] = self.episode_sums.get("rew_yaw_track", torch.zeros_like(total_reward)) + rew_yaw_track
+        self.episode_sums["rew_yaw_stability"] = self.episode_sums.get("rew_yaw_stability", torch.zeros_like(total_reward)) + rew_yaw_stability
+        self.episode_sums["rew_yaw_cheat"] = self.episode_sums.get("rew_yaw_cheat", torch.zeros_like(total_reward)) + rew_yaw_cheat
         self.episode_sums["rew_height"] = self.episode_sums.get("rew_height", torch.zeros_like(total_reward)) + rew_height
         self.episode_sums["rew_leg_moving"] = self.episode_sums.get("rew_leg_moving", torch.zeros_like(total_reward)) + rew_leg_moving
         self.episode_sums["rew_stall"] = self.episode_sums.get("rew_stall", torch.zeros_like(total_reward)) + rew_stall
         self.episode_sums["rew_smooth"] = self.episode_sums.get("rew_smooth", torch.zeros_like(total_reward)) + rew_smooth
         self.episode_sums["rew_fall"] = self.episode_sums.get("rew_fall", torch.zeros_like(total_reward)) + rew_fall
         
-        # 診斷
         self.episode_sums["diag_forward_vel"] = self.episode_sums.get("diag_forward_vel", torch.zeros_like(total_reward)) + actual_vx
         self.episode_sums["diag_lateral_vel"] = self.episode_sums.get("diag_lateral_vel", torch.zeros_like(total_reward)) + actual_vy
         self.episode_sums["diag_cmd_vx"] = self.episode_sums.get("diag_cmd_vx", torch.zeros_like(total_reward)) + cmd_vx
@@ -1408,9 +1967,31 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_base_height"] = self.episode_sums.get("diag_base_height", torch.zeros_like(total_reward)) + base_height
         self.episode_sums["diag_tilt"] = self.episode_sums.get("diag_tilt", torch.zeros_like(total_reward)) + body_tilt
         self.episode_sums["diag_leg_speed"] = self.episode_sums.get("diag_leg_speed", torch.zeros_like(total_reward)) + leg_speed
+        self.episode_sums["diag_stance_count"] = self.episode_sums.get("diag_stance_count", torch.zeros_like(total_reward)) + stance_count
+        self.episode_sums["diag_phase_diff"] = self.episode_sums.get("diag_phase_diff", torch.zeros_like(total_reward)) + phase_diff
+        self.episode_sums["diag_forward_duty_ema"] = self.episode_sums.get("diag_forward_duty_ema", torch.zeros_like(total_reward)) + self._forward_stance_frac_ema
+        self.episode_sums["diag_forward_vel_ratio_proxy"] = self.episode_sums.get("diag_forward_vel_ratio_proxy", torch.zeros_like(total_reward)) + self._forward_vel_ratio_proxy
+        self.episode_sums["diag_forward_transition_weight"] = self.episode_sums.get("diag_forward_transition_weight", torch.zeros_like(total_reward)) + self._forward_transition_weight
+        self.episode_sums["diag_mode_id"] = self.episode_sums.get("diag_mode_id", torch.zeros_like(total_reward)) + self._mode_id.float()
+        self.episode_sums["diag_contact_count"] = self.episode_sums.get("diag_contact_count", torch.zeros_like(total_reward)) + self._contact_count
+        self.episode_sums["diag_pose_error"] = self.episode_sums.get("diag_pose_error", torch.zeros_like(total_reward)) + self._stand_pose_error
+        self.episode_sums["diag_lateral_fsm_state"] = self.episode_sums.get("diag_lateral_fsm_state", torch.zeros_like(total_reward)) + self._lateral_fsm_state.float()
+        self.episode_sums["diag_lateral_time_in_state"] = self.episode_sums.get("diag_lateral_time_in_state", torch.zeros_like(total_reward)) + self._lateral_state_time
+        self.episode_sums["diag_masked_action_norm_main"] = self.episode_sums.get("diag_masked_action_norm_main", torch.zeros_like(total_reward)) + self._masked_action_norm_main
+        self.episode_sums["diag_masked_action_norm_abad"] = self.episode_sums.get("diag_masked_action_norm_abad", torch.zeros_like(total_reward)) + self._masked_action_norm_abad
+        self.episode_sums["diag_roll_rms"] = self.episode_sums.get("diag_roll_rms", torch.zeros_like(total_reward)) + self._roll_rms
+        self.episode_sums["diag_pitch_rms"] = self.episode_sums.get("diag_pitch_rms", torch.zeros_like(total_reward)) + self._pitch_rms
+        self.episode_sums["diag_yaw_slip_proxy"] = self.episode_sums.get("diag_yaw_slip_proxy", torch.zeros_like(total_reward)) + self._yaw_slip_proxy
+        self.episode_sums["diag_curriculum_stage"] = self.episode_sums.get("diag_curriculum_stage", torch.zeros_like(total_reward)) + self._dr_stage_id
+        self.episode_sums["diag_dr_mass_scale"] = self.episode_sums.get("diag_dr_mass_scale", torch.zeros_like(total_reward)) + self._mass_scale
+        self.episode_sums["diag_dr_friction_scale"] = self.episode_sums.get("diag_dr_friction_scale", torch.zeros_like(total_reward)) + self._friction_scale
+        self.episode_sums["diag_dr_main_strength"] = self.episode_sums.get("diag_dr_main_strength", torch.zeros_like(total_reward)) + self._main_strength_scale
+        self.episode_sums["diag_dr_abad_strength"] = self.episode_sums.get("diag_dr_abad_strength", torch.zeros_like(total_reward)) + self._abad_strength_scale
+        self.episode_sums["diag_obs_latency_steps"] = self.episode_sums.get("diag_obs_latency_steps", torch.zeros_like(total_reward)) + self._obs_latency_steps.float()
+        self.episode_sums["diag_push_events"] = self.episode_sums.get("diag_push_events", torch.zeros_like(total_reward)) + self._push_events_step
+        self.episode_sums["diag_terrain_level"] = self.episode_sums.get("diag_terrain_level", torch.zeros_like(total_reward)) + self._terrain_level
         
         self.last_main_drive_vel = main_drive_vel.clone()
-        
         return total_reward
 
 
@@ -2421,6 +3002,19 @@ class RedrhexEnv(DirectRLEnv):
         
         self.episode_sums["diag_stance_velocity"] += stance_vel_sum / stance_count
         self.episode_sums["diag_swing_velocity"] += swing_vel_sum / swing_count
+        self.episode_sums["diag_mode_id"] += self._mode_id.float()
+        self.episode_sums["diag_contact_count"] += self._contact_count
+        self.episode_sums["diag_pose_error"] += self._stand_pose_error
+        self.episode_sums["diag_masked_action_norm_main"] += self._masked_action_norm_main
+        self.episode_sums["diag_masked_action_norm_abad"] += self._masked_action_norm_abad
+        self.episode_sums["diag_curriculum_stage"] += self._dr_stage_id
+        self.episode_sums["diag_dr_mass_scale"] += self._mass_scale
+        self.episode_sums["diag_dr_friction_scale"] += self._friction_scale
+        self.episode_sums["diag_dr_main_strength"] += self._main_strength_scale
+        self.episode_sums["diag_dr_abad_strength"] += self._abad_strength_scale
+        self.episode_sums["diag_obs_latency_steps"] += self._obs_latency_steps.float()
+        self.episode_sums["diag_push_events"] += self._push_events_step
+        self.episode_sums["diag_terrain_level"] += self._terrain_level
         
         self.last_main_drive_vel = main_drive_vel.clone()
 
@@ -2536,6 +3130,9 @@ class RedrhexEnv(DirectRLEnv):
         """
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES  # 如果沒指定，就重置全部
+
+        # super() 會重置 episode_length_buf，因此先保存「本回合實際步數」供 logging 正規化
+        episode_len_before_reset = self.episode_length_buf[env_ids].clone().float().clamp(min=1.0)
         super()._reset_idx(env_ids)  # 呼叫父類別的重置方法
 
         num_reset = len(env_ids)
@@ -2601,9 +3198,43 @@ class RedrhexEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self.last_actions[env_ids] = 0.0
         self.last_main_drive_vel[env_ids] = 0.0  # 從零開始
+        
+        # 重置模式與側移 state machine 狀態
+        self._mode_id[env_ids] = 4
+        self._mode_fwd[env_ids] = False
+        self._mode_lat[env_ids] = False
+        self._mode_diag[env_ids] = False
+        self._mode_yaw[env_ids] = False
+        self._is_lateral_mode[env_ids] = False
+        self._is_lateral_preparing[env_ids] = False
+        self._lateral_ready[env_ids] = False
+        self._lateral_gait_phase[env_ids] = 0.0
+        self._lateral_fsm_state[env_ids] = 0
+        self._lateral_state_time[env_ids] = 0.0
+        self._lateral_timeout_cooldown[env_ids] = 0
+        self._contact_count[env_ids] = 0.0
+        self._stand_pose_error[env_ids] = 0.0
+        self._roll_rms[env_ids] = 0.0
+        self._pitch_rms[env_ids] = 0.0
+        self._yaw_slip_proxy[env_ids] = 0.0
+        self._forward_stance_frac_ema[env_ids] = float(
+            getattr(self.cfg, "forward_duty_target", self.cfg.stance_duty_cycle)
+        )
+        self._forward_vel_ratio_proxy[env_ids] = 0.0
+        self._forward_transition_weight[env_ids] = 0.0
+        self._push_events[env_ids] = 0.0
+        self._push_events_step[env_ids] = 0.0
+        self._obs_history[env_ids] = 0.0
 
         # 隨機化步態相位
         self.gait_phase[env_ids] = sample_uniform(0, 2 * math.pi, (num_reset,), device=self.device)
+
+        # 更新 stage 並套用課程配置
+        stage = self._update_curriculum_stage()
+        self._apply_terrain_curriculum_if_available(stage)
+
+        # 每回合重採樣 DR 參數
+        self._sample_domain_randomization(env_ids)
 
         # 採樣新的速度命令
         # ★★★ 外部控制時不重新採樣命令，保持用戶設置的命令 ★★★
@@ -2614,13 +3245,16 @@ class RedrhexEnv(DirectRLEnv):
         # 計算並記錄 episode 獎勵總和到 extras["log"]
         # RSL-RL 的 Logger 會自動從 extras["log"] 讀取並寫入 TensorBoard
         extras = dict()
+        mean_episode_len_steps = torch.mean(episode_len_before_reset).item()
         
         for key in self.episode_sums.keys():
             # 計算被重置環境的平均 episode 獎勵
             episodic_sum_avg = torch.mean(self.episode_sums[key][env_ids])
-            # 使用 "/" 前綴讓 RSL-RL 直接記錄到 TensorBoard
-            # 格式: "Episode_Reward/rew_forward_vel" -> TensorBoard 會顯示在 Episode_Reward 分類下
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            # 診斷項目改用「每步平均」比較可解讀；獎勵項沿用每秒正規化
+            if key.startswith("diag_"):
+                extras["Episode_Reward/" + key] = episodic_sum_avg / max(mean_episode_len_steps, 1.0)
+            else:
+                extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
         
         # 初始化 extras["log"] 並更新
         self.extras["log"] = dict()

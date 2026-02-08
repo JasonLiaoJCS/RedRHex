@@ -695,22 +695,21 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # 機器人必須學會追蹤這些命令（往前走、往左走、轉彎等）
     
     # =========================================================================
-    # ★★★ v3.0 訓練策略：先學會直走！★★★
+    # ★★★ 多技能訓練策略（command-conditioned）★★★
     # =========================================================================
-    # Phase 1: 只給前進命令（禁止側移和旋轉）
-    # Phase 2: 成功後再啟用側移和旋轉
+    # Stage 1: Forward-only
+    # Stage 2: Lateral-only
+    # Stage 3: Yaw-only
+    # Stage 4: Mixed (Forward/Lateral/Diagonal/Yaw)
     
     # 前後速度範圍（公尺/秒）
-    # ★★★ 固定在正值，先學會向前走 ★★★
-    lin_vel_x_range = [0.2, 0.4]  # v3.0: 只給小範圍前進
+    lin_vel_x_range = [0.2, 0.45]
     
     # 側向速度範圍（公尺/秒）
-    # ★★★ Phase 1: 禁用側移 ★★★
-    lin_vel_y_range = [0.0, 0.0]  # v3.0: 禁用
+    lin_vel_y_range = [-0.35, 0.35]
     
     # 旋轉速度範圍（弧度/秒）
-    # ★★★ Phase 1: 禁用旋轉 ★★★
-    ang_vel_z_range = [0.0, 0.0]  # v3.0: 禁用
+    ang_vel_z_range = [-1.0, 1.0]
     
     # 命令重新採樣時間（秒）
     command_resample_time = 6.0
@@ -737,7 +736,93 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     
     # 方向名稱（用於調試輸出，方便查看機器人正在追蹤什麼命令）
     direction_names = ["前", "左", "右", "左前", "右前", "逆時針旋轉", "順時針旋轉"]
+
+    # -------------------------------------------------------------------------
+    # Curriculum（Hydra 可直接覆寫：stage=1/2/3/4）
+    # -------------------------------------------------------------------------
+    curriculum_enable = True
+    stage = 4  # 1:Forward-only, 2:Lateral-only, 3:Yaw-only, 4:Mixed-skills
+    curriculum_auto_progress = False
+    curriculum_stage1_steps = 400_000
+    curriculum_stage2_steps = 1_000_000
+    curriculum_stage3_steps = 1_600_000
+    curriculum_stage_scales = [0.25, 0.50, 0.75, 1.00]
+
+    # Stage 專屬命令分佈
+    stage1_use_discrete_directions = False
+    stage1_discrete_directions = [[0.4, 0.0, 0.0]]
+    stage1_forward_vx_range = [0.20, 0.45]
+
+    stage2_use_discrete_directions = False
+    stage2_discrete_directions = [[0.0, 0.30, 0.0], [0.0, -0.30, 0.0]]
+    stage2_lateral_vy_abs_range = [0.20, 0.40]
+
+    # Stage3: Yaw-only
+    stage3_use_discrete_directions = True
+    stage3_discrete_directions = [[0.0, 0.0, 0.8], [0.0, 0.0, -0.8]]
+    stage3_yaw_wz_abs_range = [0.45, 1.00]
+
+    # Stage4: Mixed skills（可覆寫為 False 改用連續範圍）
+    stage4_use_discrete_directions = True
+    stage4_discrete_directions = discrete_directions
+    stage4_mode_probabilities = [0.30, 0.25, 0.20, 0.25]  # [FWD, LAT, DIAG, YAW]
+
+    # 若設 True，環境會依 command_resample_time 週期重採樣命令
+    command_resample_on_timer = False
     
+    # -------------------------------------------------------------------------
+    # Command 模式判斷閾值（FWD / LAT / DIAG / YAW）
+    # -------------------------------------------------------------------------
+    mode_lin_zero_thresh = 0.08
+    mode_yaw_zero_thresh = 0.10
+    mode_forward_min_vx = 0.10
+    mode_lateral_min_vy = 0.12
+    mode_diagonal_min = 0.10
+    mode_yaw_min_wz = 0.15
+    
+    # -------------------------------------------------------------------------
+    # 動作 gating（硬限制）
+    # -------------------------------------------------------------------------
+    lock_abad_in_forward = True
+    lock_main_drive_in_lateral = True
+    lateral_soft_lock_enable = True
+    lateral_soft_lock_velocity = 0.8
+    require_stand_before_lateral = True
+    lateral_stand_pos_tol = 0.12
+    lateral_contact_pose_tol = 0.18
+    lateral_min_contact_count = 6.0
+    lateral_go_to_stand_timeout_s = 1.5
+    lateral_timeout_cooldown_steps = 80
+    
+    # Forward tripod 相位鎖定（讓步態更接近 alternating tripod）
+    forward_phase_lock_gain = 1.2
+    forward_drive_action_scale = 0.35
+
+    # Main-drive 映射（bias + residual）
+    main_drive_residual_scale = 0.40
+    drive_bias_vx_ref = 0.45
+    drive_bias_wz_ref = 1.00
+    yaw_drive_bias_scale = 4.5
+    yaw_body_pattern_sign = 1.0
+
+    # -------------------------------------------------------------------------
+    # Forward gait prior（reward shaping 專用）
+    # -------------------------------------------------------------------------
+    # 目標規格：stance 65% / swing 35%，角度配比 60°/300°
+    forward_duty_target = 0.65
+    forward_duty_ema_alpha = 0.05
+    forward_duty_sigma = 0.08
+
+    forward_stance_angle_deg = 60.0
+    forward_swing_angle_deg = 300.0
+    forward_antiphase_sigma = 0.35
+    forward_velocity_ratio_sigma = 2.0
+
+    # 僅在相位切換附近（transition）鼓勵 >=4 腳接觸
+    forward_transition_window = 0.35
+    forward_overlap_contact_target = 4.0
+    forward_overlap_contact_scale = 0.5
+
     # -------------------------------------------------------------------------
     # 調試視覺化設定
     # -------------------------------------------------------------------------
@@ -1217,30 +1302,51 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # - 如果在各種不同的廚房練習 → 到哪都能做菜
     
     # -------------------------------------------------------------------------
-    # 質量隨機化
+    # Domain randomization 主開關
     # -------------------------------------------------------------------------
-    randomize_mass = True        # 啟用質量隨機化
-    mass_range = [0.9, 1.1]      # 質量變化範圍：原始質量的 90% ~ 110%
+    domain_randomization_enable = True
+
+    # 質量/摩擦隨機化（優先嘗試物理層；不支援時自動退回控制層 proxy）
+    dr_try_physical_material_randomization = False
+    dr_randomize_mass = True
+    dr_mass_range = [0.90, 1.10]
+    dr_randomize_friction = True
+    dr_friction_range = [0.50, 1.25]
+
+    # 致動器強度隨機化（直接作用於控制目標）
+    dr_randomize_actuator_strength = True
+    dr_main_actuator_strength_range = [0.85, 1.15]
+    dr_abad_actuator_strength_range = [0.85, 1.15]
+
+    # 觀測延遲與噪音
+    dr_obs_latency_enable = True
+    dr_obs_latency_steps_range = [0, 2]
+    dr_obs_noise_enable = True
+    dr_obs_noise_bias_enable = False
+
+    # 隨機推擠（episode 內）
+    dr_push_enable = True
+    dr_push_interval_s = 12.0
+    dr_push_probability = 0.5
+    dr_push_max_vel_xy = 0.6
+    dr_push_max_vel_z = 0.0
+
+    # 地形課程（若 terrain generator 可用，隨 stage 遞進）
+    terrain_curriculum_enable = True
+    terrain_curriculum_levels = [0.0, 0.3, 0.6, 1.0]  # flat -> mild -> medium -> rough
 
     # -------------------------------------------------------------------------
-    # 摩擦力隨機化
+    # 舊版參數別名（向後相容）
     # -------------------------------------------------------------------------
-    randomize_friction = True    # 啟用摩擦力隨機化
-    friction_range = [0.5, 1.25] # 摩擦係數範圍：0.5 倍 ~ 1.25 倍
-
-    # -------------------------------------------------------------------------
-    # 關節摩擦隨機化
-    # -------------------------------------------------------------------------
-    randomize_joint_friction = True   # 啟用關節摩擦隨機化
-    joint_friction_range = [0.0, 0.05] # 關節摩擦範圍
-
-    # -------------------------------------------------------------------------
-    # 隨機推擠(尚未實現)
-    # -------------------------------------------------------------------------
-    # 偶爾給機器人一個推力，測試它的穩定性
-    push_robots = True           # 啟用隨機推擠
-    push_interval_s = 15.0       # 每 15 秒推一次
-    max_push_vel_xy = 0.5        # 最大推擠速度（公尺/秒）
+    randomize_mass = dr_randomize_mass
+    mass_range = dr_mass_range
+    randomize_friction = dr_randomize_friction
+    friction_range = dr_friction_range
+    randomize_joint_friction = False
+    joint_friction_range = [0.0, 0.05]
+    push_robots = dr_push_enable
+    push_interval_s = dr_push_interval_s
+    max_push_vel_xy = dr_push_max_vel_xy
 
     # =========================================================================
     # 【觀測噪音】模擬真實感測器的誤差
@@ -1301,7 +1407,15 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "velocity_tracking": 4.0,     # vx/vy/wz 追蹤精度
         "mode_specialization": 2.5,   # 側移/旋轉/斜向專屬 shaping
         "axis_suppression": 1.5,      # 未命令軸速度抑制（防止直走偷分）
+        "lateral_drive_soft_penalty": 1.5,  # 側移時主驅動軟鎖（越小越好）
         
+        # Forward gait prior（只在 FWD mode 生效）
+        "forward_prior_coherence": 1.2,   # Tripod A/B 組內相位一致
+        "forward_prior_antiphase": 1.2,   # A 與 B 相位差接近 π
+        "forward_prior_duty": 0.9,        # duty factor 接近 0.65
+        "forward_prior_vel_ratio": 0.9,   # stance 慢 / swing 快速度比
+        "forward_prior_overlap": 0.7,     # 相位切換附近鼓勵 >=4 腳支撐
+
         # 穩定與探索
         "height_maintain": 0.8,       # 維持站立高度
         "leg_moving": 0.5,            # 防消極（需與命令一致）
@@ -1310,6 +1424,15 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "stall_penalty": -2.0,        # 有命令卻幾乎不動
         "action_smooth": -0.01,       # 動作平滑
         "fall": -8.0,                 # 摔倒
+
+        # Yaw 穩定專項
+        "yaw_mode_track_bonus": 2.0,      # 額外鼓勵旋轉追蹤
+        "yaw_roll_pitch_penalty": 3.0,    # 旋轉時抑制 roll/pitch
+        "yaw_height_penalty": 1.5,        # 旋轉時抑制機身抬升/下沉
+        "yaw_slip_penalty": 1.0,          # 旋轉時抑制平移滑移
+        "yaw_cheat_penalty": 4.0,         # 抑制「抬機身但不轉」作弊
+        "yaw_cheat_min_wz": 0.4,          # 低於此角速度視為未達旋轉目標
+        "yaw_cheat_tilt_thresh": 0.30,    # 超過此傾斜開始視為作弊傾向
         
         # 追蹤曲線寬度（越小越嚴格）
         "lin_tracking_sigma": 0.30,   # 線速度追蹤容忍
