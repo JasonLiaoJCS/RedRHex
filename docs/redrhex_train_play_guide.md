@@ -197,6 +197,22 @@ bash scripts/rsl_rl/train_stage_pipeline.sh \
   --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
 ```
 
+如果中途中斷（例如 Stage1 已完成），可直接從下一段接跑：
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_a \
+  --start_stage 2 \
+  --num_envs 4096 \
+  --resume_policy_only 1 \
+  --reset_action_std 0.8 \
+  --s2 8000 --s3 9000 --s4 10000 --s5 12000
+```
+
+說明：
+- `--start_stage 2` 會自動抓 `overnight_a_stage1` 最新 checkpoint 作為起點。
+- pipeline 現在即使系統沒有 `rg`，也會自動 fallback 用 `grep` 解析健康指標，不會再因為缺少 `rg` 中斷。
+
 跑完會輸出 `FINAL_CKPT`，並寫 log 到：
 
 ```text

@@ -22,6 +22,7 @@ STAGE2_ITERS="${STAGE2_ITERS:-8000}"
 STAGE3_ITERS="${STAGE3_ITERS:-9000}"
 STAGE4_ITERS="${STAGE4_ITERS:-10000}"
 STAGE5_ITERS="${STAGE5_ITERS:-12000}"
+START_STAGE="${START_STAGE:-1}"
 
 # Stage handoff behavior (recommended for stability between different command distributions)
 RESUME_POLICY_ONLY="${RESUME_POLICY_ONLY:-1}"
@@ -34,6 +35,10 @@ if ! "$PYTHON_BIN" -c "import isaaclab" >/dev/null 2>&1; then
     echo "[WARN] '$PYTHON_BIN' cannot import isaaclab. Falling back to: $FALLBACK_PY"
     PYTHON_BIN="$FALLBACK_PY"
   fi
+fi
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "[WARN] 'rg' not found. Using grep fallback for pipeline log parsing."
 fi
 
 # Stability gate: fail fast if a stage is clearly unstable.
@@ -72,6 +77,7 @@ Options:
   --s3 <iters>            Stage3 max_iterations
   --s4 <iters>            Stage4 max_iterations
   --s5 <iters>            Stage5 max_iterations
+  --start_stage <1..5>    Start pipeline from this stage (default: 1)
   --resume_policy_only <0|1>
                            Resume stage handoff with policy-only load (default: 1)
   --reset_action_std <v>  Action std reset value when policy-only resume is enabled (default: 0.8)
@@ -103,6 +109,7 @@ while [[ $# -gt 0 ]]; do
     --s3) STAGE3_ITERS="$2"; shift 2 ;;
     --s4) STAGE4_ITERS="$2"; shift 2 ;;
     --s5) STAGE5_ITERS="$2"; shift 2 ;;
+    --start_stage) START_STAGE="$2"; shift 2 ;;
     --resume_policy_only) RESUME_POLICY_ONLY="$2"; shift 2 ;;
     --reset_action_std) RESET_ACTION_STD="$2"; shift 2 ;;
     --stability_gate) STABILITY_GATE="$2"; shift 2 ;;
@@ -126,6 +133,7 @@ echo "[INFO] Pipeline log: $PIPELINE_LOG"
 echo "[INFO] RUN_TAG: $RUN_TAG" | tee -a "$PIPELINE_LOG"
 echo "[INFO] TASK: $TASK, NUM_ENVS: $NUM_ENVS" | tee -a "$PIPELINE_LOG"
 echo "[INFO] ITERS: s1=$STAGE1_ITERS s2=$STAGE2_ITERS s3=$STAGE3_ITERS s4=$STAGE4_ITERS s5=$STAGE5_ITERS" | tee -a "$PIPELINE_LOG"
+echo "[INFO] START_STAGE: $START_STAGE" | tee -a "$PIPELINE_LOG"
 echo "[INFO] PRECHECK: gui=$PRECHECK_GUI stage=$PRECHECK_STAGE envs=$PRECHECK_ENVS iters=$PRECHECK_ITERS" | tee -a "$PIPELINE_LOG"
 echo "[INFO] STABILITY_GATE: $STABILITY_GATE" | tee -a "$PIPELINE_LOG"
 echo "[INFO] HANDOFF: resume_policy_only=$RESUME_POLICY_ONLY reset_action_std=$RESET_ACTION_STD" | tee -a "$PIPELINE_LOG"
@@ -142,6 +150,16 @@ latest_run_by_suffix() {
 latest_ckpt_in_run() {
   local run_dir="$1"
   ls -v "$run_dir"/model_*.pt 2>/dev/null | tail -1 || true
+}
+
+find_last_line() {
+  local needle="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg --no-messages -F "$needle" "$file" | tail -1 || true
+  else
+    grep -F "$needle" "$file" | tail -1 || true
+  fi
 }
 
 stage_min_ep_len() {
@@ -168,6 +186,18 @@ stage_max_terminated() {
   esac
 }
 
+stage_iters() {
+  local stage="$1"
+  case "$stage" in
+    1) echo "$STAGE1_ITERS" ;;
+    2) echo "$STAGE2_ITERS" ;;
+    3) echo "$STAGE3_ITERS" ;;
+    4) echo "$STAGE4_ITERS" ;;
+    5) echo "$STAGE5_ITERS" ;;
+    *) echo "0" ;;
+  esac
+}
+
 validate_stage_health() {
   local stage="$1"
   local stage_log="$2"
@@ -182,27 +212,41 @@ validate_stage_health() {
   max_term="$(stage_max_terminated "$stage")"
 
   local ep_line term_line ep_len term_cnt
-  ep_line="$(rg "Mean episode length:" "$stage_log" | tail -1 || true)"
-  term_line="$(rg "Episode_Termination/terminated:" "$stage_log" | tail -1 || true)"
+  ep_line="$(find_last_line "Mean episode length:" "$stage_log")"
+  term_line="$(find_last_line "Episode_Termination/terminated:" "$stage_log")"
 
-  if [[ -z "$ep_line" || -z "$term_line" ]]; then
+  if [[ -z "$ep_line" && -z "$term_line" ]]; then
     echo "[ERROR] Stage ${stage} health gate: missing metrics in $stage_log" | tee -a "$PIPELINE_LOG"
     exit 1
   fi
 
-  ep_len="$(echo "$ep_line" | sed -E 's/.*Mean episode length:[[:space:]]*([0-9.]+).*/\1/')"
-  term_cnt="$(echo "$term_line" | sed -E 's/.*Episode_Termination\/terminated:[[:space:]]*([0-9.]+).*/\1/')"
+  ep_len=""
+  term_cnt=""
+  if [[ -n "$ep_line" ]]; then
+    ep_len="$(echo "$ep_line" | sed -E 's/.*Mean episode length:[[:space:]]*([0-9.]+).*/\1/')"
+  else
+    echo "[WARN] Stage ${stage} health: missing 'Mean episode length' in $stage_log. Skipping this check." | tee -a "$PIPELINE_LOG"
+  fi
+  if [[ -n "$term_line" ]]; then
+    term_cnt="$(echo "$term_line" | sed -E 's/.*Episode_Termination\/terminated:[[:space:]]*([0-9.]+).*/\1/')"
+  else
+    echo "[WARN] Stage ${stage} health: missing 'Episode_Termination/terminated' in $stage_log. Skipping this check." | tee -a "$PIPELINE_LOG"
+  fi
 
-  echo "[INFO] Stage ${stage} health: mean_episode_length=${ep_len}, terminated=${term_cnt}" | tee -a "$PIPELINE_LOG"
+  echo "[INFO] Stage ${stage} health: mean_episode_length=${ep_len:-N/A}, terminated=${term_cnt:-N/A}" | tee -a "$PIPELINE_LOG"
   echo "[INFO] Stage ${stage} thresholds: min_episode_length=${min_ep}, max_terminated=${max_term}" | tee -a "$PIPELINE_LOG"
 
-  if ! awk -v x="$ep_len" -v y="$min_ep" 'BEGIN{exit !(x+0 >= y+0)}'; then
-    echo "[ERROR] Stage ${stage} unstable: mean_episode_length=${ep_len} < ${min_ep}" | tee -a "$PIPELINE_LOG"
-    exit 1
+  if [[ -n "$ep_len" ]]; then
+    if ! awk -v x="$ep_len" -v y="$min_ep" 'BEGIN{exit !(x+0 >= y+0)}'; then
+      echo "[ERROR] Stage ${stage} unstable: mean_episode_length=${ep_len} < ${min_ep}" | tee -a "$PIPELINE_LOG"
+      exit 1
+    fi
   fi
-  if ! awk -v x="$term_cnt" -v y="$max_term" 'BEGIN{exit !(x+0 <= y+0)}'; then
-    echo "[ERROR] Stage ${stage} unstable: terminated=${term_cnt} > ${max_term}" | tee -a "$PIPELINE_LOG"
-    exit 1
+  if [[ -n "$term_cnt" ]]; then
+    if ! awk -v x="$term_cnt" -v y="$max_term" 'BEGIN{exit !(x+0 <= y+0)}'; then
+      echo "[ERROR] Stage ${stage} unstable: terminated=${term_cnt} > ${max_term}" | tee -a "$PIPELINE_LOG"
+      exit 1
+    fi
   fi
 
   echo "[INFO] Stage ${stage} health gate PASS." | tee -a "$PIPELINE_LOG"
@@ -304,12 +348,40 @@ run_stage() {
   echo "[INFO] Stage ${stage} done: RUN=${LAST_RUN}, CKPT=${LAST_CKPT}" | tee -a "$PIPELINE_LOG"
 }
 
-run_precheck
-run_stage 1 "$STAGE1_ITERS"
-run_stage 2 "$STAGE2_ITERS" "$LAST_RUN" "$LAST_CKPT"
-run_stage 3 "$STAGE3_ITERS" "$LAST_RUN" "$LAST_CKPT"
-run_stage 4 "$STAGE4_ITERS" "$LAST_RUN" "$LAST_CKPT"
-run_stage 5 "$STAGE5_ITERS" "$LAST_RUN" "$LAST_CKPT"
+if ! [[ "$START_STAGE" =~ ^[1-5]$ ]]; then
+  echo "[ERROR] --start_stage must be an integer in [1,5], got: $START_STAGE" | tee -a "$PIPELINE_LOG"
+  exit 1
+fi
+
+if [[ "$START_STAGE" -eq 1 ]]; then
+  run_precheck
+else
+  local_prev_stage=$((START_STAGE - 1))
+  local_prev_suffix="${RUN_TAG}_stage${local_prev_stage}"
+  local_prev_run_dir="$(latest_run_by_suffix "$local_prev_suffix")"
+  if [[ -z "$local_prev_run_dir" ]]; then
+    echo "[ERROR] Cannot resume from stage ${START_STAGE}: previous stage run not found for suffix '${local_prev_suffix}'" | tee -a "$PIPELINE_LOG"
+    exit 1
+  fi
+  local_prev_ckpt_abs="$(latest_ckpt_in_run "$local_prev_run_dir")"
+  if [[ -z "$local_prev_ckpt_abs" ]]; then
+    echo "[ERROR] Cannot resume from stage ${START_STAGE}: no checkpoint found in ${local_prev_run_dir}" | tee -a "$PIPELINE_LOG"
+    exit 1
+  fi
+  LAST_RUN="$(basename "$local_prev_run_dir")"
+  LAST_CKPT="$(basename "$local_prev_ckpt_abs")"
+  LAST_CKPT_ABS="$local_prev_ckpt_abs"
+  echo "[INFO] Resuming pipeline from stage ${START_STAGE} using ${LAST_CKPT_ABS}" | tee -a "$PIPELINE_LOG"
+fi
+
+for stage in $(seq "$START_STAGE" 5); do
+  iters="$(stage_iters "$stage")"
+  if [[ "$stage" -eq 1 ]]; then
+    run_stage "$stage" "$iters"
+  else
+    run_stage "$stage" "$iters" "$LAST_RUN" "$LAST_CKPT"
+  fi
+done
 
 echo "" | tee -a "$PIPELINE_LOG"
 echo "[DONE] 5-stage pipeline complete." | tee -a "$PIPELINE_LOG"

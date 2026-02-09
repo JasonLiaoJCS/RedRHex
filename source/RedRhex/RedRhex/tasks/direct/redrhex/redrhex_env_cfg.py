@@ -753,8 +753,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # Stage 專屬命令分佈
     stage1_use_discrete_directions = False
     stage1_discrete_directions = [[0.4, 0.0, 0.0]]
-    # Stage1 先降低命令難度，避免「一開始就高速前衝」導致大量早死
-    stage1_forward_vx_range = [0.14, 0.34]
+    # Stage1 回到穩定版可用的前進速度範圍
+    stage1_forward_vx_range = [0.20, 0.45]
 
     stage2_use_discrete_directions = False
     stage2_discrete_directions = [[0.0, 0.40, 0.0], [0.0, -0.40, 0.0]]
@@ -858,9 +858,10 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # Stage 穩定配置（1..5 對應 Stage1..Stage5）
     # 目標：每個 stage 都先保命、再追性能，避免「出生即死 / 抽搐」
     # -------------------------------------------------------------------------
-    stage_drive_vel_scale = [5.2, 4.2, 5.6, 4.6, 6.2]
-    stage_main_drive_residual_scale = [0.18, 0.10, 0.18, 0.15, 0.24]
-    stage_forward_bias_scale = [0.34, 0.22, 0.32, 0.24, 0.40]
+    # Stage1: 前進穩定優先（強 bias，較低 residual）
+    stage_drive_vel_scale = [8.0, 4.8, 6.2, 5.2, 6.8]
+    stage_main_drive_residual_scale = [0.10, 0.12, 0.18, 0.16, 0.22]
+    stage_forward_bias_scale = [1.00, 0.30, 0.50, 0.30, 0.55]
     stage_yaw_drive_bias_scale = [1.2, 1.0, 1.7, 2.2, 2.4]
     stage_yaw_safe_min_scale = [0.18, 0.18, 0.22, 0.18, 0.22]
     stage_yaw_hard_brake_tilt = [0.58, 0.58, 0.52, 0.44, 0.48]
@@ -876,7 +877,8 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     stage_yaw_abad_stance_bias = [0.06, 0.08, 0.10, 0.16, 0.13]
     stage_yaw_abad_policy_blend = [0.85, 0.80, 0.72, 0.58, 0.62]
     stage_abad_pos_limit = [0.48, 0.62, 0.58, 0.56, 0.62]
-    stage_action_warmup_steps = [140, 180, 150, 200, 160]
+    # Stage1 暖機不宜過長，避免有效控制長時間被壓小
+    stage_action_warmup_steps = [30, 120, 100, 140, 120]
 
     # Stage 專屬 reward 強化倍率
     stage_lateral_reward_multiplier = [1.00, 1.80, 1.20, 1.00, 1.35]
@@ -1498,55 +1500,57 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # 簡化模式的獎勵權重 v4.0（命令感知獎勵）
     # 設計原則：不同命令（前進/側移/旋轉/斜向）要有明確分流，不允許「直走偷分」
     v2_reward_scales = {
-        # 核心追蹤
-        "forward_progress": 4.0,      # 命令方向速度投影（核心）
-        "velocity_tracking": 7.5,     # vx/vy/wz 追蹤精度
-        "mode_specialization": 5.2,   # 側移/旋轉/斜向專屬 shaping
-        "axis_suppression": 1.2,      # 未命令軸速度抑制（防止直走偷分）
-        "lateral_drive_soft_penalty": 0.08,   # 側移時主驅動軟鎖（越小越好）
-        "lateral_speed_deficit_penalty": 4.2, # 側移速度不足懲罰
-        "lateral_speed_target_ratio": 0.80,   # 側移速度至少達命令的比例
-        "lateral_speed_bonus": 4.0,           # 側移速度主動性獎勵
-        "diag_sign_bonus": 1.9,       # 斜向時 vx/vy 符號都正確的加分
-        "diag_wrong_sign_penalty": 3.3,  # 斜向符號錯誤懲罰
-        "diag_speed_bonus": 3.2,      # 斜向速度協同獎勵
-        
-        # Forward gait prior（只在 FWD mode 生效）
-        "forward_prior_coherence": 1.2,   # Tripod A/B 組內相位一致
-        "forward_prior_antiphase": 1.2,   # A 與 B 相位差接近 π
-        "forward_prior_duty": 1.3,        # duty factor 接近 0.65
-        "forward_prior_vel_ratio": 1.6,   # stance 慢 / swing 快速度比
-        "forward_prior_overlap": 0.9,     # 相位切換附近鼓勵 >=4 腳支撐
+        # 核心追蹤（以穩定版為基礎）
+        "forward_progress": 5.0,
+        "velocity_tracking": 4.0,
+        "mode_specialization": 2.5,
+        "axis_suppression": 1.5,
+        "lateral_drive_soft_penalty": 1.5,
+
+        # 側移/斜向補充 shaping（保守提高，不過度干擾前進）
+        "lateral_speed_deficit_penalty": 2.0,
+        "lateral_speed_target_ratio": 0.70,
+        "lateral_speed_bonus": 1.5,
+        "diag_sign_bonus": 1.0,
+        "diag_wrong_sign_penalty": 1.5,
+        "diag_speed_bonus": 1.2,
+
+        # Forward gait prior
+        "forward_prior_coherence": 1.2,
+        "forward_prior_antiphase": 1.2,
+        "forward_prior_duty": 0.9,
+        "forward_prior_vel_ratio": 0.9,
+        "forward_prior_overlap": 0.7,
 
         # 穩定與探索
-        "height_maintain": 1.7,       # 維持站立高度
-        "target_base_height": 0.30,   # 以初始站姿附近當高度目標
-        "height_sigma": 0.05,         # 高度追蹤容忍
-        "height_low_penalty": 2.5,    # 高度過低懲罰
-        "leg_moving": 0.5,            # 防消極（需與命令一致）
-        
-        # 負向懲罰
-        "stall_penalty": -2.2,        # 有命令卻幾乎不動
-        "action_smooth": -0.015,      # 動作平滑
-        "fall": -12.0,                # 摔倒
-        "fall_height_threshold": 0.10,
-        "fall_tilt_threshold": 1.55,
-        "fall_roll_threshold": 1.20,
-        "fall_pitch_threshold": 1.20,
+        "height_maintain": 0.8,
+        "target_base_height": 0.12,
+        "height_sigma": 0.08,
+        "height_low_penalty": 1.2,
+        "leg_moving": 0.5,
 
-        # Yaw 穩定專項
-        "yaw_mode_track_bonus": 6.5,      # 額外鼓勵旋轉追蹤
-        "yaw_spin_bonus": 3.4,            # 額外鼓勵 |wz| / |wz_cmd| 比例
-        "yaw_roll_pitch_penalty": 4.8,    # 旋轉時抑制 roll/pitch
-        "yaw_height_penalty": 2.2,        # 旋轉時抑制機身抬升/下沉
-        "yaw_target_base_height": 0.30,   # 旋轉高度目標
-        "yaw_slip_penalty": 0.8,          # 旋轉時抑制平移滑移
-        "yaw_slip_cap": 2.0,              # 平移滑移 proxy 裁切
-        "yaw_cheat_penalty": 4.5,         # 抑制「抬機身但不轉」作弊
-        "yaw_cheat_min_wz": 0.35,         # 低於此角速度視為未達旋轉目標
-        "yaw_cheat_tilt_thresh": 0.32,    # 超過此傾斜開始視為作弊傾向
-        
-        # 追蹤曲線寬度（越小越嚴格）
-        "lin_tracking_sigma": 0.20,   # 線速度追蹤容忍
-        "yaw_tracking_sigma": 0.24,   # 旋轉追蹤容忍
+        # 負向懲罰
+        "stall_penalty": -2.0,
+        "action_smooth": -0.01,
+        "fall": -8.0,
+        "fall_height_threshold": 0.08,
+        "fall_tilt_threshold": 1.70,
+        "fall_roll_threshold": 1.30,
+        "fall_pitch_threshold": 1.30,
+
+        # Yaw 穩定專項（回到穩定版量級）
+        "yaw_mode_track_bonus": 2.0,
+        "yaw_spin_bonus": 1.0,
+        "yaw_roll_pitch_penalty": 3.0,
+        "yaw_height_penalty": 1.5,
+        "yaw_target_base_height": 0.12,
+        "yaw_slip_penalty": 1.0,
+        "yaw_slip_cap": 2.0,
+        "yaw_cheat_penalty": 4.0,
+        "yaw_cheat_min_wz": 0.4,
+        "yaw_cheat_tilt_thresh": 0.30,
+
+        # 追蹤曲線寬度
+        "lin_tracking_sigma": 0.30,
+        "yaw_tracking_sigma": 0.35,
     }
