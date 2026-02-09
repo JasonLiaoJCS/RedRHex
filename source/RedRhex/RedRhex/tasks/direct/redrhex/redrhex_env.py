@@ -311,6 +311,16 @@ class RedrhexEnv(DirectRLEnv):
             "rew_alive": torch.zeros(self.num_envs, device=self.device),
             "rew_forward_vel": torch.zeros(self.num_envs, device=self.device),
             "rew_vel_tracking": torch.zeros(self.num_envs, device=self.device),
+            # 簡化獎勵彙總（確保 TensorBoard 從第一個 episode 就能看到）
+            "rew_forward": torch.zeros(self.num_envs, device=self.device),
+            "rew_tracking": torch.zeros(self.num_envs, device=self.device),
+            "rew_mode": torch.zeros(self.num_envs, device=self.device),
+            "rew_forward_gait": torch.zeros(self.num_envs, device=self.device),
+            "rew_axis_suppression": torch.zeros(self.num_envs, device=self.device),
+            "rew_height": torch.zeros(self.num_envs, device=self.device),
+            "rew_stall": torch.zeros(self.num_envs, device=self.device),
+            "rew_smooth": torch.zeros(self.num_envs, device=self.device),
+            "rew_fall": torch.zeros(self.num_envs, device=self.device),
             # 步態獎勵 - RHex 非對稱 Duty Cycle
             "rew_gait_sync": torch.zeros(self.num_envs, device=self.device),
             "rew_tripod_sync": torch.zeros(self.num_envs, device=self.device),
@@ -427,6 +437,9 @@ class RedrhexEnv(DirectRLEnv):
             "diag_obs_latency_steps": torch.zeros(self.num_envs, device=self.device),
             "diag_push_events": torch.zeros(self.num_envs, device=self.device),
             "diag_terrain_level": torch.zeros(self.num_envs, device=self.device),
+            # 簡化獎勵診斷彙總
+            "diag_leg_speed": torch.zeros(self.num_envs, device=self.device),
+            "diag_stance_count": torch.zeros(self.num_envs, device=self.device),
         }
 
         # 初始化目標速度緩衝
@@ -1458,10 +1471,8 @@ class RedrhexEnv(DirectRLEnv):
         yaw_bias_joint = yaw_bias_body * self._direction_multiplier
 
         # Yaw safety gate: 在姿態過度傾斜時自動收斂旋轉驅動，避免「一起步就翻」
-        gravity_body = self.projected_gravity
-        roll = torch.atan2(gravity_body[:, 1], -gravity_body[:, 2])
-        pitch = torch.atan2(-gravity_body[:, 0], torch.sqrt(gravity_body[:, 1] ** 2 + gravity_body[:, 2] ** 2))
-        roll_pitch_rms = torch.sqrt(0.5 * (roll**2 + pitch**2))
+        gravity_alignment = torch.sum(self.projected_gravity * self.reference_projected_gravity, dim=1).clamp(-1.0, 1.0)
+        roll_pitch_rms = torch.acos(gravity_alignment)
         tilt_limit = max(float(getattr(self.cfg, "yaw_stability_tilt_limit", 0.45)), 1e-3)
         yaw_safe_scale = torch.clamp(1.0 - roll_pitch_rms / tilt_limit, min=0.35, max=1.0)
         yaw_safe_scale = torch.where(mode_yaw, yaw_safe_scale, torch.ones_like(yaw_safe_scale))
@@ -1826,12 +1837,12 @@ class RedrhexEnv(DirectRLEnv):
         cmd_lin_speed = torch.linalg.norm(cmd_lin, dim=1)
         actual_lin_speed = torch.linalg.norm(actual_lin, dim=1)
         base_height = self.robot.data.root_pos_w[:, 2]
-        gravity_body = self.projected_gravity
-        roll = torch.atan2(gravity_body[:, 1], -gravity_body[:, 2])
-        pitch = torch.atan2(-gravity_body[:, 0], torch.sqrt(gravity_body[:, 1] ** 2 + gravity_body[:, 2] ** 2))
-        roll_rms = torch.abs(roll)
-        pitch_rms = torch.abs(pitch)
-        roll_pitch_rms = torch.sqrt(0.5 * (roll**2 + pitch**2))
+        # 用「相對 reference 的傾角」取代直接 roll/pitch，避免座標系偏置導致誤判。
+        gravity_alignment = torch.sum(self.projected_gravity * self.reference_projected_gravity, dim=1).clamp(-1.0, 1.0)
+        tilt_angle = torch.acos(gravity_alignment)
+        roll_rms = tilt_angle
+        pitch_rms = tilt_angle
+        roll_pitch_rms = tilt_angle
         yaw_ref_for_slip = torch.clamp(torch.abs(cmd_wz), min=0.2)
         yaw_slip_cap = max(float(scales.get("yaw_slip_cap", 2.0)), 0.1)
         yaw_slip_proxy = torch.clamp(actual_lin_speed / yaw_ref_for_slip, min=0.0, max=yaw_slip_cap)
@@ -2041,82 +2052,85 @@ class RedrhexEnv(DirectRLEnv):
         rew_smooth = action_rate * scales.get("action_smooth", -0.01)
         total_reward += rew_smooth
         
-        # R9: 倒地懲罰
-        gravity_alignment = torch.sum(self.projected_gravity * self.reference_projected_gravity, dim=1)
+        # R9: 倒地懲罰（與終止判斷解耦）
+        # 注意：roll/pitch 在不同初始姿態下可能帶固定偏置，不適合直接當 terminate 依據。
+        # 這裡改用 body_tilt + base_height 當「是否倒地」主條件，避免一出生就被誤判。
         body_tilt = 1.0 - gravity_alignment
-        fall_height_threshold = float(scales.get("fall_height_threshold", 0.14))
-        fall_roll_threshold = float(scales.get("fall_roll_threshold", 0.90))
-        fall_pitch_threshold = float(scales.get("fall_pitch_threshold", 0.90))
-        is_fallen = (
-            (base_height < fall_height_threshold)
-            | (torch.abs(roll) > fall_roll_threshold)
-            | (torch.abs(pitch) > fall_pitch_threshold)
+        fall_height_threshold = float(scales.get("fall_height_threshold", 0.10))
+        fall_tilt_threshold = float(
+            scales.get("fall_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55))
         )
+        is_fallen = (base_height < fall_height_threshold) | (body_tilt > fall_tilt_threshold)
         rew_fall = is_fallen.float() * scales.get("fall", -8.0)
         total_reward += rew_fall
-        
-        self._body_contact = is_fallen
+
+        # body_contact 提供 _get_dones() 使用，門檻獨立於 fall reward
+        body_contact_height_threshold = float(getattr(self.cfg, "body_contact_height_threshold", 0.08))
+        body_contact_tilt_threshold = float(
+            getattr(self.cfg, "body_contact_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55))
+        )
+        self._body_contact = (base_height < body_contact_height_threshold) | (body_tilt > body_contact_tilt_threshold)
         self._body_tilt = body_tilt
         
         total_reward = torch.nan_to_num(total_reward, nan=0.0, posinf=20.0, neginf=-20.0)
         
-        self.episode_sums["rew_forward"] = self.episode_sums.get("rew_forward", torch.zeros_like(total_reward)) + rew_forward
-        self.episode_sums["rew_tracking"] = self.episode_sums.get("rew_tracking", torch.zeros_like(total_reward)) + rew_tracking
-        self.episode_sums["rew_mode"] = self.episode_sums.get("rew_mode", torch.zeros_like(total_reward)) + rew_mode
-        self.episode_sums["rew_forward_gait"] = self.episode_sums.get("rew_forward_gait", torch.zeros_like(total_reward)) + rew_forward_gait
-        self.episode_sums["rew_forward_prior_coherence"] = self.episode_sums.get("rew_forward_prior_coherence", torch.zeros_like(total_reward)) + rew_forward_prior_coherence
-        self.episode_sums["rew_forward_prior_antiphase"] = self.episode_sums.get("rew_forward_prior_antiphase", torch.zeros_like(total_reward)) + rew_forward_prior_antiphase
-        self.episode_sums["rew_forward_prior_duty"] = self.episode_sums.get("rew_forward_prior_duty", torch.zeros_like(total_reward)) + rew_forward_prior_duty
-        self.episode_sums["rew_forward_prior_vel_ratio"] = self.episode_sums.get("rew_forward_prior_vel_ratio", torch.zeros_like(total_reward)) + rew_forward_prior_vel_ratio
-        self.episode_sums["rew_forward_prior_overlap"] = self.episode_sums.get("rew_forward_prior_overlap", torch.zeros_like(total_reward)) + rew_forward_prior_overlap
-        self.episode_sums["rew_axis_suppression"] = self.episode_sums.get("rew_axis_suppression", torch.zeros_like(total_reward)) + rew_axis_suppression
-        self.episode_sums["rew_lateral_soft_lock"] = self.episode_sums.get("rew_lateral_soft_lock", torch.zeros_like(total_reward)) + rew_lateral_soft_lock
-        self.episode_sums["rew_lateral_speed_deficit"] = self.episode_sums.get("rew_lateral_speed_deficit", torch.zeros_like(total_reward)) + rew_lateral_speed_deficit
-        self.episode_sums["rew_diag_sign"] = self.episode_sums.get("rew_diag_sign", torch.zeros_like(total_reward)) + rew_diag_sign
-        self.episode_sums["rew_yaw_track"] = self.episode_sums.get("rew_yaw_track", torch.zeros_like(total_reward)) + rew_yaw_track
-        self.episode_sums["rew_yaw_stability"] = self.episode_sums.get("rew_yaw_stability", torch.zeros_like(total_reward)) + rew_yaw_stability
-        self.episode_sums["rew_yaw_cheat"] = self.episode_sums.get("rew_yaw_cheat", torch.zeros_like(total_reward)) + rew_yaw_cheat
-        self.episode_sums["rew_height"] = self.episode_sums.get("rew_height", torch.zeros_like(total_reward)) + rew_height
-        self.episode_sums["rew_leg_moving"] = self.episode_sums.get("rew_leg_moving", torch.zeros_like(total_reward)) + rew_leg_moving
-        self.episode_sums["rew_stall"] = self.episode_sums.get("rew_stall", torch.zeros_like(total_reward)) + rew_stall
-        self.episode_sums["rew_smooth"] = self.episode_sums.get("rew_smooth", torch.zeros_like(total_reward)) + rew_smooth
-        self.episode_sums["rew_fall"] = self.episode_sums.get("rew_fall", torch.zeros_like(total_reward)) + rew_fall
+        self.episode_sums["rew_forward"] += rew_forward
+        self.episode_sums["rew_tracking"] += rew_tracking
+        self.episode_sums["rew_mode"] += rew_mode
+        self.episode_sums["rew_forward_gait"] += rew_forward_gait
+        self.episode_sums["rew_forward_prior_coherence"] += rew_forward_prior_coherence
+        self.episode_sums["rew_forward_prior_antiphase"] += rew_forward_prior_antiphase
+        self.episode_sums["rew_forward_prior_duty"] += rew_forward_prior_duty
+        self.episode_sums["rew_forward_prior_vel_ratio"] += rew_forward_prior_vel_ratio
+        self.episode_sums["rew_forward_prior_overlap"] += rew_forward_prior_overlap
+        self.episode_sums["rew_axis_suppression"] += rew_axis_suppression
+        self.episode_sums["rew_lateral_soft_lock"] += rew_lateral_soft_lock
+        self.episode_sums["rew_lateral_speed_deficit"] += rew_lateral_speed_deficit
+        self.episode_sums["rew_diag_sign"] += rew_diag_sign
+        self.episode_sums["rew_yaw_track"] += rew_yaw_track
+        self.episode_sums["rew_yaw_stability"] += rew_yaw_stability
+        self.episode_sums["rew_yaw_cheat"] += rew_yaw_cheat
+        self.episode_sums["rew_height"] += rew_height
+        self.episode_sums["rew_leg_moving"] += rew_leg_moving
+        self.episode_sums["rew_stall"] += rew_stall
+        self.episode_sums["rew_smooth"] += rew_smooth
+        self.episode_sums["rew_fall"] += rew_fall
         
-        self.episode_sums["diag_forward_vel"] = self.episode_sums.get("diag_forward_vel", torch.zeros_like(total_reward)) + actual_vx
-        self.episode_sums["diag_lateral_vel"] = self.episode_sums.get("diag_lateral_vel", torch.zeros_like(total_reward)) + actual_vy
-        self.episode_sums["diag_cmd_vx"] = self.episode_sums.get("diag_cmd_vx", torch.zeros_like(total_reward)) + cmd_vx
-        self.episode_sums["diag_cmd_vy"] = self.episode_sums.get("diag_cmd_vy", torch.zeros_like(total_reward)) + cmd_vy
-        self.episode_sums["diag_cmd_wz"] = self.episode_sums.get("diag_cmd_wz", torch.zeros_like(total_reward)) + cmd_wz
-        self.episode_sums["diag_actual_wz"] = self.episode_sums.get("diag_actual_wz", torch.zeros_like(total_reward)) + actual_wz
-        self.episode_sums["diag_wz_error"] = self.episode_sums.get("diag_wz_error", torch.zeros_like(total_reward)) + wz_error
+        self.episode_sums["diag_forward_vel"] += actual_vx
+        self.episode_sums["diag_lateral_vel"] += actual_vy
+        self.episode_sums["diag_cmd_vx"] += cmd_vx
+        self.episode_sums["diag_cmd_vy"] += cmd_vy
+        self.episode_sums["diag_cmd_wz"] += cmd_wz
+        self.episode_sums["diag_actual_wz"] += actual_wz
+        self.episode_sums["diag_wz_error"] += wz_error
         lin_vel_error = torch.linalg.norm(cmd_lin - actual_lin, dim=1)
-        self.episode_sums["diag_vel_error"] = self.episode_sums.get("diag_vel_error", torch.zeros_like(total_reward)) + lin_vel_error
-        self.episode_sums["diag_base_height"] = self.episode_sums.get("diag_base_height", torch.zeros_like(total_reward)) + base_height
-        self.episode_sums["diag_tilt"] = self.episode_sums.get("diag_tilt", torch.zeros_like(total_reward)) + body_tilt
-        self.episode_sums["diag_leg_speed"] = self.episode_sums.get("diag_leg_speed", torch.zeros_like(total_reward)) + leg_speed
-        self.episode_sums["diag_stance_count"] = self.episode_sums.get("diag_stance_count", torch.zeros_like(total_reward)) + stance_count
-        self.episode_sums["diag_phase_diff"] = self.episode_sums.get("diag_phase_diff", torch.zeros_like(total_reward)) + phase_diff
-        self.episode_sums["diag_forward_duty_ema"] = self.episode_sums.get("diag_forward_duty_ema", torch.zeros_like(total_reward)) + self._forward_stance_frac_ema
-        self.episode_sums["diag_forward_vel_ratio_proxy"] = self.episode_sums.get("diag_forward_vel_ratio_proxy", torch.zeros_like(total_reward)) + self._forward_vel_ratio_proxy
-        self.episode_sums["diag_forward_transition_weight"] = self.episode_sums.get("diag_forward_transition_weight", torch.zeros_like(total_reward)) + self._forward_transition_weight
-        self.episode_sums["diag_mode_id"] = self.episode_sums.get("diag_mode_id", torch.zeros_like(total_reward)) + self._mode_id.float()
-        self.episode_sums["diag_contact_count"] = self.episode_sums.get("diag_contact_count", torch.zeros_like(total_reward)) + self._contact_count
-        self.episode_sums["diag_pose_error"] = self.episode_sums.get("diag_pose_error", torch.zeros_like(total_reward)) + self._stand_pose_error
-        self.episode_sums["diag_lateral_fsm_state"] = self.episode_sums.get("diag_lateral_fsm_state", torch.zeros_like(total_reward)) + self._lateral_fsm_state.float()
-        self.episode_sums["diag_lateral_time_in_state"] = self.episode_sums.get("diag_lateral_time_in_state", torch.zeros_like(total_reward)) + self._lateral_state_time
-        self.episode_sums["diag_masked_action_norm_main"] = self.episode_sums.get("diag_masked_action_norm_main", torch.zeros_like(total_reward)) + self._masked_action_norm_main
-        self.episode_sums["diag_masked_action_norm_abad"] = self.episode_sums.get("diag_masked_action_norm_abad", torch.zeros_like(total_reward)) + self._masked_action_norm_abad
-        self.episode_sums["diag_roll_rms"] = self.episode_sums.get("diag_roll_rms", torch.zeros_like(total_reward)) + self._roll_rms
-        self.episode_sums["diag_pitch_rms"] = self.episode_sums.get("diag_pitch_rms", torch.zeros_like(total_reward)) + self._pitch_rms
-        self.episode_sums["diag_yaw_slip_proxy"] = self.episode_sums.get("diag_yaw_slip_proxy", torch.zeros_like(total_reward)) + self._yaw_slip_proxy
-        self.episode_sums["diag_curriculum_stage"] = self.episode_sums.get("diag_curriculum_stage", torch.zeros_like(total_reward)) + self._dr_stage_id
-        self.episode_sums["diag_dr_mass_scale"] = self.episode_sums.get("diag_dr_mass_scale", torch.zeros_like(total_reward)) + self._mass_scale
-        self.episode_sums["diag_dr_friction_scale"] = self.episode_sums.get("diag_dr_friction_scale", torch.zeros_like(total_reward)) + self._friction_scale
-        self.episode_sums["diag_dr_main_strength"] = self.episode_sums.get("diag_dr_main_strength", torch.zeros_like(total_reward)) + self._main_strength_scale
-        self.episode_sums["diag_dr_abad_strength"] = self.episode_sums.get("diag_dr_abad_strength", torch.zeros_like(total_reward)) + self._abad_strength_scale
-        self.episode_sums["diag_obs_latency_steps"] = self.episode_sums.get("diag_obs_latency_steps", torch.zeros_like(total_reward)) + self._obs_latency_steps.float()
-        self.episode_sums["diag_push_events"] = self.episode_sums.get("diag_push_events", torch.zeros_like(total_reward)) + self._push_events_step
-        self.episode_sums["diag_terrain_level"] = self.episode_sums.get("diag_terrain_level", torch.zeros_like(total_reward)) + self._terrain_level
+        self.episode_sums["diag_vel_error"] += lin_vel_error
+        self.episode_sums["diag_base_height"] += base_height
+        self.episode_sums["diag_tilt"] += body_tilt
+        self.episode_sums["diag_leg_speed"] += leg_speed
+        self.episode_sums["diag_stance_count"] += stance_count
+        self.episode_sums["diag_phase_diff"] += phase_diff
+        self.episode_sums["diag_forward_duty_ema"] += self._forward_stance_frac_ema
+        self.episode_sums["diag_forward_vel_ratio_proxy"] += self._forward_vel_ratio_proxy
+        self.episode_sums["diag_forward_transition_weight"] += self._forward_transition_weight
+        self.episode_sums["diag_mode_id"] += self._mode_id.float()
+        self.episode_sums["diag_contact_count"] += self._contact_count
+        self.episode_sums["diag_pose_error"] += self._stand_pose_error
+        self.episode_sums["diag_lateral_fsm_state"] += self._lateral_fsm_state.float()
+        self.episode_sums["diag_lateral_time_in_state"] += self._lateral_state_time
+        self.episode_sums["diag_masked_action_norm_main"] += self._masked_action_norm_main
+        self.episode_sums["diag_masked_action_norm_abad"] += self._masked_action_norm_abad
+        self.episode_sums["diag_roll_rms"] += self._roll_rms
+        self.episode_sums["diag_pitch_rms"] += self._pitch_rms
+        self.episode_sums["diag_yaw_slip_proxy"] += self._yaw_slip_proxy
+        self.episode_sums["diag_curriculum_stage"] += self._dr_stage_id
+        self.episode_sums["diag_dr_mass_scale"] += self._mass_scale
+        self.episode_sums["diag_dr_friction_scale"] += self._friction_scale
+        self.episode_sums["diag_dr_main_strength"] += self._main_strength_scale
+        self.episode_sums["diag_dr_abad_strength"] += self._abad_strength_scale
+        self.episode_sums["diag_obs_latency_steps"] += self._obs_latency_steps.float()
+        self.episode_sums["diag_push_events"] += self._push_events_step
+        self.episode_sums["diag_terrain_level"] += self._terrain_level
         
         self.last_main_drive_vel = main_drive_vel.clone()
         return total_reward
@@ -3288,30 +3302,33 @@ class RedrhexEnv(DirectRLEnv):
         default_root_state[:, 0] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
         default_root_state[:, 1] += sample_uniform(-0.1, 0.1, (num_reset,), device=self.device)
 
-        # ★★★ 關鍵修正：隨機化機器人的初始朝向（yaw）★★★
-        # 這樣訓練時機器人會面向各種方向，迫使它學習「本體座標系」的追蹤
-        # 而不是「世界座標系」的追蹤
-        random_yaw = sample_uniform(-math.pi, math.pi, (num_reset,), device=self.device)
-        
-        # 創建 yaw 旋轉的四元數 [w, x, y, z] = [cos(yaw/2), 0, 0, sin(yaw/2)]
-        half_yaw = random_yaw * 0.5
-        yaw_w = torch.cos(half_yaw)
-        yaw_z = torch.sin(half_yaw)
-        
-        # ★★★ 重要：將 yaw 旋轉疊加到原本的初始旋轉上 ★★★
-        # 原本的初始旋轉是繞 X 軸 90 度：(w0, x0, y0, z0) = (0.7071068, 0.7071068, 0, 0)
-        # yaw 旋轉四元數：(yaw_w, 0, 0, yaw_z)
-        # 
-        # 四元數乘法：q_yaw * q_init
-        # w = yaw_w*w0 - yaw_z*0 = yaw_w * w0
-        # x = yaw_w*x0 + yaw_z*0 = yaw_w * x0
-        # y = yaw_z*x0           (注意：正號！)
-        # z = yaw_z*w0
-        w0, x0 = 0.7071068, 0.7071068  # 原本的 X 軸 90 度旋轉
-        default_root_state[:, 3] = w0 * yaw_w              # w
-        default_root_state[:, 4] = x0 * yaw_w              # x
-        default_root_state[:, 5] = x0 * yaw_z              # y (修正：正號)
-        default_root_state[:, 6] = w0 * yaw_z              # z
+        # 初始 yaw 隨機化（預設關閉，避免姿態偏置造成「一出生就死亡」）
+        if getattr(self.cfg, "randomize_initial_yaw", False):
+            yaw_range = getattr(self.cfg, "initial_yaw_range", [-0.20, 0.20])
+            yaw_low = float(yaw_range[0])
+            yaw_high = float(yaw_range[1])
+            if yaw_low > yaw_high:
+                yaw_low, yaw_high = yaw_high, yaw_low
+
+            random_yaw = sample_uniform(yaw_low, yaw_high, (num_reset,), device=self.device)
+            zeros = torch.zeros_like(random_yaw)
+            yaw_quat = math_utils.quat_from_euler_xyz(zeros, zeros, random_yaw)
+
+            # q_out = q_yaw * q_default（保留原本姿態，只繞世界 Z 轉）
+            q_default = default_root_state[:, 3:7].clone()
+            w1, x1, y1, z1 = yaw_quat.unbind(dim=1)
+            w2, x2, y2, z2 = q_default.unbind(dim=1)
+            q_out = torch.stack(
+                (
+                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                ),
+                dim=1,
+            )
+            q_out = q_out / torch.linalg.norm(q_out, dim=1, keepdim=True).clamp(min=1e-6)
+            default_root_state[:, 3:7] = q_out
 
         # 寫入模擬
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
@@ -3375,13 +3392,15 @@ class RedrhexEnv(DirectRLEnv):
         mean_episode_len_steps = torch.mean(episode_len_before_reset).item()
         
         for key in self.episode_sums.keys():
-            # 計算被重置環境的平均 episode 獎勵
+            # 計算被重置環境的平均 episode 指標，並強制轉成有限 float，
+            # 確保 TensorBoard 不會因 nan/inf 或裝置 tensor 而漏記。
             episodic_sum_avg = torch.mean(self.episode_sums[key][env_ids])
-            # 診斷項目改用「每步平均」比較可解讀；獎勵項沿用每秒正規化
             if key.startswith("diag_"):
-                extras["Episode_Reward/" + key] = episodic_sum_avg / max(mean_episode_len_steps, 1.0)
+                value = episodic_sum_avg / max(mean_episode_len_steps, 1.0)
             else:
-                extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+                value = episodic_sum_avg / self.max_episode_length_s
+            value = torch.nan_to_num(value.detach(), nan=0.0, posinf=0.0, neginf=0.0).item()
+            extras["Episode_Reward/" + key] = value
         
         # 初始化 extras["log"] 並更新
         self.extras["log"] = dict()

@@ -167,6 +167,17 @@ find logs/rsl_rl/redrhex_wheg -type f -name "model_*.pt" | sort | tail -1
 bash scripts/rsl_rl/train_stage_pipeline.sh
 ```
 
+先用 GUI 肉眼確認「不是出生即死」再夜跑（建議）：
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --precheck_gui 1 \
+  --precheck_stage 1 \
+  --precheck_envs 64 \
+  --precheck_iters 120 \
+  --run_tag overnight_safe
+```
+
 自訂範例：
 
 ```bash
@@ -276,6 +287,14 @@ python scripts/rsl_rl/play.py \
   --task=Template-Redrhex-Direct-v0 \
   --num_envs=64 \
   --checkpoint="$FINAL_CKPT"
+```
+
+注意：`--checkpoint` 只能給「一個」完整路徑，不要把兩段路徑串在同一行。
+正確示例：
+
+```bash
+FINAL_CKPT="logs/rsl_rl/redrhex_wheg/2026-02-09_xxx_stage5/model_yyyy.pt"
+python scripts/rsl_rl/play.py --task=Template-Redrhex-Direct-v0 --num_envs=1 --checkpoint="$FINAL_CKPT"
 ```
 
 Headless + 錄影：

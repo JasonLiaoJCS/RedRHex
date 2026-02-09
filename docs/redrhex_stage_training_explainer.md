@@ -49,6 +49,103 @@
 
 ---
 
+## 2.1) 每個 Stage 的 TensorBoard 驗收重點（你要看的 tag）
+
+先看這 3 個共通原則，不然很容易誤判：
+- 很多 `rew_*` 是「模式啟動才會有值」。例如你在 Stage1 看 `rew_yaw_track` 幾乎是 0，這是正常。
+- 先看「趨勢」再看「絕對值」：同一組 scale 下，往正向收斂比單點數值更重要。
+- 最後一定用 `eval_command_sweep.py` 做客觀驗收；TensorBoard 只負責訓練中監控。
+
+### 共通必看（所有 Stage 都要看）
+- `Train/mean_episode_length`：要明顯上升並穩住。若長期接近 1~20，通常是出生即死或 reward 爆炸。
+- `Train/mean_reward`：應該從亂飄逐漸變穩。若一路往負無限或劇烈震盪，優先查終止與 action 映射。
+- `Episode_Termination/terminated`：要下降。若長期很高，代表跌倒/觸地問題嚴重。
+- `Episode_Reward/rew_fall`：理想是接近 0（少觸發）；若持續大負值，表示還在大量摔倒。
+- `Episode_Reward/diag_base_height`：要接近站姿高度（目前設定目標約 0.30m 附近），不要一路掉到 0.1 以下。
+
+### Stage1（Forward-only）要看什麼
+命令是否正確：
+- `Episode_Reward/diag_cmd_vx` 應為正值（約在 `stage1_forward_vx_range`）。
+- `Episode_Reward/diag_cmd_vy`、`Episode_Reward/diag_cmd_wz` 應接近 0。
+核心追蹤：
+- `Episode_Reward/rew_tracking` 應上升並穩定。
+- `Episode_Reward/diag_forward_vel` 應與 `diag_cmd_vx` 同號，且差距縮小（可搭配 `diag_vel_error` 下降）。
+前進步態先驗（最關鍵）：
+- `Episode_Reward/rew_forward_prior_coherence`、`rew_forward_prior_antiphase`、`rew_forward_prior_duty`、`rew_forward_prior_vel_ratio`、`rew_forward_prior_overlap` 應整體轉正並提升。
+- `Episode_Reward/diag_forward_duty_ema` 目標靠近 0.65（常見可接受帶：0.50~0.75，越接近越好）。
+- `Episode_Reward/diag_forward_vel_ratio_proxy` 應明顯 > 1，代表 swing 比 stance 快（越高越符合快擺慢撐）。
+失敗警訊：
+- `rew_tracking` 長期低迷 + `terminated` 高。
+- `diag_forward_duty_ema` 長期偏離（例如 <0.35 或 >0.9）。
+- `rew_stall` 長期負值很大（有命令卻不動）。
+
+### Stage2（Lateral-only）要看什麼
+命令是否正確：
+- `Episode_Reward/diag_cmd_vy` 應非 0（正負都會出現）。
+- `Episode_Reward/diag_cmd_vx`、`Episode_Reward/diag_cmd_wz` 應接近 0。
+FSM 是否正常：
+- `Episode_Reward/diag_lateral_fsm_state` 應從 `GO_TO_STAND(1)` 進到 `LATERAL_STEP(2)`，後期平均值應偏向 2。
+- `Episode_Reward/diag_pose_error` 應下降（進入 LATERAL_STEP 前要變小）。
+- `Episode_Reward/diag_contact_count` 在側移時不要長期掉到 0~1。
+側移能力是否變積極：
+- `Episode_Reward/rew_lateral_speed_deficit` 應「往 0 靠近」（這個值通常是負，越不負越好）。
+- `Episode_Reward/diag_lateral_vel` 要和 `diag_cmd_vy` 同號，且絕對值變大。
+- `Episode_Reward/rew_mode`（在 lateral 段）應提升。
+鎖主驅動是否生效：
+- `Episode_Reward/diag_masked_action_norm_main` 應維持低值（硬鎖接近 0，soft-lock 也不應長期很大）。
+失敗警訊：
+- 卡在 `diag_lateral_fsm_state ≈ 1` 很久（GO_TO_STAND 出不去）。
+- `rew_lateral_speed_deficit` 長期大幅負值 + `diag_lateral_vel` 接近 0（站著不動）。
+
+### Stage3（Diagonal-only）要看什麼
+命令是否正確：
+- `Episode_Reward/diag_cmd_vx` 應為正，`diag_cmd_vy` 應有正負切換，`diag_cmd_wz` 接近 0。
+斜向組合能力：
+- `Episode_Reward/rew_diag_sign` 要轉正並穩定（代表 vx/vy 方向符號正確）。
+- `Episode_Reward/rew_mode`（diag 段）應提升。
+- `Episode_Reward/diag_vel_error` 應下降。
+干擾軸抑制：
+- `Episode_Reward/rew_axis_suppression` 不要越來越負（過負表示未命令軸漏動嚴重）。
+失敗警訊：
+- `rew_diag_sign` 長期 <= 0（常見是只會某一側，例如只會 diag_left）。
+- `diag_lateral_vel` 或 `diag_forward_vel` 長期某一軸太小，導致不像真正斜走。
+
+### Stage4（Yaw-only）要看什麼
+命令是否正確：
+- `Episode_Reward/diag_cmd_wz` 應非 0（正負都會出現）。
+- `Episode_Reward/diag_cmd_vx`、`diag_cmd_vy` 應接近 0。
+旋轉是否真的成立：
+- `Episode_Reward/rew_yaw_track` 應上升。
+- `Episode_Reward/diag_actual_wz` 應和 `diag_cmd_wz` 同號，且差距縮小（`diag_wz_error` 下降）。
+穩定性（避免「掀機身作弊」）：
+- `Episode_Reward/rew_yaw_stability`、`rew_yaw_cheat` 通常是負值，理想是逐步往 0 靠近。
+- `Episode_Reward/diag_roll_rms`、`diag_pitch_rms` 要壓低（建議先看是否能壓到 <0.35 rad）。
+- `Episode_Reward/diag_yaw_slip_proxy` 要下降（降低平移滑移）。
+- `Episode_Reward/diag_base_height` 不可長期崩到很低。
+失敗警訊：
+- `rew_yaw_track` 低 + `rew_yaw_cheat` 很負 + `terminated` 高，通常就是一轉就翻。
+
+### Stage5（Mixed integration）要看什麼
+先確認「不是只剩單一技能」：
+- `Episode_Reward/rew_forward_gait`、`rew_lateral_speed_deficit`、`rew_diag_sign`、`rew_yaw_track` 這四組都要有活動，不應長期只剩一組有反應。
+綜合能力：
+- `Episode_Reward/rew_tracking` 應維持高位。
+- `Episode_Reward/rew_mode` 應為正向貢獻（或至少比 stage4 初期更好）。
+- `Episode_Reward/rew_fall`、`Episode_Termination/terminated` 要壓低。
+- `Episode_Reward/rew_smooth` 不要極端負值（避免抖動控制）。
+失敗警訊：
+- 某技能相關 tag 完全貼地（接近 0 或持續惡化），表示混訓時被其他技能「覆蓋」。
+- `rew_tracking` 看似高，但 `rew_mode` 長期很差，代表可能靠錯誤運動模式偷分。
+
+### 你可以直接照抄的 Stage 成功判定（TensorBoard 快速版）
+- Stage1 成功：`rew_tracking` 穩定上升、`rew_forward_gait` 為正且成長、`diag_forward_duty_ema` 靠近 0.65、`terminated` 下降。
+- Stage2 成功：`diag_lateral_fsm_state` 多數時間在 2、`rew_lateral_speed_deficit` 趨近 0、`diag_lateral_vel` 顯著上升且方向正確。
+- Stage3 成功：`rew_diag_sign` 穩定為正、`diag_vel_error` 下降、`rew_mode` 提升。
+- Stage4 成功：`rew_yaw_track` 上升、`diag_wz_error` 下降、`rew_yaw_stability/rew_yaw_cheat` 往 0 靠近、`terminated` 不爆量。
+- Stage5 成功：四類技能 tag 都活著，且 `rew_tracking` 高、`rew_fall` 低、`terminated` 低，最後 eval profile=`stage5/full` 能過線。
+
+---
+
 ## 3) 這次程式上的關鍵改動（對外可講）
 
 1. 命令採樣改成 5-stage（stage1~stage5），每段 command 分布分離。
