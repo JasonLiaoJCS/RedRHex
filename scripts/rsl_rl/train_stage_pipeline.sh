@@ -23,6 +23,32 @@ STAGE3_ITERS="${STAGE3_ITERS:-9000}"
 STAGE4_ITERS="${STAGE4_ITERS:-10000}"
 STAGE5_ITERS="${STAGE5_ITERS:-12000}"
 
+# Stage handoff behavior (recommended for stability between different command distributions)
+RESUME_POLICY_ONLY="${RESUME_POLICY_ONLY:-1}"
+RESET_ACTION_STD="${RESET_ACTION_STD:-0.8}"
+
+# Resolve Python interpreter that can import isaaclab.
+if ! "$PYTHON_BIN" -c "import isaaclab" >/dev/null 2>&1; then
+  FALLBACK_PY="/home/jasonliao/miniconda3/envs/env_isaaclab/bin/python"
+  if [[ -x "$FALLBACK_PY" ]] && "$FALLBACK_PY" -c "import isaaclab" >/dev/null 2>&1; then
+    echo "[WARN] '$PYTHON_BIN' cannot import isaaclab. Falling back to: $FALLBACK_PY"
+    PYTHON_BIN="$FALLBACK_PY"
+  fi
+fi
+
+# Stability gate: fail fast if a stage is clearly unstable.
+STABILITY_GATE="${STABILITY_GATE:-1}"
+STAGE1_MIN_EP_LEN="${STAGE1_MIN_EP_LEN:-55}"
+STAGE2_MIN_EP_LEN="${STAGE2_MIN_EP_LEN:-45}"
+STAGE3_MIN_EP_LEN="${STAGE3_MIN_EP_LEN:-50}"
+STAGE4_MIN_EP_LEN="${STAGE4_MIN_EP_LEN:-40}"
+STAGE5_MIN_EP_LEN="${STAGE5_MIN_EP_LEN:-50}"
+STAGE1_MAX_TERMINATED="${STAGE1_MAX_TERMINATED:-30}"
+STAGE2_MAX_TERMINATED="${STAGE2_MAX_TERMINATED:-30}"
+STAGE3_MAX_TERMINATED="${STAGE3_MAX_TERMINATED:-30}"
+STAGE4_MAX_TERMINATED="${STAGE4_MAX_TERMINATED:-35}"
+STAGE5_MAX_TERMINATED="${STAGE5_MAX_TERMINATED:-35}"
+
 # Space-separated Hydra overrides.
 EXTRA_OVERRIDES_STR="${EXTRA_OVERRIDES_STR:-env.draw_debug_vis=False env.dr_try_physical_material_randomization=False}"
 
@@ -46,6 +72,10 @@ Options:
   --s3 <iters>            Stage3 max_iterations
   --s4 <iters>            Stage4 max_iterations
   --s5 <iters>            Stage5 max_iterations
+  --resume_policy_only <0|1>
+                           Resume stage handoff with policy-only load (default: 1)
+  --reset_action_std <v>  Action std reset value when policy-only resume is enabled (default: 0.8)
+  --stability_gate <0|1>  Enable stage health gate (default: 1)
   --extra "<overrides>"   Extra Hydra overrides string
   -h, --help              Show this help
 
@@ -73,6 +103,9 @@ while [[ $# -gt 0 ]]; do
     --s3) STAGE3_ITERS="$2"; shift 2 ;;
     --s4) STAGE4_ITERS="$2"; shift 2 ;;
     --s5) STAGE5_ITERS="$2"; shift 2 ;;
+    --resume_policy_only) RESUME_POLICY_ONLY="$2"; shift 2 ;;
+    --reset_action_std) RESET_ACTION_STD="$2"; shift 2 ;;
+    --stability_gate) STABILITY_GATE="$2"; shift 2 ;;
     --extra) EXTRA_OVERRIDES_STR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; ADDITIONAL_ARGS+=("$@"); break ;;
@@ -94,6 +127,8 @@ echo "[INFO] RUN_TAG: $RUN_TAG" | tee -a "$PIPELINE_LOG"
 echo "[INFO] TASK: $TASK, NUM_ENVS: $NUM_ENVS" | tee -a "$PIPELINE_LOG"
 echo "[INFO] ITERS: s1=$STAGE1_ITERS s2=$STAGE2_ITERS s3=$STAGE3_ITERS s4=$STAGE4_ITERS s5=$STAGE5_ITERS" | tee -a "$PIPELINE_LOG"
 echo "[INFO] PRECHECK: gui=$PRECHECK_GUI stage=$PRECHECK_STAGE envs=$PRECHECK_ENVS iters=$PRECHECK_ITERS" | tee -a "$PIPELINE_LOG"
+echo "[INFO] STABILITY_GATE: $STABILITY_GATE" | tee -a "$PIPELINE_LOG"
+echo "[INFO] HANDOFF: resume_policy_only=$RESUME_POLICY_ONLY reset_action_std=$RESET_ACTION_STD" | tee -a "$PIPELINE_LOG"
 
 LAST_RUN=""
 LAST_CKPT=""
@@ -107,6 +142,70 @@ latest_run_by_suffix() {
 latest_ckpt_in_run() {
   local run_dir="$1"
   ls -v "$run_dir"/model_*.pt 2>/dev/null | tail -1 || true
+}
+
+stage_min_ep_len() {
+  local stage="$1"
+  case "$stage" in
+    1) echo "$STAGE1_MIN_EP_LEN" ;;
+    2) echo "$STAGE2_MIN_EP_LEN" ;;
+    3) echo "$STAGE3_MIN_EP_LEN" ;;
+    4) echo "$STAGE4_MIN_EP_LEN" ;;
+    5) echo "$STAGE5_MIN_EP_LEN" ;;
+    *) echo "40" ;;
+  esac
+}
+
+stage_max_terminated() {
+  local stage="$1"
+  case "$stage" in
+    1) echo "$STAGE1_MAX_TERMINATED" ;;
+    2) echo "$STAGE2_MAX_TERMINATED" ;;
+    3) echo "$STAGE3_MAX_TERMINATED" ;;
+    4) echo "$STAGE4_MAX_TERMINATED" ;;
+    5) echo "$STAGE5_MAX_TERMINATED" ;;
+    *) echo "40" ;;
+  esac
+}
+
+validate_stage_health() {
+  local stage="$1"
+  local stage_log="$2"
+
+  if [[ "$STABILITY_GATE" != "1" ]]; then
+    echo "[INFO] Stage ${stage} health gate disabled." | tee -a "$PIPELINE_LOG"
+    return
+  fi
+
+  local min_ep max_term
+  min_ep="$(stage_min_ep_len "$stage")"
+  max_term="$(stage_max_terminated "$stage")"
+
+  local ep_line term_line ep_len term_cnt
+  ep_line="$(rg "Mean episode length:" "$stage_log" | tail -1 || true)"
+  term_line="$(rg "Episode_Termination/terminated:" "$stage_log" | tail -1 || true)"
+
+  if [[ -z "$ep_line" || -z "$term_line" ]]; then
+    echo "[ERROR] Stage ${stage} health gate: missing metrics in $stage_log" | tee -a "$PIPELINE_LOG"
+    exit 1
+  fi
+
+  ep_len="$(echo "$ep_line" | sed -E 's/.*Mean episode length:[[:space:]]*([0-9.]+).*/\1/')"
+  term_cnt="$(echo "$term_line" | sed -E 's/.*Episode_Termination\/terminated:[[:space:]]*([0-9.]+).*/\1/')"
+
+  echo "[INFO] Stage ${stage} health: mean_episode_length=${ep_len}, terminated=${term_cnt}" | tee -a "$PIPELINE_LOG"
+  echo "[INFO] Stage ${stage} thresholds: min_episode_length=${min_ep}, max_terminated=${max_term}" | tee -a "$PIPELINE_LOG"
+
+  if ! awk -v x="$ep_len" -v y="$min_ep" 'BEGIN{exit !(x+0 >= y+0)}'; then
+    echo "[ERROR] Stage ${stage} unstable: mean_episode_length=${ep_len} < ${min_ep}" | tee -a "$PIPELINE_LOG"
+    exit 1
+  fi
+  if ! awk -v x="$term_cnt" -v y="$max_term" 'BEGIN{exit !(x+0 <= y+0)}'; then
+    echo "[ERROR] Stage ${stage} unstable: terminated=${term_cnt} > ${max_term}" | tee -a "$PIPELINE_LOG"
+    exit 1
+  fi
+
+  echo "[INFO] Stage ${stage} health gate PASS." | tee -a "$PIPELINE_LOG"
 }
 
 run_precheck() {
@@ -162,6 +261,9 @@ run_stage() {
   fi
   if [[ -n "$load_run" && -n "$load_ckpt" ]]; then
     cmd+=(--resume "--load_run=${load_run}" "--checkpoint=${load_ckpt}")
+    if [[ "$RESUME_POLICY_ONLY" == "1" ]]; then
+      cmd+=(--resume_policy_only "--reset_action_std=${RESET_ACTION_STD}")
+    fi
   fi
   for ov in "${EXTRA_OVERRIDES[@]}"; do
     cmd+=("$ov")
@@ -176,7 +278,8 @@ run_stage() {
   echo "[INFO] Command: ${cmd[*]}" | tee -a "$PIPELINE_LOG"
   echo "==================================================" | tee -a "$PIPELINE_LOG"
 
-  "${cmd[@]}" 2>&1 | tee -a "$PIPELINE_LOG"
+  local stage_log="logs/rsl_rl/pipeline/${RUN_TAG}_stage${stage}.log"
+  "${cmd[@]}" 2>&1 | tee "$stage_log" | tee -a "$PIPELINE_LOG"
 
   local run_dir
   run_dir="$(latest_run_by_suffix "$stage_suffix")"
@@ -195,6 +298,8 @@ run_stage() {
   LAST_RUN="$(basename "$run_dir")"
   LAST_CKPT="$(basename "$ckpt_abs")"
   LAST_CKPT_ABS="$ckpt_abs"
+
+  validate_stage_health "$stage" "$stage_log"
 
   echo "[INFO] Stage ${stage} done: RUN=${LAST_RUN}, CKPT=${LAST_CKPT}" | tee -a "$PIPELINE_LOG"
 }

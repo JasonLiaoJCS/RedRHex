@@ -49,6 +49,8 @@ python scripts/rsl_rl/train.py \
   --max_iterations=8000 \
   --run_name=stage2 \
   --resume \
+  --resume_policy_only \
+  --reset_action_std=0.8 \
   --load_run="$RUN1" \
   --checkpoint="$CKPT1" \
   env.stage=2 \
@@ -75,6 +77,8 @@ python scripts/rsl_rl/train.py \
   --max_iterations=9000 \
   --run_name=stage3 \
   --resume \
+  --resume_policy_only \
+  --reset_action_std=0.8 \
   --load_run="$RUN2" \
   --checkpoint="$CKPT2" \
   env.stage=3 \
@@ -101,6 +105,8 @@ python scripts/rsl_rl/train.py \
   --max_iterations=10000 \
   --run_name=stage4 \
   --resume \
+  --resume_policy_only \
+  --reset_action_std=0.8 \
   --load_run="$RUN3" \
   --checkpoint="$CKPT3" \
   env.stage=4 \
@@ -127,6 +133,8 @@ python scripts/rsl_rl/train.py \
   --max_iterations=12000 \
   --run_name=stage5 \
   --resume \
+  --resume_policy_only \
+  --reset_action_std=0.8 \
   --load_run="$RUN4" \
   --checkpoint="$CKPT4" \
   env.stage=5 \
@@ -184,6 +192,8 @@ bash scripts/rsl_rl/train_stage_pipeline.sh \
 bash scripts/rsl_rl/train_stage_pipeline.sh \
   --run_tag overnight_a \
   --num_envs 4096 \
+  --resume_policy_only 1 \
+  --reset_action_std 0.8 \
   --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
 ```
 

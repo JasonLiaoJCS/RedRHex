@@ -381,7 +381,10 @@ class RedrhexEnv(DirectRLEnv):
             "rew_yaw_cheat": torch.zeros(self.num_envs, device=self.device),              # 旋轉作弊懲罰
             "rew_lateral_soft_lock": torch.zeros(self.num_envs, device=self.device),      # 側移主驅動軟鎖
             "rew_lateral_speed_deficit": torch.zeros(self.num_envs, device=self.device),  # 側移速度不足懲罰
+            "rew_lateral_speed_bonus": torch.zeros(self.num_envs, device=self.device),    # 側移速度主動性獎勵
             "rew_diag_sign": torch.zeros(self.num_envs, device=self.device),              # 斜向符號一致性
+            "rew_diag_speed": torch.zeros(self.num_envs, device=self.device),             # 斜向速度協同
+            "rew_yaw_spin": torch.zeros(self.num_envs, device=self.device),               # 旋轉速度比例獎勵
             # ★★★ 新增：移動獎勵（防消極）★★★
             "rew_leg_moving": torch.zeros(self.num_envs, device=self.device),            # 腿轉動獎勵
             "rew_direction_bonus": torch.zeros(self.num_envs, device=self.device),       # 方向正確額外獎勵
@@ -437,6 +440,7 @@ class RedrhexEnv(DirectRLEnv):
             "diag_obs_latency_steps": torch.zeros(self.num_envs, device=self.device),
             "diag_push_events": torch.zeros(self.num_envs, device=self.device),
             "diag_terrain_level": torch.zeros(self.num_envs, device=self.device),
+            "diag_action_warmup": torch.zeros(self.num_envs, device=self.device),
             # 簡化獎勵診斷彙總
             "diag_leg_speed": torch.zeros(self.num_envs, device=self.device),
             "diag_stance_count": torch.zeros(self.num_envs, device=self.device),
@@ -469,6 +473,9 @@ class RedrhexEnv(DirectRLEnv):
         self._roll_rms = torch.zeros(self.num_envs, device=self.device)
         self._pitch_rms = torch.zeros(self.num_envs, device=self.device)
         self._yaw_slip_proxy = torch.zeros(self.num_envs, device=self.device)
+        # 終止條件狀態（避免 reset 後沿用上一回合的 body contact 狀態）
+        self._body_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._body_tilt = torch.zeros(self.num_envs, device=self.device)
         # Forward gait prior 的狀態估計（duty/contact/transition）
         self._forward_stance_frac_ema = torch.full(
             (self.num_envs,),
@@ -477,6 +484,7 @@ class RedrhexEnv(DirectRLEnv):
         )
         self._forward_vel_ratio_proxy = torch.zeros(self.num_envs, device=self.device)
         self._forward_transition_weight = torch.zeros(self.num_envs, device=self.device)
+        self._action_warmup_scale = torch.ones(self.num_envs, device=self.device)
 
         # 站姿高度參考（給 simplified reward 使用）
         init_height = 0.30
@@ -747,6 +755,29 @@ class RedrhexEnv(DirectRLEnv):
         idx = max(0, min(len(scales) - 1, int(stage) - 1))
         return float(scales[idx])
 
+    def _get_stage_value(self, attr_name: str, default_value):
+        """讀取 stage 專屬配置（可用 list/tuple 指定 1..5 各 stage）。"""
+        stage = int(max(1, min(5, self._curriculum_stage)))
+        value = getattr(self.cfg, attr_name, default_value)
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return default_value
+            idx = min(stage - 1, len(value) - 1)
+            value = value[idx]
+        if isinstance(default_value, bool):
+            return bool(value)
+        if isinstance(default_value, int) and not isinstance(default_value, bool):
+            try:
+                return int(value)
+            except Exception:
+                return default_value
+        if isinstance(default_value, float):
+            try:
+                return float(value)
+            except Exception:
+                return default_value
+        return value
+
     def _sample_commands_from_table(self, env_ids: torch.Tensor, directions: Sequence[Sequence[float]]) -> None:
         table = torch.tensor(directions, device=self.device, dtype=torch.float32)
         if table.numel() == 0:
@@ -1000,8 +1031,10 @@ class RedrhexEnv(DirectRLEnv):
 
         candidate_ids = torch.nonzero(eligible, as_tuple=False).squeeze(-1)
         stage_prob = float(getattr(self.cfg, "dr_push_probability", 0.5))
+        stage_push_scale = self._get_stage_value("stage_push_probability_scale", 1.0)
+        stage_push_scale = float(min(max(stage_push_scale, 0.0), 1.0))
         random_vals = torch.rand(len(candidate_ids), device=self.device)
-        push_mask = random_vals < (stage_prob * self._dr_stage_scale[candidate_ids])
+        push_mask = random_vals < (stage_prob * stage_push_scale * self._dr_stage_scale[candidate_ids])
         push_ids = candidate_ids[push_mask]
         if len(push_ids) == 0:
             return
@@ -1402,6 +1435,7 @@ class RedrhexEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         """將策略輸出轉為關節控制（含 FWD/LAT/DIAG/YAW 模式 gating）。"""
+        raw_drive_actions = self.actions[:, :6].clone()
         main_drive_pos = self.joint_pos[:, self._main_drive_indices]
         effective_pos = main_drive_pos * self._direction_multiplier
         leg_phase = torch.remainder(effective_pos, 2 * math.pi)
@@ -1414,6 +1448,18 @@ class RedrhexEnv(DirectRLEnv):
         self._mode_yaw = mode_yaw
         self._mode_id = mode_id
         self._is_pure_lateral = mode_lat
+
+        # 每回合前幾步動作暖機，避免 reset 後瞬間大動作導致翻倒
+        warmup_steps = int(self._get_stage_value("stage_action_warmup_steps", 0))
+        if warmup_steps > 0:
+            action_warmup_scale = torch.clamp(
+                (self.episode_length_buf.float() + 1.0) / float(warmup_steps),
+                min=0.0,
+                max=1.0,
+            )
+        else:
+            action_warmup_scale = torch.ones(self.num_envs, device=self.device)
+        self._action_warmup_scale = action_warmup_scale
         
         # 先做 action gating（硬限制）
         masked_drive_actions, masked_abad_actions = self._mask_actions_by_mode(mode_fwd, mode_lat)
@@ -1459,14 +1505,20 @@ class RedrhexEnv(DirectRLEnv):
         wz_ref = max(float(getattr(self.cfg, "drive_bias_wz_ref", 1.00)), 1e-3)
         vx_norm = torch.clamp(cmd_vx / vx_ref, min=-1.0, max=1.0)
         wz_norm = torch.clamp(cmd_wz / wz_ref, min=-1.0, max=1.0)
+        forward_bias_scale = float(
+            self._get_stage_value("stage_forward_bias_scale", getattr(self.cfg, "forward_drive_action_scale", 1.0))
+        )
 
         # Main-drive signed mapping: target = command bias + residual(policy)
-        forward_bias_joint = forward_profile * self._direction_multiplier * vx_norm.unsqueeze(1)
+        forward_bias_joint = forward_profile * self._direction_multiplier * vx_norm.unsqueeze(1) * forward_bias_scale
 
         # Yaw bias在「body-space」是左右反向，轉到 joint-space 後可允許反轉驅動。
         yaw_body_pattern = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device=self.device).unsqueeze(0)
         yaw_body_pattern = yaw_body_pattern * float(getattr(self.cfg, "yaw_body_pattern_sign", 1.0))
-        yaw_bias_body = yaw_body_pattern * (wz_norm.unsqueeze(1) * float(getattr(self.cfg, "yaw_drive_bias_scale", 4.5)))
+        yaw_drive_bias_scale = float(
+            self._get_stage_value("stage_yaw_drive_bias_scale", getattr(self.cfg, "yaw_drive_bias_scale", 4.5))
+        )
+        yaw_bias_body = yaw_body_pattern * (wz_norm.unsqueeze(1) * yaw_drive_bias_scale)
         yaw_bias_body = torch.where(mode_yaw.unsqueeze(1), yaw_bias_body, torch.zeros_like(yaw_bias_body))
         yaw_bias_joint = yaw_bias_body * self._direction_multiplier
 
@@ -1474,18 +1526,38 @@ class RedrhexEnv(DirectRLEnv):
         gravity_alignment = torch.sum(self.projected_gravity * self.reference_projected_gravity, dim=1).clamp(-1.0, 1.0)
         roll_pitch_rms = torch.acos(gravity_alignment)
         tilt_limit = max(float(getattr(self.cfg, "yaw_stability_tilt_limit", 0.45)), 1e-3)
-        yaw_safe_scale = torch.clamp(1.0 - roll_pitch_rms / tilt_limit, min=0.35, max=1.0)
+        yaw_safe_min = float(
+            self._get_stage_value("stage_yaw_safe_min_scale", getattr(self.cfg, "yaw_safe_min_scale", 0.35))
+        )
+        yaw_safe_scale = torch.clamp(1.0 - roll_pitch_rms / tilt_limit, min=yaw_safe_min, max=1.0)
         yaw_safe_scale = torch.where(mode_yaw, yaw_safe_scale, torch.ones_like(yaw_safe_scale))
         yaw_bias_joint = yaw_bias_joint * yaw_safe_scale.unsqueeze(1)
 
-        drive_vel_scale = float(getattr(self.cfg, "main_drive_vel_scale", 8.0))
-        residual_scale = float(getattr(self.cfg, "main_drive_residual_scale", 0.40))
+        drive_vel_scale = float(self._get_stage_value("stage_drive_vel_scale", getattr(self.cfg, "main_drive_vel_scale", 8.0)))
+        residual_scale = float(
+            self._get_stage_value("stage_main_drive_residual_scale", getattr(self.cfg, "main_drive_residual_scale", 0.40))
+        )
         drive_residual = masked_drive_actions * drive_vel_scale * residual_scale
         drive_residual = torch.where(mode_yaw.unsqueeze(1), drive_residual * yaw_safe_scale.unsqueeze(1), drive_residual)
 
-        target_drive_vel = forward_bias_joint + yaw_bias_joint + drive_residual
+        target_drive_vel = (forward_bias_joint + yaw_bias_joint + drive_residual) * action_warmup_scale.unsqueeze(1)
         max_vel = max(self.swing_velocity * 1.5, drive_vel_scale * 1.5)
         target_drive_vel = torch.clamp(target_drive_vel, min=-max_vel, max=max_vel)
+
+        # Yaw 專項硬保護：傾角超限時暫停旋轉驅動，優先保命
+        yaw_hard_brake_tilt = float(
+            self._get_stage_value("stage_yaw_hard_brake_tilt", max(tilt_limit * 1.10, 0.45))
+        )
+        yaw_hard_brake_scale = float(
+            self._get_stage_value("stage_yaw_hard_brake_scale", 0.20)
+        )
+        yaw_hard_brake = mode_yaw & (roll_pitch_rms > yaw_hard_brake_tilt)
+        if yaw_hard_brake.any():
+            target_drive_vel = torch.where(
+                yaw_hard_brake.unsqueeze(1),
+                target_drive_vel * yaw_hard_brake_scale,
+                target_drive_vel,
+            )
 
         # 保存診斷
         self._base_velocity = (forward_bias_joint + yaw_bias_joint).clone()
@@ -1497,7 +1569,9 @@ class RedrhexEnv(DirectRLEnv):
         require_stand = getattr(self.cfg, "require_stand_before_lateral", True)
         lock_main_lateral = getattr(self.cfg, "lock_main_drive_in_lateral", True)
         soft_lock_enable = getattr(self.cfg, "lateral_soft_lock_enable", True)
-        soft_lock_vel = float(getattr(self.cfg, "lateral_soft_lock_velocity", 0.8))
+        soft_lock_vel = float(
+            self._get_stage_value("stage_lateral_soft_lock_velocity", getattr(self.cfg, "lateral_soft_lock_velocity", 0.8))
+        )
         stand_timeout_s = float(getattr(self.cfg, "lateral_go_to_stand_timeout_s", 1.5))
         timeout_cooldown_steps = int(getattr(self.cfg, "lateral_timeout_cooldown_steps", 80))
 
@@ -1574,7 +1648,13 @@ class RedrhexEnv(DirectRLEnv):
                 if soft_lock_enable:
                     phase_with_offsets = self._lateral_gait_phase.unsqueeze(1) + self.leg_phase_offsets.unsqueeze(0)
                     clearance_wave = torch.sin(phase_with_offsets)
+                    policy_residual_scale = float(
+                        self._get_stage_value("stage_lateral_policy_drive_residual_scale", 0.0)
+                    )
+                    policy_residual_scale = min(max(policy_residual_scale, 0.0), 1.0)
                     soft_drive = soft_lock_vel * clearance_wave * self._direction_multiplier
+                    soft_drive += policy_residual_scale * soft_lock_vel * raw_drive_actions * self._direction_multiplier
+                    soft_drive = torch.clamp(soft_drive, min=-1.8 * soft_lock_vel, max=1.8 * soft_lock_vel)
                     final_drive_vel = torch.where(ready_mask.unsqueeze(1), soft_drive, final_drive_vel)
                 else:
                     final_drive_vel = torch.where(ready_mask.unsqueeze(1), torch.zeros_like(final_drive_vel), final_drive_vel)
@@ -1631,8 +1711,8 @@ class RedrhexEnv(DirectRLEnv):
         if self._is_lateral_mode.any():
             lateral_dir = torch.sign(self.commands[:, 1])
             phase_sin = torch.sin(self._lateral_gait_phase)
-            base_amp = float(getattr(self.cfg, "lateral_abad_base_amplitude", 0.32))
-            max_amp = float(getattr(self.cfg, "lateral_abad_max_amplitude", 0.58))
+            base_amp = float(self._get_stage_value("stage_lateral_abad_base_amplitude", getattr(self.cfg, "lateral_abad_base_amplitude", 0.32)))
+            max_amp = float(self._get_stage_value("stage_lateral_abad_max_amplitude", getattr(self.cfg, "lateral_abad_max_amplitude", 0.58)))
             vy_ref = max(float(getattr(self.cfg, "mode_lateral_min_vy", 0.12)), 1e-3)
             vy_ratio = torch.clamp(torch.abs(cmd_vy) / vy_ref, min=0.0, max=1.5)
             abad_amplitude = base_amp + (max_amp - base_amp) * torch.clamp(vy_ratio, min=0.0, max=1.0)
@@ -1645,7 +1725,7 @@ class RedrhexEnv(DirectRLEnv):
                 ],
                 dim=1,
             )
-            policy_blend = float(getattr(self.cfg, "lateral_abad_policy_blend", 0.10))
+            policy_blend = float(self._get_stage_value("stage_lateral_abad_policy_blend", getattr(self.cfg, "lateral_abad_policy_blend", 0.10)))
             policy_blend = min(max(policy_blend, 0.0), 1.0)
             blended_abad = (1.0 - policy_blend) * lateral_abad_pos + policy_blend * base_abad_pos
             target_abad_pos = torch.where(
@@ -1659,29 +1739,59 @@ class RedrhexEnv(DirectRLEnv):
             diag_dir = torch.sign(cmd_vy)
             vy_ref = max(float(getattr(self.cfg, "mode_lateral_min_vy", 0.12)), 1e-3)
             vy_ratio = torch.clamp(torch.abs(cmd_vy) / vy_ref, min=0.0, max=1.5)
-            diag_amp = float(getattr(self.cfg, "diag_abad_bias_scale", 0.18)) * torch.clamp(vy_ratio, min=0.0, max=1.0)
+            diag_amp = float(
+                self._get_stage_value("stage_diag_abad_bias_scale", getattr(self.cfg, "diag_abad_bias_scale", 0.18))
+            ) * torch.clamp(vy_ratio, min=0.0, max=1.0)
             right_diag = -diag_dir * diag_amp
             left_diag = diag_dir * diag_amp
             diag_bias = torch.stack(
                 [right_diag, right_diag, right_diag, left_diag, left_diag, left_diag],
                 dim=1,
             )
-            diag_policy_blend = float(getattr(self.cfg, "diag_abad_policy_blend", 0.70))
+            diag_policy_blend = float(
+                self._get_stage_value("stage_diag_abad_policy_blend", getattr(self.cfg, "diag_abad_policy_blend", 0.70))
+            )
             diag_policy_blend = min(max(diag_policy_blend, 0.0), 1.0)
             diag_target = diag_policy_blend * base_abad_pos + (1.0 - diag_policy_blend) * diag_bias
             target_abad_pos = torch.where(mode_diag.unsqueeze(1), diag_target, target_abad_pos)
 
         # YAW：保留 ABAD 自由度，但降低振幅避免一開始旋轉就掀翻
-        yaw_abad_scale = float(getattr(self.cfg, "yaw_abad_action_scale", 1.0))
+        yaw_abad_scale = float(
+            self._get_stage_value("stage_yaw_abad_action_scale", getattr(self.cfg, "yaw_abad_action_scale", 1.0))
+        )
         yaw_abad_scale = min(max(yaw_abad_scale, 0.0), 1.0)
         target_abad_pos = torch.where(
             mode_yaw.unsqueeze(1),
             target_abad_pos * yaw_abad_scale,
             target_abad_pos,
         )
+        yaw_stance_bias = float(
+            self._get_stage_value("stage_yaw_abad_stance_bias", 0.0)
+        )
+        if mode_yaw.any() and yaw_stance_bias > 1e-6:
+            yaw_stance = torch.tensor(
+                [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device=self.device
+            ).unsqueeze(0)
+            yaw_stance_target = yaw_stance * yaw_stance_bias
+            yaw_stance_blend = float(
+                self._get_stage_value("stage_yaw_abad_policy_blend", 0.7)
+            )
+            yaw_stance_blend = min(max(yaw_stance_blend, 0.0), 1.0)
+            blended_yaw_abad = yaw_stance_blend * target_abad_pos + (1.0 - yaw_stance_blend) * yaw_stance_target
+            target_abad_pos = torch.where(mode_yaw.unsqueeze(1), blended_yaw_abad, target_abad_pos)
+        if yaw_hard_brake.any():
+            target_abad_pos = torch.where(
+                yaw_hard_brake.unsqueeze(1),
+                target_abad_pos * yaw_hard_brake_scale,
+                target_abad_pos,
+            )
+
+        target_abad_pos = target_abad_pos * action_warmup_scale.unsqueeze(1)
         
         target_abad_pos = target_abad_pos * self._abad_strength_scale.unsqueeze(1)
-        abad_limit = float(getattr(self.cfg, "abad_pos_limit", max(float(self.cfg.abad_pos_scale), 0.5)))
+        abad_limit = float(
+            self._get_stage_value("stage_abad_pos_limit", getattr(self.cfg, "abad_pos_limit", max(float(self.cfg.abad_pos_scale), 0.5)))
+        )
         target_abad_pos = torch.clamp(target_abad_pos, min=-abad_limit, max=abad_limit)
         self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
         
@@ -1903,11 +2013,14 @@ class RedrhexEnv(DirectRLEnv):
         signed_wz = cmd_wz_sign * actual_wz
         
         rew_mode = torch.zeros(self.num_envs, device=self.device)
+        lateral_mult = float(self._get_stage_value("stage_lateral_reward_multiplier", 1.0))
+        diag_mult = float(self._get_stage_value("stage_diag_reward_multiplier", 1.0))
+        yaw_mult = float(self._get_stage_value("stage_yaw_reward_multiplier", 1.0))
         lateral_mode_reward = signed_vy - 0.8 * torch.abs(actual_vx) - 0.3 * torch.abs(actual_wz)
-        rew_mode += torch.where(mode_lat, lateral_mode_reward, torch.zeros_like(lateral_mode_reward))
+        rew_mode += torch.where(mode_lat, lateral_mode_reward * lateral_mult, torch.zeros_like(lateral_mode_reward))
         
         rotation_mode_reward = signed_wz - 0.7 * actual_lin_speed
-        rew_mode += torch.where(mode_yaw, rotation_mode_reward, torch.zeros_like(rotation_mode_reward))
+        rew_mode += torch.where(mode_yaw, rotation_mode_reward * yaw_mult, torch.zeros_like(rotation_mode_reward))
         
         cmd_ratio = torch.abs(cmd_vy) / (torch.abs(cmd_vx) + 1e-5)
         actual_ratio = torch.abs(actual_vy) / (torch.abs(actual_vx) + 1e-5)
@@ -1923,13 +2036,30 @@ class RedrhexEnv(DirectRLEnv):
             - diag_wrong_sign_penalty
             - 0.5 * torch.clamp(-signed_vy, min=0.0)
         )
-        rew_mode += torch.where(mode_diag, diagonal_reward, torch.zeros_like(diagonal_reward))
+        rew_mode += torch.where(mode_diag, diagonal_reward * diag_mult, torch.zeros_like(diagonal_reward))
         
         rew_mode = rew_mode * scales.get("mode_specialization", 2.5)
         total_reward += rew_mode
 
-        rew_diag_sign = torch.where(mode_diag, diag_sign_bonus - diag_wrong_sign_penalty, torch.zeros_like(diag_sign_bonus))
+        rew_diag_sign = torch.where(
+            mode_diag,
+            (diag_sign_bonus - diag_wrong_sign_penalty) * diag_mult,
+            torch.zeros_like(diag_sign_bonus),
+        )
         total_reward += rew_diag_sign
+
+        # 斜向速度協同：同時推進 vx 和 vy，避免只學「半邊斜走」
+        diag_pos_vx = torch.clamp(cmd_vx_sign * actual_vx, min=0.0)
+        diag_pos_vy = torch.clamp(cmd_vy_sign * actual_vy, min=0.0)
+        diag_norm_vx = diag_pos_vx / torch.clamp(torch.abs(cmd_vx), min=0.05)
+        diag_norm_vy = diag_pos_vy / torch.clamp(torch.abs(cmd_vy), min=0.05)
+        diag_balanced_speed = torch.minimum(diag_norm_vx, diag_norm_vy)
+        rew_diag_speed = torch.where(
+            mode_diag,
+            torch.clamp(diag_balanced_speed, min=0.0, max=1.5) * scales.get("diag_speed_bonus", 2.6) * diag_mult,
+            torch.zeros_like(diag_balanced_speed),
+        )
+        total_reward += rew_diag_speed
 
         # R3.1: 側移 soft-lock（主驅動越大懲罰越重，避免 lateral 靠主驅動亂轉）
         lateral_drive_mag = torch.abs(main_drive_vel).mean(dim=1)
@@ -1941,16 +2071,28 @@ class RedrhexEnv(DirectRLEnv):
         total_reward += rew_lateral_soft_lock
 
         # R3.1b: 側移速度不足懲罰（避免「有側移命令但幾乎原地不動」）
-        lateral_target_ratio = max(float(scales.get("lateral_speed_target_ratio", 0.70)), 0.0)
+        lateral_target_ratio = max(
+            float(self._get_stage_value("stage_lateral_speed_target_ratio", scales.get("lateral_speed_target_ratio", 0.70))),
+            0.0,
+        )
         lateral_target_speed = lateral_target_ratio * torch.abs(cmd_vy)
         lateral_achieved = torch.clamp(signed_vy, min=0.0)
         lateral_deficit = torch.relu(lateral_target_speed - lateral_achieved)
         rew_lateral_speed_deficit = torch.where(
             mode_lat,
-            -lateral_deficit * scales.get("lateral_speed_deficit_penalty", 3.0),
+            -lateral_deficit * scales.get("lateral_speed_deficit_penalty", 3.0) * lateral_mult,
             torch.zeros_like(lateral_deficit),
         )
         total_reward += rew_lateral_speed_deficit
+
+        lateral_ratio = lateral_achieved / torch.clamp(torch.abs(cmd_vy), min=0.05)
+        lateral_speed_bonus = torch.clamp(lateral_ratio, min=0.0, max=1.5)
+        rew_lateral_speed_bonus = torch.where(
+            mode_lat,
+            lateral_speed_bonus * scales.get("lateral_speed_bonus", 2.5) * lateral_mult,
+            torch.zeros_like(lateral_speed_bonus),
+        )
+        total_reward += rew_lateral_speed_bonus
 
         # R3.2: Yaw 專項（追蹤 + 穩定 + 防作弊抬升）
         yaw_track_bonus = torch.where(
@@ -1980,7 +2122,16 @@ class RedrhexEnv(DirectRLEnv):
         rew_yaw_track = yaw_track_bonus
         rew_yaw_stability = -yaw_stability_penalty
         rew_yaw_cheat = -yaw_cheat_penalty
-        total_reward += rew_yaw_track + rew_yaw_stability + rew_yaw_cheat
+        yaw_ratio = torch.abs(actual_wz) / torch.clamp(torch.abs(cmd_wz), min=0.10)
+        rew_yaw_spin = torch.where(
+            mode_yaw,
+            torch.clamp(yaw_ratio, min=0.0, max=1.8) * scales.get("yaw_spin_bonus", 3.0) * yaw_mult,
+            torch.zeros_like(yaw_ratio),
+        )
+        rew_yaw_track = rew_yaw_track * yaw_mult
+        rew_yaw_stability = rew_yaw_stability * yaw_mult
+        rew_yaw_cheat = rew_yaw_cheat * yaw_mult
+        total_reward += rew_yaw_track + rew_yaw_stability + rew_yaw_cheat + rew_yaw_spin
         
         # R3.5: Forward gait prior（僅 FWD mode）
         effective_pos = main_drive_pos * self._direction_multiplier
@@ -2056,18 +2207,32 @@ class RedrhexEnv(DirectRLEnv):
         # 注意：roll/pitch 在不同初始姿態下可能帶固定偏置，不適合直接當 terminate 依據。
         # 這裡改用 body_tilt + base_height 當「是否倒地」主條件，避免一出生就被誤判。
         body_tilt = 1.0 - gravity_alignment
-        fall_height_threshold = float(scales.get("fall_height_threshold", 0.10))
+        fall_height_threshold = float(
+            self._get_stage_value("stage_fall_height_threshold", float(scales.get("fall_height_threshold", 0.10)))
+        )
         fall_tilt_threshold = float(
-            scales.get("fall_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55))
+            self._get_stage_value(
+                "stage_fall_tilt_threshold",
+                float(scales.get("fall_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55))),
+            )
         )
         is_fallen = (base_height < fall_height_threshold) | (body_tilt > fall_tilt_threshold)
         rew_fall = is_fallen.float() * scales.get("fall", -8.0)
         total_reward += rew_fall
 
         # body_contact 提供 _get_dones() 使用，門檻獨立於 fall reward
-        body_contact_height_threshold = float(getattr(self.cfg, "body_contact_height_threshold", 0.08))
+        body_contact_height_threshold = float(
+            self._get_stage_value("stage_body_contact_height_threshold", getattr(self.cfg, "body_contact_height_threshold", 0.08))
+        )
+        if self._curriculum_stage == 1:
+            body_contact_height_threshold = float(
+                getattr(self.cfg, "stage1_body_contact_height_threshold", body_contact_height_threshold)
+            )
         body_contact_tilt_threshold = float(
-            getattr(self.cfg, "body_contact_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55))
+            self._get_stage_value(
+                "stage_body_contact_tilt_threshold",
+                getattr(self.cfg, "body_contact_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55)),
+            )
         )
         self._body_contact = (base_height < body_contact_height_threshold) | (body_tilt > body_contact_tilt_threshold)
         self._body_tilt = body_tilt
@@ -2086,10 +2251,13 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_axis_suppression"] += rew_axis_suppression
         self.episode_sums["rew_lateral_soft_lock"] += rew_lateral_soft_lock
         self.episode_sums["rew_lateral_speed_deficit"] += rew_lateral_speed_deficit
+        self.episode_sums["rew_lateral_speed_bonus"] += rew_lateral_speed_bonus
         self.episode_sums["rew_diag_sign"] += rew_diag_sign
+        self.episode_sums["rew_diag_speed"] += rew_diag_speed
         self.episode_sums["rew_yaw_track"] += rew_yaw_track
         self.episode_sums["rew_yaw_stability"] += rew_yaw_stability
         self.episode_sums["rew_yaw_cheat"] += rew_yaw_cheat
+        self.episode_sums["rew_yaw_spin"] += rew_yaw_spin
         self.episode_sums["rew_height"] += rew_height
         self.episode_sums["rew_leg_moving"] += rew_leg_moving
         self.episode_sums["rew_stall"] += rew_stall
@@ -2131,6 +2299,7 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_obs_latency_steps"] += self._obs_latency_steps.float()
         self.episode_sums["diag_push_events"] += self._push_events_step
         self.episode_sums["diag_terrain_level"] += self._terrain_level
+        self.episode_sums["diag_action_warmup"] += self._action_warmup_scale
         
         self.last_main_drive_vel = main_drive_vel.clone()
         return total_reward
@@ -3211,7 +3380,7 @@ class RedrhexEnv(DirectRLEnv):
         # 使用之前計算的 body_tilt 來判斷
         # ★★★ 放寬到 1.5（約 115 度），配合 config 中的 max_tilt_magnitude ★★★
         if hasattr(self, '_body_tilt'):
-            max_tilt = getattr(self.cfg, 'max_tilt_magnitude', 2.0)
+            max_tilt = float(self._get_stage_value("stage_max_tilt_magnitude", getattr(self.cfg, 'max_tilt_magnitude', 2.0)))
             flipped_over = self._body_tilt > max_tilt
         else:
             # 回退方案：第一次調用時可能還沒有 _body_tilt
@@ -3224,7 +3393,9 @@ class RedrhexEnv(DirectRLEnv):
         # 終止條件 4：高度異常
         # =================================================================
         base_height = root_pos[:, 2]   # 機身高度（Z 座標）
-        min_height = getattr(self.cfg, 'min_base_height', -0.05)
+        min_height = float(self._get_stage_value("stage_min_base_height", getattr(self.cfg, 'min_base_height', -0.05)))
+        if self._curriculum_stage == 1:
+            min_height = float(getattr(self.cfg, "stage1_min_base_height", min_height))
         too_low = base_height < min_height  # 使用 config 中的值
         too_high = base_height > 2.0   # 高於 2 公尺（飛上天了？）
         
@@ -3236,6 +3407,16 @@ class RedrhexEnv(DirectRLEnv):
         body_contact_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self.cfg.terminate_on_body_contact and hasattr(self, '_body_contact'):
             body_contact_terminated = self._body_contact
+
+        # 啟動保護期：避免 reset 剛落地/數值瞬態造成「一出生就死亡」
+        grace_steps = int(self._get_stage_value("stage_termination_grace_steps", getattr(self.cfg, "termination_grace_steps", 0)))
+        if self._curriculum_stage == 1:
+            grace_steps = max(grace_steps, int(getattr(self.cfg, "stage1_termination_grace_steps", grace_steps)))
+        if grace_steps > 0:
+            in_grace = self.episode_length_buf < grace_steps
+            flipped_over = flipped_over & (~in_grace)
+            too_low = too_low & (~in_grace)
+            body_contact_terminated = body_contact_terminated & (~in_grace)
         
         # 每隔一段時間打印一次終止原因統計
         if not hasattr(self, '_term_debug_counter'):
@@ -3361,11 +3542,14 @@ class RedrhexEnv(DirectRLEnv):
         self._roll_rms[env_ids] = 0.0
         self._pitch_rms[env_ids] = 0.0
         self._yaw_slip_proxy[env_ids] = 0.0
+        self._body_contact[env_ids] = False
+        self._body_tilt[env_ids] = 0.0
         self._forward_stance_frac_ema[env_ids] = float(
             getattr(self.cfg, "forward_duty_target", self.cfg.stance_duty_cycle)
         )
         self._forward_vel_ratio_proxy[env_ids] = 0.0
         self._forward_transition_weight[env_ids] = 0.0
+        self._action_warmup_scale[env_ids] = 0.0
         self._push_events[env_ids] = 0.0
         self._push_events_step[env_ids] = 0.0
         self._obs_history[env_ids] = 0.0
