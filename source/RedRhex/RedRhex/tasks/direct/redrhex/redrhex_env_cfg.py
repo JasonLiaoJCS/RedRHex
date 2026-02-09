@@ -757,33 +757,33 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     stage1_forward_vx_range = [0.20, 0.45]
 
     stage2_use_discrete_directions = False
-    stage2_discrete_directions = [[0.0, 0.40, 0.0], [0.0, -0.40, 0.0]]
-    stage2_lateral_vy_abs_range = [0.28, 0.58]
+    stage2_discrete_directions = [[0.0, 0.44, 0.0], [0.0, -0.44, 0.0]]
+    stage2_lateral_vy_abs_range = [0.32, 0.64]
 
     # Stage3: Diagonal-only（融合 stage1 前進 + stage2 側移）
     stage3_use_discrete_directions = True
     stage3_discrete_directions = [
-        [0.34, 0.28, 0.0],
-        [0.34, -0.28, 0.0],
-        [0.44, 0.34, 0.0],
-        [0.44, -0.34, 0.0],
-        [0.50, 0.38, 0.0],
-        [0.50, -0.38, 0.0],
+        [0.36, 0.30, 0.0],
+        [0.36, -0.30, 0.0],
+        [0.46, 0.36, 0.0],
+        [0.46, -0.36, 0.0],
+        [0.54, 0.42, 0.0],
+        [0.54, -0.42, 0.0],
     ]
-    stage3_diag_vx_range = [0.32, 0.56]
-    stage3_diag_vy_abs_range = [0.26, 0.44]
+    stage3_diag_vx_range = [0.34, 0.60]
+    stage3_diag_vy_abs_range = [0.28, 0.48]
 
     # Stage4: Yaw-only（先把原地旋轉練穩）
     stage4_use_discrete_directions = True
     stage4_discrete_directions = [
-        [0.0, 0.0, 0.28],
-        [0.0, 0.0, -0.28],
-        [0.0, 0.0, 0.45],
-        [0.0, 0.0, -0.45],
-        [0.0, 0.0, 0.62],
-        [0.0, 0.0, -0.62],
+        [0.0, 0.0, 0.22],
+        [0.0, 0.0, -0.22],
+        [0.0, 0.0, 0.38],
+        [0.0, 0.0, -0.38],
+        [0.0, 0.0, 0.54],
+        [0.0, 0.0, -0.54],
     ]
-    stage4_yaw_wz_abs_range = [0.25, 0.70]
+    stage4_yaw_wz_abs_range = [0.20, 0.62]
 
     # Stage5: Mixed skills（最終整合）
     stage5_use_discrete_directions = False
@@ -796,12 +796,12 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         [0.00, 0.00, 0.80],
         [0.00, 0.00, -0.80],
     ]
-    stage5_mode_probabilities = [0.17, 0.25, 0.33, 0.25]  # [FWD, LAT, DIAG, YAW]
+    stage5_mode_probabilities = [0.28, 0.24, 0.24, 0.24]  # [FWD, LAT, DIAG, YAW]
     stage5_forward_vx_range = [0.22, 0.45]
-    stage5_lateral_vy_abs_range = [0.26, 0.56]
-    stage5_diag_vx_range = [0.30, 0.54]
-    stage5_diag_vy_abs_range = [0.24, 0.42]
-    stage5_yaw_wz_abs_range = [0.30, 0.72]
+    stage5_lateral_vy_abs_range = [0.28, 0.60]
+    stage5_diag_vx_range = [0.32, 0.56]
+    stage5_diag_vy_abs_range = [0.26, 0.44]
+    stage5_yaw_wz_abs_range = [0.28, 0.70]
 
     # 若設 True，環境會依 command_resample_time 週期重採樣命令
     command_resample_on_timer = False
@@ -853,6 +853,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     yaw_body_pattern_sign = 1.0
     yaw_stability_tilt_limit = 0.38
     yaw_safe_min_scale = 0.20
+    forward_residual_cap_ratio = 0.22
 
     # -------------------------------------------------------------------------
     # Stage 穩定配置（1..5 對應 Stage1..Stage5）
@@ -860,31 +861,39 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # -------------------------------------------------------------------------
     # Stage1: 前進穩定優先（強 bias，較低 residual）
     stage_drive_vel_scale = [8.0, 4.8, 6.2, 5.2, 6.8]
-    stage_main_drive_residual_scale = [0.10, 0.12, 0.18, 0.16, 0.22]
-    stage_forward_bias_scale = [1.00, 0.30, 0.50, 0.30, 0.55]
-    stage_yaw_drive_bias_scale = [1.2, 1.0, 1.7, 2.2, 2.4]
-    stage_yaw_safe_min_scale = [0.18, 0.18, 0.22, 0.18, 0.22]
-    stage_yaw_hard_brake_tilt = [0.58, 0.58, 0.52, 0.44, 0.48]
-    stage_yaw_hard_brake_scale = [0.34, 0.34, 0.28, 0.30, 0.28]
-    stage_lateral_soft_lock_velocity = [1.3, 2.3, 1.8, 1.3, 2.1]
-    stage_lateral_policy_drive_residual_scale = [0.00, 0.30, 0.14, 0.07, 0.25]
-    stage_lateral_abad_base_amplitude = [0.40, 0.58, 0.50, 0.42, 0.54]
-    stage_lateral_abad_max_amplitude = [0.62, 0.86, 0.76, 0.64, 0.80]
-    stage_lateral_abad_policy_blend = [0.05, 0.22, 0.14, 0.09, 0.16]
-    stage_diag_abad_bias_scale = [0.18, 0.18, 0.34, 0.22, 0.28]
-    stage_diag_abad_policy_blend = [0.72, 0.74, 0.56, 0.68, 0.62]
-    stage_yaw_abad_action_scale = [0.38, 0.42, 0.48, 0.52, 0.58]
-    stage_yaw_abad_stance_bias = [0.06, 0.08, 0.10, 0.16, 0.13]
-    stage_yaw_abad_policy_blend = [0.85, 0.80, 0.72, 0.58, 0.62]
+    stage_main_drive_residual_scale = [0.10, 0.14, 0.18, 0.14, 0.20]
+    stage_forward_bias_scale = [1.00, 0.35, 0.55, 0.35, 0.90]
+    stage_yaw_drive_bias_scale = [0.90, 0.90, 1.20, 1.30, 1.50]
+    stage_yaw_safe_min_scale = [0.18, 0.18, 0.20, 0.10, 0.18]
+    stage_yaw_hard_brake_tilt = [0.58, 0.58, 0.52, 0.42, 0.46]
+    stage_yaw_hard_brake_scale = [0.34, 0.34, 0.26, 0.16, 0.24]
+    stage_lateral_soft_lock_velocity = [1.3, 2.8, 2.0, 1.4, 2.3]
+    stage_lateral_policy_drive_residual_scale = [0.00, 0.42, 0.18, 0.08, 0.30]
+    stage_lateral_abad_base_amplitude = [0.40, 0.66, 0.54, 0.44, 0.58]
+    stage_lateral_abad_max_amplitude = [0.62, 0.95, 0.82, 0.66, 0.86]
+    stage_lateral_abad_policy_blend = [0.05, 0.26, 0.16, 0.10, 0.18]
+    stage_diag_abad_bias_scale = [0.18, 0.20, 0.40, 0.24, 0.32]
+    stage_diag_abad_policy_blend = [0.72, 0.72, 0.48, 0.66, 0.58]
+    stage_yaw_abad_action_scale = [0.38, 0.40, 0.46, 0.36, 0.46]
+    stage_yaw_abad_stance_bias = [0.06, 0.08, 0.10, 0.11, 0.12]
+    stage_yaw_abad_policy_blend = [0.85, 0.78, 0.70, 0.42, 0.56]
     stage_abad_pos_limit = [0.48, 0.62, 0.58, 0.56, 0.62]
     # Stage1 暖機不宜過長，避免有效控制長時間被壓小
     stage_action_warmup_steps = [30, 120, 100, 140, 120]
+    # 防遺忘：Forward 模式下，後續 stage 僅保留小殘差，避免破壞穩定直走
+    stage_forward_policy_drive_residual_scale = [0.10, 0.02, 0.02, 0.02, 0.06]
+    stage_diag_policy_drive_residual_scale = [0.05, 0.08, 0.16, 0.08, 0.20]
+    stage_yaw_policy_drive_residual_scale = [0.05, 0.08, 0.12, 0.10, 0.18]
+    stage_forward_residual_cap_ratio = [0.26, 0.18, 0.18, 0.18, 0.22]
 
     # Stage 專屬 reward 強化倍率
-    stage_lateral_reward_multiplier = [1.00, 1.80, 1.20, 1.00, 1.35]
-    stage_diag_reward_multiplier = [1.00, 1.00, 1.65, 1.00, 1.35]
-    stage_yaw_reward_multiplier = [1.00, 1.00, 1.15, 1.80, 1.45]
-    stage_lateral_speed_target_ratio = [0.65, 0.72, 0.72, 0.68, 0.78]
+    stage_lateral_reward_multiplier = [1.00, 2.20, 1.30, 1.00, 1.55]
+    stage_diag_reward_multiplier = [1.00, 1.00, 2.00, 1.00, 1.45]
+    stage_yaw_reward_multiplier = [1.00, 1.00, 1.10, 2.20, 1.60]
+    # 保留直走能力：在 Stage1 與 Stage5 讓 forward 相關 reward 權重更高，減少遺忘
+    stage_forward_reward_multiplier = [1.20, 0.35, 0.80, 0.45, 1.25]
+    stage_forward_gait_reward_multiplier = [1.45, 0.40, 0.90, 0.55, 1.35]
+    stage_lateral_speed_target_ratio = [0.65, 0.82, 0.78, 0.68, 0.82]
 
     # -------------------------------------------------------------------------
     # Forward gait prior（reward shaping 專用）
@@ -1508,12 +1517,12 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "lateral_drive_soft_penalty": 1.5,
 
         # 側移/斜向補充 shaping（保守提高，不過度干擾前進）
-        "lateral_speed_deficit_penalty": 2.0,
+        "lateral_speed_deficit_penalty": 2.6,
         "lateral_speed_target_ratio": 0.70,
-        "lateral_speed_bonus": 1.5,
-        "diag_sign_bonus": 1.0,
-        "diag_wrong_sign_penalty": 1.5,
-        "diag_speed_bonus": 1.2,
+        "lateral_speed_bonus": 2.0,
+        "diag_sign_bonus": 1.2,
+        "diag_wrong_sign_penalty": 1.8,
+        "diag_speed_bonus": 1.8,
 
         # Forward gait prior
         "forward_prior_coherence": 1.2,
@@ -1540,11 +1549,11 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
         # Yaw 穩定專項（回到穩定版量級）
         "yaw_mode_track_bonus": 2.0,
-        "yaw_spin_bonus": 1.0,
+        "yaw_spin_bonus": 1.6,
         "yaw_roll_pitch_penalty": 3.0,
         "yaw_height_penalty": 1.5,
         "yaw_target_base_height": 0.12,
-        "yaw_slip_penalty": 1.0,
+        "yaw_slip_penalty": 1.3,
         "yaw_slip_cap": 2.0,
         "yaw_cheat_penalty": 4.0,
         "yaw_cheat_min_wz": 0.4,

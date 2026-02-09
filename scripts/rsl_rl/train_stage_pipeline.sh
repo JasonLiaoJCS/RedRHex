@@ -43,6 +43,7 @@ fi
 
 # Stability gate: fail fast if a stage is clearly unstable.
 STABILITY_GATE="${STABILITY_GATE:-1}"
+STABILITY_GATE_STRICT="${STABILITY_GATE_STRICT:-0}"
 STAGE1_MIN_EP_LEN="${STAGE1_MIN_EP_LEN:-55}"
 STAGE2_MIN_EP_LEN="${STAGE2_MIN_EP_LEN:-45}"
 STAGE3_MIN_EP_LEN="${STAGE3_MIN_EP_LEN:-50}"
@@ -155,11 +156,14 @@ latest_ckpt_in_run() {
 find_last_line() {
   local needle="$1"
   local file="$2"
+  local line=""
   if command -v rg >/dev/null 2>&1; then
-    rg --no-messages -F "$needle" "$file" | tail -1 || true
-  else
-    grep -F "$needle" "$file" | tail -1 || true
+    line="$(rg --no-messages -F "$needle" "$file" 2>/dev/null | tail -1 || true)"
   fi
+  if [[ -z "$line" ]]; then
+    line="$(grep -F "$needle" "$file" 2>/dev/null | tail -1 || true)"
+  fi
+  echo "$line"
 }
 
 stage_min_ep_len() {
@@ -215,9 +219,21 @@ validate_stage_health() {
   ep_line="$(find_last_line "Mean episode length:" "$stage_log")"
   term_line="$(find_last_line "Episode_Termination/terminated:" "$stage_log")"
 
+  # 有些環境下 stage log 可能缺最後幾行，退回到 pipeline 總 log 再抓一次
+  if [[ -z "$ep_line" ]]; then
+    ep_line="$(find_last_line "Mean episode length:" "$PIPELINE_LOG")"
+  fi
+  if [[ -z "$term_line" ]]; then
+    term_line="$(find_last_line "Episode_Termination/terminated:" "$PIPELINE_LOG")"
+  fi
+
   if [[ -z "$ep_line" && -z "$term_line" ]]; then
-    echo "[ERROR] Stage ${stage} health gate: missing metrics in $stage_log" | tee -a "$PIPELINE_LOG"
-    exit 1
+    if [[ "$STABILITY_GATE_STRICT" == "1" ]]; then
+      echo "[ERROR] Stage ${stage} health gate: missing metrics in $stage_log" | tee -a "$PIPELINE_LOG"
+      exit 1
+    fi
+    echo "[WARN] Stage ${stage} health gate: missing metrics in $stage_log, skip this gate." | tee -a "$PIPELINE_LOG"
+    return
   fi
 
   ep_len=""

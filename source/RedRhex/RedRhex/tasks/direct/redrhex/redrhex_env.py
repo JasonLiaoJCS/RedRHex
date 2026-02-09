@@ -1518,7 +1518,13 @@ class RedrhexEnv(DirectRLEnv):
         yaw_drive_bias_scale = float(
             self._get_stage_value("stage_yaw_drive_bias_scale", getattr(self.cfg, "yaw_drive_bias_scale", 4.5))
         )
-        yaw_bias_body = yaw_body_pattern * (wz_norm.unsqueeze(1) * yaw_drive_bias_scale)
+        # 用 phase gain 讓 yaw 也維持「stance 慢 / swing 快」節奏，降低掀翻風險。
+        yaw_phase_gain = torch.where(
+            desired_in_stance,
+            torch.full_like(desired_phase, float(getattr(self.cfg, "stance_velocity_ratio", 0.15))),
+            torch.full_like(desired_phase, float(getattr(self.cfg, "swing_velocity_ratio", 1.5))),
+        )
+        yaw_bias_body = yaw_body_pattern * (wz_norm.unsqueeze(1) * yaw_drive_bias_scale) * yaw_phase_gain
         yaw_bias_body = torch.where(mode_yaw.unsqueeze(1), yaw_bias_body, torch.zeros_like(yaw_bias_body))
         yaw_bias_joint = yaw_bias_body * self._direction_multiplier
 
@@ -1534,11 +1540,41 @@ class RedrhexEnv(DirectRLEnv):
         yaw_bias_joint = yaw_bias_joint * yaw_safe_scale.unsqueeze(1)
 
         drive_vel_scale = float(self._get_stage_value("stage_drive_vel_scale", getattr(self.cfg, "main_drive_vel_scale", 8.0)))
-        residual_scale = float(
+        base_residual_scale = float(
             self._get_stage_value("stage_main_drive_residual_scale", getattr(self.cfg, "main_drive_residual_scale", 0.40))
         )
-        drive_residual = masked_drive_actions * drive_vel_scale * residual_scale
+        forward_residual_scale = float(
+            self._get_stage_value("stage_forward_policy_drive_residual_scale", base_residual_scale)
+        )
+        diag_residual_scale = float(
+            self._get_stage_value("stage_diag_policy_drive_residual_scale", base_residual_scale)
+        )
+        yaw_residual_scale = float(
+            self._get_stage_value("stage_yaw_policy_drive_residual_scale", base_residual_scale)
+        )
+        residual_scale_map = torch.full((self.num_envs, 1), base_residual_scale, device=self.device)
+        residual_scale_map = torch.where(mode_fwd.unsqueeze(1), torch.full_like(residual_scale_map, forward_residual_scale), residual_scale_map)
+        residual_scale_map = torch.where(mode_diag.unsqueeze(1), torch.full_like(residual_scale_map, diag_residual_scale), residual_scale_map)
+        residual_scale_map = torch.where(mode_yaw.unsqueeze(1), torch.full_like(residual_scale_map, yaw_residual_scale), residual_scale_map)
+        drive_residual = masked_drive_actions * drive_vel_scale * residual_scale_map
         drive_residual = torch.where(mode_yaw.unsqueeze(1), drive_residual * yaw_safe_scale.unsqueeze(1), drive_residual)
+        # 保留前進穩定：限制 FWD 模式殘差不超過 forward bias 的固定比例，降低遺忘。
+        forward_residual_cap_ratio = float(
+            self._get_stage_value(
+                "stage_forward_residual_cap_ratio",
+                getattr(self.cfg, "forward_residual_cap_ratio", 0.22),
+            )
+        )
+        if mode_fwd.any():
+            forward_residual_cap = torch.clamp(
+                torch.abs(forward_bias_joint) * forward_residual_cap_ratio,
+                min=0.08,
+            )
+            drive_residual = torch.where(
+                mode_fwd.unsqueeze(1),
+                torch.clamp(drive_residual, min=-forward_residual_cap, max=forward_residual_cap),
+                drive_residual,
+            )
 
         target_drive_vel = (forward_bias_joint + yaw_bias_joint + drive_residual) * action_warmup_scale.unsqueeze(1)
         max_vel = max(self.swing_velocity * 1.5, drive_vel_scale * 1.5)
@@ -1930,6 +1966,11 @@ class RedrhexEnv(DirectRLEnv):
         })
         
         mode_fwd, mode_lat, mode_diag, mode_yaw, _ = self._resolve_command_modes()
+        forward_mult = float(self._get_stage_value("stage_forward_reward_multiplier", 1.0))
+        forward_gait_mult = float(self._get_stage_value("stage_forward_gait_reward_multiplier", 1.0))
+        lateral_mult = float(self._get_stage_value("stage_lateral_reward_multiplier", 1.0))
+        diag_mult = float(self._get_stage_value("stage_diag_reward_multiplier", 1.0))
+        yaw_mult = float(self._get_stage_value("stage_yaw_reward_multiplier", 1.0))
         
         main_drive_pos = self.joint_pos[:, self._main_drive_indices]
         main_drive_vel = self.joint_vel[:, self._main_drive_indices]
@@ -1981,6 +2022,7 @@ class RedrhexEnv(DirectRLEnv):
             - 0.5 * cross_track_error
             - 1.0 * backward_slip
         ) * scales.get("forward_progress", 5.0)
+        rew_forward = torch.where(mode_fwd, rew_forward * forward_mult, rew_forward)
         total_reward += rew_forward
         
         # R2: 速度追蹤
@@ -2005,6 +2047,7 @@ class RedrhexEnv(DirectRLEnv):
         yaw_tracking_reward = torch.where(torch.abs(cmd_wz) > yaw_eps, tracking_wz, yaw_stop_reward)
         
         rew_tracking = (lin_tracking_reward + yaw_tracking_reward) * scales.get("velocity_tracking", 4.0)
+        rew_tracking = torch.where(mode_fwd, rew_tracking * forward_mult, rew_tracking)
         total_reward += rew_tracking
         
         # R3: 模式專屬 shaping（LAT / YAW / DIAG）
@@ -2013,9 +2056,6 @@ class RedrhexEnv(DirectRLEnv):
         signed_wz = cmd_wz_sign * actual_wz
         
         rew_mode = torch.zeros(self.num_envs, device=self.device)
-        lateral_mult = float(self._get_stage_value("stage_lateral_reward_multiplier", 1.0))
-        diag_mult = float(self._get_stage_value("stage_diag_reward_multiplier", 1.0))
-        yaw_mult = float(self._get_stage_value("stage_yaw_reward_multiplier", 1.0))
         lateral_mode_reward = signed_vy - 0.8 * torch.abs(actual_vx) - 0.3 * torch.abs(actual_wz)
         rew_mode += torch.where(mode_lat, lateral_mode_reward * lateral_mult, torch.zeros_like(lateral_mode_reward))
         
@@ -2149,6 +2189,7 @@ class RedrhexEnv(DirectRLEnv):
             + rew_forward_prior_vel_ratio
             + rew_forward_prior_overlap
         )
+        rew_forward_gait = rew_forward_gait * forward_gait_mult
         total_reward += rew_forward_gait
         stance_count = forward_terms["stance_count"]
         phase_diff = forward_terms["phase_diff"]
