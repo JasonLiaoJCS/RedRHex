@@ -8,7 +8,9 @@ import csv
 import math
 import os
 import sys
+import re
 from collections import defaultdict
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from isaaclab.app import AppLauncher
@@ -59,6 +61,12 @@ parser.add_argument("--accept_min_base_height", type=float, default=0.12, help="
 parser.add_argument("--accept_max_fall_rate", type=float, default=0.20, help="Max fall-rate allowed per command.")
 parser.add_argument("--accept_skill_pass_ratio", type=float, default=0.60, help="Skill-level pass ratio threshold.")
 parser.add_argument("--accept_overall_pass_ratio", type=float, default=0.70, help="Overall command pass-ratio threshold.")
+parser.add_argument(
+    "--disable_auto_stage_from_checkpoint",
+    action="store_true",
+    default=False,
+    help="Do not auto-set env.stage from checkpoint run-name suffix like *_stage4.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -90,6 +98,90 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import RedRhex.tasks  # noqa: F401
+
+
+def _model_step_from_name(path: Path) -> int:
+    match = re.fullmatch(r"model_(\d+)\.pt", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _pick_latest_model_checkpoint(run_dir: Path) -> Path | None:
+    if not run_dir.exists() or not run_dir.is_dir():
+        return None
+    candidates = [p for p in run_dir.glob("model_*.pt") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=_model_step_from_name)
+
+
+def _pick_latest_model_checkpoint_recursive(root_dir: Path) -> Path | None:
+    if not root_dir.exists() or not root_dir.is_dir():
+        return None
+    candidates = [p for p in root_dir.rglob("model_*.pt") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_rsl_rl_checkpoint_path(raw_checkpoint: str, fallback_root: str | None = None) -> str:
+    """Resolve user checkpoint arg to a valid rsl_rl training checkpoint (model_*.pt)."""
+    resolved = Path(retrieve_file_path(raw_checkpoint))
+    fallback_root_path = Path(fallback_root) if fallback_root is not None else None
+
+    if resolved.is_dir():
+        latest = _pick_latest_model_checkpoint(resolved)
+        if latest is None:
+            raise FileNotFoundError(
+                f"No model_*.pt found under directory: {resolved}. "
+                "Please pass a training checkpoint like .../model_11999.pt."
+            )
+        print(f"[WARN] --checkpoint points to a directory. Auto-select latest checkpoint: {latest}")
+        return str(latest)
+
+    is_training_ckpt = re.fullmatch(r"model_(\d+)\.pt", resolved.name) is not None
+    if is_training_ckpt:
+        return str(resolved)
+
+    # Common user mistake: passing TensorBoard event file.
+    if resolved.name.startswith("events.out.tfevents") or resolved.suffix != ".pt":
+        latest = _pick_latest_model_checkpoint(resolved.parent)
+        if latest is None:
+            latest = _pick_latest_model_checkpoint_recursive(fallback_root_path) if fallback_root_path else None
+        if latest is not None:
+            print(
+                "[WARN] --checkpoint is not a training checkpoint file. "
+                f"Auto-fallback to latest model checkpoint: {latest}"
+            )
+            return str(latest)
+        raise ValueError(
+            f"Invalid checkpoint: {resolved}. Expected model_*.pt, but got '{resolved.name}'. "
+            "No sibling model_*.pt found."
+        )
+
+    # .pt but not model_*.pt (e.g. exported policy.pt) is usually not loadable by runner.load()
+    latest = _pick_latest_model_checkpoint(resolved.parent)
+    if latest is None:
+        latest = _pick_latest_model_checkpoint_recursive(fallback_root_path) if fallback_root_path else None
+    if latest is not None:
+        print(
+            "[WARN] --checkpoint points to a non-training .pt file. "
+            f"Auto-fallback to latest model checkpoint: {latest}"
+        )
+        return str(latest)
+    raise ValueError(
+        f"Invalid checkpoint: {resolved}. Expected training checkpoint model_*.pt, got '{resolved.name}'."
+    )
+
+
+def _infer_stage_from_checkpoint_path(path: str) -> int | None:
+    lowered = path.lower()
+    match = re.search(r"(?:^|[_/-])stage([1-5])(?:$|[_/-])", lowered)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
 
 
 def circular_distance(a: torch.Tensor, b: float | torch.Tensor) -> torch.Tensor:
@@ -278,9 +370,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        resume_path = _resolve_rsl_rl_checkpoint_path(args_cli.checkpoint, fallback_root=log_root_path)
     else:
+        # Some configs may resolve to tensorboard event files by default (e.g. checkpt1/events...).
+        # Always sanitize to a real training checkpoint (model_*.pt).
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = _resolve_rsl_rl_checkpoint_path(resume_path, fallback_root=log_root_path)
+
+    if not args_cli.disable_auto_stage_from_checkpoint and hasattr(env_cfg, "stage"):
+        inferred_stage = _infer_stage_from_checkpoint_path(resume_path)
+        if inferred_stage is not None:
+            prev_stage = int(getattr(env_cfg, "stage"))
+            env_cfg.stage = inferred_stage
+            if prev_stage != inferred_stage:
+                print(
+                    f"[INFO] Auto-set env.stage from {prev_stage} to {inferred_stage} "
+                    f"based on checkpoint path: {resume_path}"
+                )
 
     env_cfg.log_dir = os.path.dirname(resume_path)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
@@ -398,6 +504,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actual_vx = unwrapped_env.base_lin_vel[:, 0]
             actual_vy = unwrapped_env.base_lin_vel[:, 1]
             actual_wz = unwrapped_env.base_ang_vel[:, 2]
+            actual_lin_speed = torch.sqrt(actual_vx**2 + actual_vy**2)
 
             dvx = torch.abs(actual_vx - cmd[0])
             dvy = torch.abs(actual_vy - cmd[1])

@@ -34,6 +34,25 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--disable_auto_stage_from_checkpoint",
+    action="store_true",
+    default=False,
+    help="Do not auto-set env.stage from checkpoint run-name suffix like *_stage4.",
+)
+parser.add_argument(
+    "--disable_keyboard_control",
+    action="store_true",
+    default=False,
+    help="Disable keyboard command override and keep environment command sampler.",
+)
+parser.add_argument(
+    "--initial_command",
+    type=str,
+    default="stop",
+    choices=["forward", "backward", "left", "right", "diag_left", "diag_right", "yaw_ccw", "yaw_cw", "stop"],
+    help="Initial command when keyboard control is enabled.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -58,6 +77,8 @@ import os
 import time
 import torch
 import threading
+import re
+from pathlib import Path
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -79,6 +100,123 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import RedRhex.tasks  # noqa: F401
+
+
+def _model_step_from_name(path: Path) -> int:
+    match = re.fullmatch(r"model_(\d+)\.pt", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _pick_latest_model_checkpoint(run_dir: Path) -> Path | None:
+    if not run_dir.exists() or not run_dir.is_dir():
+        return None
+    candidates = [p for p in run_dir.glob("model_*.pt") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=_model_step_from_name)
+
+
+def _pick_latest_model_checkpoint_recursive(root_dir: Path) -> Path | None:
+    if not root_dir.exists() or not root_dir.is_dir():
+        return None
+    candidates = [p for p in root_dir.rglob("model_*.pt") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_rsl_rl_checkpoint_path(raw_checkpoint: str, fallback_root: str | None = None) -> str:
+    """Resolve user checkpoint arg to a valid rsl_rl training checkpoint (model_*.pt)."""
+    resolved = Path(retrieve_file_path(raw_checkpoint))
+    fallback_root_path = Path(fallback_root) if fallback_root is not None else None
+
+    if resolved.is_dir():
+        latest = _pick_latest_model_checkpoint(resolved)
+        if latest is None:
+            raise FileNotFoundError(
+                f"No model_*.pt found under directory: {resolved}. "
+                "Please pass a training checkpoint like .../model_11999.pt."
+            )
+        print(f"[WARN] --checkpoint points to a directory. Auto-select latest checkpoint: {latest}")
+        return str(latest)
+
+    is_training_ckpt = re.fullmatch(r"model_(\d+)\.pt", resolved.name) is not None
+    if is_training_ckpt:
+        return str(resolved)
+
+    # Common user mistake: passing TensorBoard event file.
+    if resolved.name.startswith("events.out.tfevents") or resolved.suffix != ".pt":
+        latest = _pick_latest_model_checkpoint(resolved.parent)
+        if latest is None:
+            latest = _pick_latest_model_checkpoint_recursive(fallback_root_path) if fallback_root_path else None
+        if latest is not None:
+            print(
+                "[WARN] --checkpoint is not a training checkpoint file. "
+                f"Auto-fallback to latest model checkpoint: {latest}"
+            )
+            return str(latest)
+        raise ValueError(
+            f"Invalid checkpoint: {resolved}. Expected model_*.pt, but got '{resolved.name}'. "
+            "No sibling model_*.pt found."
+        )
+
+    # .pt but not model_*.pt (e.g. exported policy.pt) is usually not loadable by runner.load()
+    latest = _pick_latest_model_checkpoint(resolved.parent)
+    if latest is None:
+        latest = _pick_latest_model_checkpoint_recursive(fallback_root_path) if fallback_root_path else None
+    if latest is not None:
+        print(
+            "[WARN] --checkpoint points to a non-training .pt file. "
+            f"Auto-fallback to latest model checkpoint: {latest}"
+        )
+        return str(latest)
+    raise ValueError(
+        f"Invalid checkpoint: {resolved}. Expected training checkpoint model_*.pt, got '{resolved.name}'."
+    )
+
+
+def _infer_stage_from_checkpoint_path(path: str) -> int | None:
+    lowered = path.lower()
+    match = re.search(r"(?:^|[_/-])stage([1-5])(?:$|[_/-])", lowered)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _infer_keyboard_command_scales(env_cfg, defaults: tuple[float, float, float] = (0.4, 0.3, 0.8)) -> tuple[float, float, float]:
+    """Infer (vx, vy, wz) display/control scales from discrete command tables."""
+    tables = [
+        getattr(env_cfg, "stage5_discrete_directions", None),
+        getattr(env_cfg, "stage4_discrete_directions", None),
+        getattr(env_cfg, "stage3_discrete_directions", None),
+        getattr(env_cfg, "stage2_discrete_directions", None),
+        getattr(env_cfg, "stage1_discrete_directions", None),
+        getattr(env_cfg, "discrete_directions", None),
+    ]
+
+    triples: list[tuple[float, float, float]] = []
+    for table in tables:
+        if not table:
+            continue
+        for cmd in table:
+            if len(cmd) >= 3:
+                triples.append((float(cmd[0]), float(cmd[1]), float(cmd[2])))
+
+    if not triples:
+        return defaults
+
+    eps = 1e-6
+    fwd = [abs(vx) for vx, vy, wz in triples if abs(vx) > eps and abs(vy) <= eps and abs(wz) <= eps]
+    lat = [abs(vy) for vx, vy, wz in triples if abs(vy) > eps and abs(vx) <= eps and abs(wz) <= eps]
+    yaw = [abs(wz) for vx, vy, wz in triples if abs(wz) > eps and abs(vx) <= eps and abs(vy) <= eps]
+
+    vx_scale = max(fwd) if fwd else defaults[0]
+    vy_scale = max(lat) if lat else defaults[1]
+    wz_scale = max(yaw) if yaw else defaults[2]
+    return vx_scale, vy_scale, wz_scale
 
 
 # =============================================================================
@@ -105,7 +243,13 @@ class KeyboardController:
     ★ 切換模式：按一下就維持，直到按下另一個按鍵 ★
     """
     
-    def __init__(self, velocity_scale: float = 0.4, lateral_scale: float = 0.3, angular_scale: float = 0.8):
+    def __init__(
+        self,
+        velocity_scale: float = 0.4,
+        lateral_scale: float = 0.3,
+        angular_scale: float = 0.8,
+        initial_command: str = "forward",
+    ):
         """
         初始化鍵盤控制器
         
@@ -135,12 +279,26 @@ class KeyboardController:
             'f': (-velocity_scale * 0.6, lateral_scale * 1.1, 0.0, "左後"),
             'space': (0.0, 0.0, 0.0, "停止"),
         }
-        
+
+        initial_key_map = {
+            "forward": "w",
+            "backward": "s",
+            "left": "a",
+            "right": "d",
+            "diag_left": "t",
+            "diag_right": "r",
+            "yaw_ccw": "q",
+            "yaw_cw": "e",
+            "stop": "space",
+        }
+        initial_key = initial_key_map.get(str(initial_command).lower(), "space")
+        vx0, vy0, wz0, name0 = self.command_presets[initial_key]
+
         # 當前命令（切換模式：維持直到下一個按鍵）
-        self.target_vx = 0.0
-        self.target_vy = 0.0
-        self.target_wz = 0.0
-        self.current_command_name = "停止"
+        self.target_vx = vx0
+        self.target_vy = vy0
+        self.target_wz = wz0
+        self.current_command_name = name0
         
         # 上一幀的按鍵狀態（用於檢測按鍵「剛按下」的瞬間）
         self._last_key_states = {}
@@ -283,9 +441,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
     elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        checkpoint_arg = args_cli.checkpoint
+        # Compatibility: allow "--load_run <run> --checkpoint model_XXXX.pt".
+        # If only a filename is provided, resolve it under logs/rsl_rl/<exp>/<run>/ first.
+        if args_cli.load_run and not os.path.isabs(checkpoint_arg):
+            candidate = os.path.join(log_root_path, args_cli.load_run, checkpoint_arg)
+            if os.path.exists(candidate):
+                checkpoint_arg = candidate
+        resume_path = _resolve_rsl_rl_checkpoint_path(checkpoint_arg, fallback_root=log_root_path)
     else:
+        # Some configs may resolve to tensorboard event files by default (e.g. checkpt1/events...).
+        # Always sanitize to a real training checkpoint (model_*.pt).
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = _resolve_rsl_rl_checkpoint_path(resume_path, fallback_root=log_root_path)
+
+    if not args_cli.disable_auto_stage_from_checkpoint and hasattr(env_cfg, "stage"):
+        inferred_stage = _infer_stage_from_checkpoint_path(resume_path)
+        if inferred_stage is not None:
+            prev_stage = int(getattr(env_cfg, "stage"))
+            env_cfg.stage = inferred_stage
+            if prev_stage != inferred_stage:
+                print(
+                    f"[INFO] Auto-set env.stage from {prev_stage} to {inferred_stage} "
+                    f"based on checkpoint path: {resume_path}"
+                )
 
     log_dir = os.path.dirname(resume_path)
 
@@ -357,24 +536,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # 從環境配置獲取速度範圍（用於縮放）
     unwrapped_env = env.unwrapped
     
-    # 使用與 discrete_directions 中相同的速度值
-    # 前進: 0.4 m/s, 側移: 0.3 m/s, 旋轉: 0.8 rad/s
-    velocity_scale = 0.4   # 與環境中的前進速度一致
-    lateral_scale = 0.3    # 與環境中的側移速度一致
-    angular_scale = 0.8    # 與環境中的旋轉速度一致
-    
-    # 創建鍵盤控制器（切換模式）
-    keyboard_ctrl = KeyboardController(
-        velocity_scale=velocity_scale,
-        lateral_scale=lateral_scale,
-        angular_scale=angular_scale
-    )
-    keyboard_ctrl.start()
-    
-    # ★★★ 啟用外部控制模式，禁用環境的自動命令重採樣 ★★★
-    if hasattr(unwrapped_env, 'external_control'):
-        unwrapped_env.external_control = True
-        print("[INFO] 已啟用外部控制模式，環境不會自動切換命令")
+    velocity_scale, lateral_scale, angular_scale = _infer_keyboard_command_scales(env_cfg, defaults=(0.4, 0.3, 0.8))
+
+    keyboard_ctrl = None
+    if not args_cli.disable_keyboard_control:
+        keyboard_ctrl = KeyboardController(
+            velocity_scale=velocity_scale,
+            lateral_scale=lateral_scale,
+            angular_scale=angular_scale,
+            initial_command=args_cli.initial_command,
+        )
+        keyboard_ctrl.start()
+
+        # ★★★ 啟用外部控制模式，禁用環境的自動命令重採樣 ★★★
+        if hasattr(unwrapped_env, "external_control"):
+            unwrapped_env.external_control = True
+            print("[INFO] 已啟用外部控制模式，環境不會自動切換命令")
+            print(
+                f"[INFO] 初始命令: {keyboard_ctrl.current_command_name} "
+                f"(vx={keyboard_ctrl.target_vx:.2f}, vy={keyboard_ctrl.target_vy:.2f}, wz={keyboard_ctrl.target_wz:.2f})"
+            )
+    else:
+        if hasattr(unwrapped_env, "external_control"):
+            unwrapped_env.external_control = False
+        print("[INFO] 鍵盤控制已停用，使用環境命令採樣。")
     
     # 獲取設備和環境數量
     device = unwrapped_env.device
@@ -393,7 +578,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # =====================================================================
         # 鍵盤控制（切換模式）
         # =====================================================================
-        if keyboard_ctrl._running:
+        if keyboard_ctrl is not None and keyboard_ctrl._running:
             keyboard_ctrl.update_from_carb()
             keyboard_commands = keyboard_ctrl.get_commands(num_envs, device)
             if hasattr(unwrapped_env, 'commands'):
@@ -406,7 +591,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy_nn.reset(dones)
         
         # 再次設置命令（確保 reset 後也正確）
-        if keyboard_ctrl._running and hasattr(unwrapped_env, 'commands'):
+        if keyboard_ctrl is not None and keyboard_ctrl._running and hasattr(unwrapped_env, 'commands'):
             unwrapped_env.commands[:] = keyboard_commands
         
         if args_cli.video:
@@ -419,7 +604,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    keyboard_ctrl.stop()
+    if keyboard_ctrl is not None:
+        keyboard_ctrl.stop()
     env.close()
 
 

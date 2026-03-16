@@ -837,6 +837,16 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     yaw_abad_action_scale = 0.55
     abad_pos_limit = 0.60
 
+    # -------------------------------------------------------------------------
+    # Play 相容保護（舊 checkpoint 在新版控制邏輯下仍可穩定前進）
+    # 僅在 external_control=True（play/eval command override）時生效
+    # -------------------------------------------------------------------------
+    play_forward_compat_enable = True
+    play_forward_compat_only_external = True
+    play_forward_compat_bias_scale = 1.00
+    play_forward_compat_residual_scale = 0.04
+    play_forward_compat_residual_clip = 0.30
+
     # Reset 穩定性：預設不做大範圍 yaw 隨機化，先確保起步可訓練
     randomize_initial_yaw = False
     initial_yaw_range = [-0.20, 0.20]
@@ -1560,6 +1570,143 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "yaw_cheat_tilt_thresh": 0.30,
 
         # 追蹤曲線寬度
+        "lin_tracking_sigma": 0.30,
+        "yaw_tracking_sigma": 0.35,
+    }
+
+
+@configclass
+class RedrhexForwardFastEnvCfg(RedrhexEnvCfg):
+    """Forward-only fast setup that stays close to the proven stage-1 behavior."""
+
+    # Keep rollout bounded for faster iteration while preserving stage-1 stability.
+    episode_length_s = 30
+    draw_debug_vis = False
+
+    # Force single-skill training path.
+    curriculum_enable = True
+    curriculum_auto_progress = False
+    stage = 1
+    # Reuse stage-1 low-randomization regime from the full curriculum.
+    curriculum_stage_scales = [0.05]
+
+    # Forward-only command distribution.
+    use_discrete_directions = False
+    lin_vel_x_range = [0.22, 0.42]
+    lin_vel_y_range = [0.0, 0.0]
+    ang_vel_z_range = [0.0, 0.0]
+    command_resample_on_timer = False
+    command_resample_time = 6.0
+    stage1_use_discrete_directions = False
+    stage1_forward_vx_range = [0.22, 0.42]
+    stage1_discrete_directions = [
+        [0.35, 0.0, 0.0],
+        [0.42, 0.0, 0.0],
+    ]
+
+    # Keep controller close to the previously successful stage-1 defaults.
+    main_drive_vel_scale = 8.0
+    forward_phase_lock_gain = 1.2
+    forward_drive_action_scale = 0.35
+    main_drive_residual_scale = 0.22
+    forward_residual_cap_ratio = 0.22
+    stage_drive_vel_scale = [8.0]
+    stage_main_drive_residual_scale = [0.10]
+    stage_forward_bias_scale = [1.00]
+    stage_forward_policy_drive_residual_scale = [0.10]
+    stage_forward_residual_cap_ratio = [0.26]
+    stage_action_warmup_steps = [30]
+    stage_forward_reward_multiplier = [1.20]
+    stage_forward_gait_reward_multiplier = [1.45]
+    stage_lateral_reward_multiplier = [0.0]
+    stage_diag_reward_multiplier = [0.0]
+    stage_yaw_reward_multiplier = [0.0]
+
+    # Moderate DR: keep sim-to-real robustness, but don't overburden fast training.
+    domain_randomization_enable = True
+    dr_try_physical_material_randomization = False
+    dr_randomize_mass = True
+    dr_mass_range = [0.97, 1.03]
+    dr_randomize_friction = True
+    dr_friction_range = [0.90, 1.10]
+    dr_randomize_actuator_strength = True
+    dr_main_actuator_strength_range = [0.95, 1.05]
+    dr_abad_actuator_strength_range = [0.95, 1.05]
+    dr_obs_latency_enable = False
+    dr_obs_latency_steps_range = [0, 0]
+    dr_obs_noise_enable = True
+    dr_push_enable = False
+    terrain_curriculum_enable = False
+    stage_push_probability_scale = [0.0]
+
+    add_noise = True
+    noise_level = 0.8
+    noise_lin_vel = 0.03
+    noise_ang_vel = 0.06
+    noise_gravity = 0.02
+    noise_joint_pos = 0.005
+    noise_joint_vel = 0.4
+
+    # Termination thresholds: aligned to stable stage-1 behavior (less premature resets).
+    max_tilt_magnitude = 1.55
+    stage_max_tilt_magnitude = [1.82]
+    min_base_height = 0.06
+    stage1_min_base_height = 0.03
+    stage_min_base_height = [0.03]
+    body_contact_height_threshold = 0.08
+    stage1_body_contact_height_threshold = 0.06
+    stage_body_contact_height_threshold = [0.06]
+    body_contact_tilt_threshold = 1.55
+    stage_body_contact_tilt_threshold = [1.80]
+    stage_fall_height_threshold = [0.085]
+    stage_fall_tilt_threshold = [1.80]
+    termination_grace_steps = 20
+    stage1_termination_grace_steps = 120
+    stage_termination_grace_steps = [120]
+    gate_positive_rewards_when_unhealthy = False
+    reward_gate_min_base_height = 0.105
+    reward_gate_max_body_tilt = 0.70
+
+    # Stage-1-like rewards with slight forward emphasis for faster convergence.
+    v2_reward_scales = {
+        "forward_progress": 5.5,
+        "velocity_tracking": 4.5,
+        "mode_specialization": 0.0,
+        "axis_suppression": 1.3,
+        "lateral_drive_soft_penalty": 0.0,
+        "lateral_speed_deficit_penalty": 0.0,
+        "lateral_speed_target_ratio": 0.70,
+        "lateral_speed_bonus": 0.0,
+        "diag_sign_bonus": 0.0,
+        "diag_wrong_sign_penalty": 0.0,
+        "diag_speed_bonus": 0.0,
+        "forward_prior_coherence": 1.2,
+        "forward_prior_antiphase": 1.2,
+        "forward_prior_duty": 0.9,
+        "forward_prior_vel_ratio": 0.9,
+        "forward_prior_overlap": 0.7,
+        "height_maintain": 0.9,
+        "target_base_height": 0.12,
+        "height_sigma": 0.08,
+        "height_low_penalty": 1.2,
+        "leg_moving": 0.35,
+        "stall_penalty": -2.5,
+        "action_smooth": -0.015,
+        "fall": -8.0,
+        "fall_height_threshold": 0.085,
+        "fall_tilt_threshold": 1.70,
+        "fall_roll_threshold": 1.30,
+        "fall_pitch_threshold": 1.30,
+        "yaw_mode_track_bonus": 0.0,
+        "yaw_spin_bonus": 0.0,
+        "yaw_roll_pitch_penalty": 0.0,
+        "yaw_height_penalty": 0.0,
+        "yaw_target_base_height": 0.12,
+        "yaw_slip_penalty": 0.0,
+        "yaw_slip_cap": 2.0,
+        "yaw_cheat_penalty": 0.0,
+        "yaw_cheat_min_wz": 0.4,
+        "yaw_cheat_tilt_thresh": 0.30,
         "lin_tracking_sigma": 0.30,
         "yaw_tracking_sigma": 0.35,
     }

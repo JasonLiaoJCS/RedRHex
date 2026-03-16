@@ -24,8 +24,9 @@ STAGE4_ITERS="${STAGE4_ITERS:-10000}"
 STAGE5_ITERS="${STAGE5_ITERS:-12000}"
 START_STAGE="${START_STAGE:-1}"
 
-# Stage handoff behavior (recommended for stability between different command distributions)
-RESUME_POLICY_ONLY="${RESUME_POLICY_ONLY:-1}"
+# Stage handoff behavior
+# Default = full resume (policy + optimizer + iteration continuity) for true curriculum continuation.
+RESUME_POLICY_ONLY="${RESUME_POLICY_ONLY:-0}"
 RESET_ACTION_STD="${RESET_ACTION_STD:-0.8}"
 
 # Resolve Python interpreter that can import isaaclab.
@@ -80,7 +81,7 @@ Options:
   --s5 <iters>            Stage5 max_iterations
   --start_stage <1..5>    Start pipeline from this stage (default: 1)
   --resume_policy_only <0|1>
-                           Resume stage handoff with policy-only load (default: 1)
+                           Resume stage handoff with policy-only load (default: 0)
   --reset_action_std <v>  Action std reset value when policy-only resume is enabled (default: 0.8)
   --stability_gate <0|1>  Enable stage health gate (default: 1)
   --extra "<overrides>"   Extra Hydra overrides string
@@ -138,6 +139,11 @@ echo "[INFO] START_STAGE: $START_STAGE" | tee -a "$PIPELINE_LOG"
 echo "[INFO] PRECHECK: gui=$PRECHECK_GUI stage=$PRECHECK_STAGE envs=$PRECHECK_ENVS iters=$PRECHECK_ITERS" | tee -a "$PIPELINE_LOG"
 echo "[INFO] STABILITY_GATE: $STABILITY_GATE" | tee -a "$PIPELINE_LOG"
 echo "[INFO] HANDOFF: resume_policy_only=$RESUME_POLICY_ONLY reset_action_std=$RESET_ACTION_STD" | tee -a "$PIPELINE_LOG"
+if [[ "$RESUME_POLICY_ONLY" != "1" ]]; then
+  echo "[INFO] HANDOFF MODE: full-resume (policy+optimizer+iteration continuity)." | tee -a "$PIPELINE_LOG"
+else
+  echo "[WARN] HANDOFF MODE: policy-only (iteration resets per stage; numbering restarts)." | tee -a "$PIPELINE_LOG"
+fi
 
 LAST_RUN=""
 LAST_CKPT=""
@@ -151,6 +157,15 @@ latest_run_by_suffix() {
 latest_ckpt_in_run() {
   local run_dir="$1"
   ls -v "$run_dir"/model_*.pt 2>/dev/null | tail -1 || true
+}
+
+checkpoint_step_from_name() {
+  local ckpt_name="$1"
+  if [[ "$ckpt_name" =~ ^model_([0-9]+)\.pt$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo ""
+  fi
 }
 
 find_last_line() {
@@ -319,10 +334,13 @@ run_stage() {
   if [[ "$HEADLESS" == "1" ]]; then
     cmd+=(--headless)
   fi
+  local prev_step=""
   if [[ -n "$load_run" && -n "$load_ckpt" ]]; then
+    prev_step="$(checkpoint_step_from_name "$load_ckpt")"
     cmd+=(--resume "--load_run=${load_run}" "--checkpoint=${load_ckpt}")
     if [[ "$RESUME_POLICY_ONLY" == "1" ]]; then
       cmd+=(--resume_policy_only "--reset_action_std=${RESET_ACTION_STD}")
+      echo "[WARN] Stage ${stage}: resume_policy_only=1 -> iteration index resets, model_*.pt numbering may restart from 0." | tee -a "$PIPELINE_LOG"
     fi
   fi
   for ov in "${EXTRA_OVERRIDES[@]}"; do
@@ -358,6 +376,20 @@ run_stage() {
   LAST_RUN="$(basename "$run_dir")"
   LAST_CKPT="$(basename "$ckpt_abs")"
   LAST_CKPT_ABS="$ckpt_abs"
+
+  local new_step
+  new_step="$(checkpoint_step_from_name "$LAST_CKPT")"
+  if [[ -n "$prev_step" && -n "$new_step" ]]; then
+    if [[ "$RESUME_POLICY_ONLY" == "1" ]]; then
+      echo "[INFO] Stage ${stage} iteration continuity check skipped (policy-only resume)." | tee -a "$PIPELINE_LOG"
+    else
+      if ! awk -v n="$new_step" -v p="$prev_step" 'BEGIN{exit !(n+0 > p+0)}'; then
+        echo "[ERROR] Stage ${stage} continuity failed: new checkpoint step ${new_step} <= previous ${prev_step}" | tee -a "$PIPELINE_LOG"
+        exit 1
+      fi
+      echo "[INFO] Stage ${stage} continuity PASS: previous step=${prev_step}, new step=${new_step}" | tee -a "$PIPELINE_LOG"
+    fi
+  fi
 
   validate_stage_health "$stage" "$stage_log"
 

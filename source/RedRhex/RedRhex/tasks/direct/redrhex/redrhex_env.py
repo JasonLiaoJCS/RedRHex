@@ -1480,6 +1480,8 @@ class RedrhexEnv(DirectRLEnv):
             self.gait_phase.unsqueeze(1) + self.leg_phase_offsets.unsqueeze(0),
             2 * math.pi,
         )
+        # Keep stance/swing scheduling aligned with the original stable stage-1
+        # angle-window definition used by full curriculum training.
         desired_in_stance = self._in_stance_phase(desired_phase)
         forward_base_velocity = torch.where(
             desired_in_stance,
@@ -1577,6 +1579,30 @@ class RedrhexEnv(DirectRLEnv):
             )
 
         target_drive_vel = (forward_bias_joint + yaw_bias_joint + drive_residual) * action_warmup_scale.unsqueeze(1)
+
+        # Play/Eval 相容保護：舊版 checkpoint 在新版控制器下，純 forward 模式可能起步失穩。
+        # 僅在 external_control 模式（play/eval 指令覆寫）時套用，訓練流程不受影響。
+        play_forward_compat_enable = bool(getattr(self.cfg, "play_forward_compat_enable", False))
+        play_forward_compat_only_external = bool(getattr(self.cfg, "play_forward_compat_only_external", True))
+        allow_play_forward_compat = play_forward_compat_enable and (
+            (not play_forward_compat_only_external) or bool(self.external_control)
+        )
+        if allow_play_forward_compat:
+            pure_forward_mask = mode_fwd & (~mode_lat) & (~mode_diag) & (~mode_yaw)
+            if pure_forward_mask.any():
+                compat_bias_scale = float(getattr(self.cfg, "play_forward_compat_bias_scale", 1.00))
+                compat_residual_scale = float(getattr(self.cfg, "play_forward_compat_residual_scale", 0.04))
+                compat_residual_clip = float(getattr(self.cfg, "play_forward_compat_residual_clip", 0.30))
+
+                compat_drive_bias = forward_profile * self._direction_multiplier * vx_norm.unsqueeze(1) * compat_bias_scale
+                compat_drive_residual = torch.clamp(
+                    masked_drive_actions, min=-compat_residual_clip, max=compat_residual_clip
+                ) * drive_vel_scale * compat_residual_scale
+                compat_target_drive_vel = (compat_drive_bias + compat_drive_residual) * action_warmup_scale.unsqueeze(1)
+                target_drive_vel = torch.where(
+                    pure_forward_mask.unsqueeze(1), compat_target_drive_vel, target_drive_vel
+                )
+
         max_vel = max(self.swing_velocity * 1.5, drive_vel_scale * 1.5)
         target_drive_vel = torch.clamp(target_drive_vel, min=-max_vel, max=max_vel)
 
@@ -1997,6 +2023,28 @@ class RedrhexEnv(DirectRLEnv):
         yaw_ref_for_slip = torch.clamp(torch.abs(cmd_wz), min=0.2)
         yaw_slip_cap = max(float(scales.get("yaw_slip_cap", 2.0)), 0.1)
         yaw_slip_proxy = torch.clamp(actual_lin_speed / yaw_ref_for_slip, min=0.0, max=yaw_slip_cap)
+        body_tilt = 1.0 - gravity_alignment
+
+        use_health_gate = bool(getattr(self.cfg, "gate_positive_rewards_when_unhealthy", False))
+        if use_health_gate:
+            gate_height_default = float(
+                self._get_stage_value(
+                    "stage_body_contact_height_threshold",
+                    getattr(self.cfg, "body_contact_height_threshold", 0.08),
+                )
+            ) + 0.01
+            gate_tilt_default = float(
+                self._get_stage_value(
+                    "stage_body_contact_tilt_threshold",
+                    getattr(self.cfg, "body_contact_tilt_threshold", getattr(self.cfg, "max_tilt_magnitude", 1.55)),
+                )
+            ) * 0.90
+            gate_height = float(getattr(self.cfg, "reward_gate_min_base_height", gate_height_default))
+            gate_tilt = float(getattr(self.cfg, "reward_gate_max_body_tilt", gate_tilt_default))
+            healthy_gate = ((base_height > gate_height) & (body_tilt < gate_tilt)).float()
+        else:
+            healthy_gate = torch.ones(self.num_envs, device=self.device)
+
         self._roll_rms = roll_rms
         self._pitch_rms = pitch_rms
         self._yaw_slip_proxy = yaw_slip_proxy
@@ -2023,6 +2071,7 @@ class RedrhexEnv(DirectRLEnv):
             - 1.0 * backward_slip
         ) * scales.get("forward_progress", 5.0)
         rew_forward = torch.where(mode_fwd, rew_forward * forward_mult, rew_forward)
+        rew_forward = rew_forward * healthy_gate
         total_reward += rew_forward
         
         # R2: 速度追蹤
@@ -2048,6 +2097,7 @@ class RedrhexEnv(DirectRLEnv):
         
         rew_tracking = (lin_tracking_reward + yaw_tracking_reward) * scales.get("velocity_tracking", 4.0)
         rew_tracking = torch.where(mode_fwd, rew_tracking * forward_mult, rew_tracking)
+        rew_tracking = rew_tracking * healthy_gate
         total_reward += rew_tracking
         
         # R3: 模式專屬 shaping（LAT / YAW / DIAG）
@@ -2079,6 +2129,7 @@ class RedrhexEnv(DirectRLEnv):
         rew_mode += torch.where(mode_diag, diagonal_reward * diag_mult, torch.zeros_like(diagonal_reward))
         
         rew_mode = rew_mode * scales.get("mode_specialization", 2.5)
+        rew_mode = rew_mode * healthy_gate
         total_reward += rew_mode
 
         rew_diag_sign = torch.where(
@@ -2086,6 +2137,7 @@ class RedrhexEnv(DirectRLEnv):
             (diag_sign_bonus - diag_wrong_sign_penalty) * diag_mult,
             torch.zeros_like(diag_sign_bonus),
         )
+        rew_diag_sign = rew_diag_sign * healthy_gate
         total_reward += rew_diag_sign
 
         # 斜向速度協同：同時推進 vx 和 vy，避免只學「半邊斜走」
@@ -2099,6 +2151,7 @@ class RedrhexEnv(DirectRLEnv):
             torch.clamp(diag_balanced_speed, min=0.0, max=1.5) * scales.get("diag_speed_bonus", 2.6) * diag_mult,
             torch.zeros_like(diag_balanced_speed),
         )
+        rew_diag_speed = rew_diag_speed * healthy_gate
         total_reward += rew_diag_speed
 
         # R3.1: 側移 soft-lock（主驅動越大懲罰越重，避免 lateral 靠主驅動亂轉）
@@ -2132,6 +2185,7 @@ class RedrhexEnv(DirectRLEnv):
             lateral_speed_bonus * scales.get("lateral_speed_bonus", 2.5) * lateral_mult,
             torch.zeros_like(lateral_speed_bonus),
         )
+        rew_lateral_speed_bonus = rew_lateral_speed_bonus * healthy_gate
         total_reward += rew_lateral_speed_bonus
 
         # R3.2: Yaw 專項（追蹤 + 穩定 + 防作弊抬升）
@@ -2171,6 +2225,8 @@ class RedrhexEnv(DirectRLEnv):
         rew_yaw_track = rew_yaw_track * yaw_mult
         rew_yaw_stability = rew_yaw_stability * yaw_mult
         rew_yaw_cheat = rew_yaw_cheat * yaw_mult
+        rew_yaw_track = rew_yaw_track * healthy_gate
+        rew_yaw_spin = rew_yaw_spin * healthy_gate
         total_reward += rew_yaw_track + rew_yaw_stability + rew_yaw_cheat + rew_yaw_spin
         
         # R3.5: Forward gait prior（僅 FWD mode）
@@ -2190,6 +2246,7 @@ class RedrhexEnv(DirectRLEnv):
             + rew_forward_prior_overlap
         )
         rew_forward_gait = rew_forward_gait * forward_gait_mult
+        rew_forward_gait = rew_forward_gait * healthy_gate
         total_reward += rew_forward_gait
         stance_count = forward_terms["stance_count"]
         phase_diff = forward_terms["phase_diff"]
@@ -2226,6 +2283,7 @@ class RedrhexEnv(DirectRLEnv):
             * (0.3 + 0.7 * motion_alignment)
             * scales.get("leg_moving", 0.5)
         )
+        rew_leg_moving = rew_leg_moving * healthy_gate
         total_reward += rew_leg_moving
         
         # R7: 有命令卻不動
@@ -2247,7 +2305,6 @@ class RedrhexEnv(DirectRLEnv):
         # R9: 倒地懲罰（與終止判斷解耦）
         # 注意：roll/pitch 在不同初始姿態下可能帶固定偏置，不適合直接當 terminate 依據。
         # 這裡改用 body_tilt + base_height 當「是否倒地」主條件，避免一出生就被誤判。
-        body_tilt = 1.0 - gravity_alignment
         fall_height_threshold = float(
             self._get_stage_value("stage_fall_height_threshold", float(scales.get("fall_height_threshold", 0.10)))
         )

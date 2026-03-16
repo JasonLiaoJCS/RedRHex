@@ -19,3 +19,14 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Template-Redrhex-ForwardFast-Direct-v0",
+    entry_point=f"{__name__}.redrhex_env:RedrhexEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.redrhex_env_cfg:RedrhexForwardFastEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerForwardFastCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
