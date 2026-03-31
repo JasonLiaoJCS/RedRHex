@@ -455,6 +455,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     energy_count = 0
     effort_proxy_name = "mean(|target_vel * omega|)"
 
+    # ★ Energy-aware KPIs
+    spring_energy_sum = 0.0
+    spring_release_sum = 0.0
+    spring_store_sum = 0.0
+    mech_power_main_sum = 0.0
+    cot_proxy_sum = 0.0
+    damper_dissipation_sum = 0.0
+    energy_kpi_count = 0
+
     forward_phase_diff_sum = 0.0
     forward_phase_err_to_pi_sum = 0.0
     forward_stance_frac_sum = 0.0
@@ -674,6 +683,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             energy_count += 1
 
+            # ★ Spring energy & CoT KPIs
+            if hasattr(unwrapped_env, "_damper_indices") and hasattr(unwrapped_env, "_damper_initial_pos"):
+                _damp_pos = unwrapped_env.joint_pos[:, unwrapped_env._damper_indices]
+                _damp_vel = unwrapped_env.joint_vel[:, unwrapped_env._damper_indices]
+                _damp_defl = _damp_pos - unwrapped_env._damper_initial_pos
+                _spring_k = float(getattr(unwrapped_env, "_spring_k", 200.0))
+                _spring_d = float(getattr(unwrapped_env, "_spring_d", 20.0))
+                _robot_m = float(getattr(unwrapped_env, "_robot_mass", 14.0))
+
+                _se = 0.5 * _spring_k * (_damp_defl ** 2)
+                _sp = _spring_k * _damp_defl * _damp_vel
+                _sr = torch.sum(torch.clamp(-_sp, min=0.0), dim=1)
+                _ss = torch.sum(torch.clamp(_sp, min=0.0), dim=1)
+                _dd = _spring_d * torch.sum(_damp_vel ** 2, dim=1)
+
+                spring_energy_sum += torch.sum(_se).item() / float(num_envs)
+                spring_release_sum += _sr.mean().item()
+                spring_store_sum += _ss.mean().item()
+                damper_dissipation_sum += _dd.mean().item()
+
+                _speed = torch.sqrt(actual_vx ** 2 + actual_vy ** 2)
+                if hasattr(unwrapped_env.robot.data, "applied_torque"):
+                    _mt = unwrapped_env.robot.data.applied_torque[:, unwrapped_env._main_drive_indices]
+                    _mo = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
+                    _mp = torch.sum(torch.abs(_mt * _mo), dim=1)
+                    mech_power_main_sum += _mp.mean().item()
+                    _cot = _mp / (_robot_m * 9.81 * (_speed + 0.1))
+                    cot_proxy_sum += _cot.mean().item()
+
+                energy_kpi_count += 1
+
         denom = float(max(1, cmd_samples))
         result = {
             "command": name,
@@ -860,6 +900,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"contact.transition_ratio_ge4: {transition_ratio_ge4:.6f}")
     print(f"energy.action_rate_mean: {action_rate_mean:.6f}")
     print(f"energy.effort_proxy_mean [{effort_proxy_name}]: {effort_proxy_mean:.6f}")
+    # ★ Energy-aware KPIs
+    _ekc = float(max(1, energy_kpi_count))
+    print(f"energy.spring_energy_mean(J): {spring_energy_sum / _ekc:.6f}")
+    print(f"energy.spring_release_power_mean(W): {spring_release_sum / _ekc:.6f}")
+    print(f"energy.spring_store_power_mean(W): {spring_store_sum / _ekc:.6f}")
+    print(f"energy.damper_dissipation_mean(W): {damper_dissipation_sum / _ekc:.6f}")
+    print(f"energy.mech_power_main_mean(W): {mech_power_main_sum / _ekc:.6f}")
+    print(f"energy.cost_of_transport_proxy: {cot_proxy_sum / _ekc:.6f}")
+    if spring_release_sum + spring_store_sum > 0:
+        print(f"energy.spring_recovery_ratio: {spring_release_sum / (spring_release_sum + spring_store_sum):.6f}")
+    else:
+        print(f"energy.spring_recovery_ratio: N/A")
     print(f"acceptance.command_pass_ratio: {command_pass_ratio:.6f}")
     print(f"acceptance.min_skill_pass_ratio: {min_skill_pass_ratio:.6f}")
     print(f"acceptance.overall_score_mean: {overall_score_mean:.6f}")
@@ -921,6 +973,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             {"metric": "energy.action_rate_mean", "value": action_rate_mean},
             {"metric": "energy.effort_proxy_mean", "value": effort_proxy_mean},
             {"metric": "energy.effort_proxy_name", "value": effort_proxy_name},
+            {"metric": "energy.spring_energy_mean", "value": spring_energy_sum / _ekc},
+            {"metric": "energy.spring_release_power_mean", "value": spring_release_sum / _ekc},
+            {"metric": "energy.spring_store_power_mean", "value": spring_store_sum / _ekc},
+            {"metric": "energy.damper_dissipation_mean", "value": damper_dissipation_sum / _ekc},
+            {"metric": "energy.mech_power_main_mean", "value": mech_power_main_sum / _ekc},
+            {"metric": "energy.cost_of_transport_proxy", "value": cot_proxy_sum / _ekc},
+            {"metric": "energy.spring_recovery_ratio", "value": spring_release_sum / max(spring_release_sum + spring_store_sum, 1e-6)},
             {"metric": "contact.histogram", "value": summarize_contact_hist(contact_hist)},
             {"metric": "acceptance.command_pass_ratio", "value": command_pass_ratio},
             {"metric": "acceptance.min_skill_pass_ratio", "value": min_skill_pass_ratio},

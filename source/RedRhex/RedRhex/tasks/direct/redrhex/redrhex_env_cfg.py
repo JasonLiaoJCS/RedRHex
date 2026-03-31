@@ -1572,7 +1572,38 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         # 追蹤曲線寬度
         "lin_tracking_sigma": 0.30,
         "yaw_tracking_sigma": 0.35,
+
+        # =====================================================================
+        # 節能 reward（Energy-aware rewards）
+        # 設計原則：權重遠低於追蹤(~9.0)，讓省能不壓過命令追蹤
+        # =====================================================================
+        # E1: 有源機械功率效率 — 每單位速度的功率消耗越低越好
+        #     r = -w * sum(|τ*ω|) / (v + ε)
+        "power_efficiency": 0.3,
+        "power_efficiency_eps": 0.1,       # 速度分母的 ε，防除零
+
+        # E2: 彈簧能量回收 — 鼓勵彈簧釋能佔驅動功率的比例
+        #     r = w * clamp(spring_release / (|P_main| + ε), 0, 1)
+        "spring_recovery": 0.4,
+        "spring_recovery_eps": 0.01,       # 功率分母的 ε
+
+        # E3: 彈簧活用度 — 彈簧偏轉 std 越大，表示彈簧被動態使用
+        #     r = w * clamp(std(Δθ) / max_deflection, 0, 1)
+        "spring_utilization": 0.2,
+        "spring_util_max_deflection": 0.3, # 歸一化用的最大偏轉 (rad)
+
+        # E4: 力矩平方懲罰（很輕，只防極端）
+        "torque_penalty": -0.0001,
+        "torque_penalty_abad_weight": 0.5, # ABAD 力矩懲罰的相對權重
     }
+
+    # =========================================================================
+    # 【彈簧/阻尼器物理常數】用於節能 reward 計算
+    # =========================================================================
+    # 這些值必須與 REDRHEX_CFG.actuators["damper"] 的設定一致
+    damper_stiffness = 200.0    # N·m/rad — 扭轉彈簧剛度
+    damper_damping = 20.0       # N·m·s/rad — 阻尼係數
+    robot_mass_kg = 14.0        # 整機質量（用於 CoT 計算）
 
 
 @configclass
@@ -1709,4 +1740,13 @@ class RedrhexForwardFastEnvCfg(RedrhexEnvCfg):
         "yaw_cheat_tilt_thresh": 0.30,
         "lin_tracking_sigma": 0.30,
         "yaw_tracking_sigma": 0.35,
+        # 節能 reward — ForwardFast 先用低權重，穩定後再調高
+        "power_efficiency": 0.15,
+        "power_efficiency_eps": 0.1,
+        "spring_recovery": 0.2,
+        "spring_recovery_eps": 0.01,
+        "spring_utilization": 0.1,
+        "spring_util_max_deflection": 0.3,
+        "torque_penalty": -0.00005,
+        "torque_penalty_abad_weight": 0.5,
     }
