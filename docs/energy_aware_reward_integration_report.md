@@ -6,6 +6,10 @@
 **環境**: `Template-Redrhex-Direct-v0` / `Template-Redrhex-ForwardFast-Direct-v0`  
 **文件狀態**: 已對齊目前 repo 中實際完成的程式實作  
 
+> 更新註記（2026-04-16）：目前 reward 設計方向已改為以結果為導向的
+> `馬達能耗 / 有效距離` 目標。最新、與期中報告對齊的說明與程式修改摘要，
+> 請參考 `docs/2026_Midterm.md`。
+
 ---
 
 ## 目錄

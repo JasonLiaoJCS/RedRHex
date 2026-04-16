@@ -365,6 +365,8 @@ def collect_energy_metrics(
     actual_vx: torch.Tensor,
     actual_vy: torch.Tensor,
     actual_wz: torch.Tensor,
+    cmd_vx: float,
+    cmd_vy: float,
 ) -> dict[str, torch.Tensor]:
     """Collect per-step energy metrics with simulator-first torque lookup and safe fallbacks."""
     num_envs = unwrapped_env.num_envs
@@ -374,6 +376,25 @@ def collect_energy_metrics(
     lin_xy = torch.stack((actual_vx, actual_vy), dim=1)
     yaw_radius = float(getattr(unwrapped_env, "_energy_yaw_radius", getattr(unwrapped_env.cfg, "energy_velocity_yaw_radius", 0.18)))
     motion_speed = torch.sqrt(torch.sum(torch.square(lin_xy), dim=1) + torch.square(yaw_radius * actual_wz))
+    cmd_lin = torch.stack(
+        (
+            torch.full_like(actual_vx, float(cmd_vx)),
+            torch.full_like(actual_vy, float(cmd_vy)),
+        ),
+        dim=1,
+    )
+    cmd_lin_speed = torch.linalg.norm(cmd_lin, dim=1)
+    safe_cmd_lin_speed = torch.clamp(cmd_lin_speed, min=1e-6)
+    cmd_dir = cmd_lin / safe_cmd_lin_speed.unsqueeze(1)
+    min_cmd_motion = float(
+        getattr(unwrapped_env, "_energy_min_cmd_motion", getattr(unwrapped_env.cfg, "energy_min_command_motion", 0.05))
+    )
+    progress_speed = torch.sum(lin_xy * cmd_dir, dim=1)
+    progress_speed = torch.where(
+        cmd_lin_speed > min_cmd_motion,
+        torch.clamp(progress_speed, min=0.0),
+        torch.zeros_like(progress_speed),
+    )
 
     main_power = zeros.clone()
     abad_power = zeros.clone()
@@ -434,14 +455,19 @@ def collect_energy_metrics(
         damper_dissipation = spring_d * torch.sum(torch.square(damp_vel), dim=1)
 
     robot_mass = float(getattr(unwrapped_env, "_robot_mass", getattr(unwrapped_env.cfg, "robot_mass_kg", 14.0)))
+    reward_scales = getattr(unwrapped_env.cfg, "v2_reward_scales", {})
+    power_eff_eps = max(float(reward_scales.get("power_efficiency_eps", 0.1)), 1e-3)
     cot_proxy = total_power / (robot_mass * 9.81 * (motion_speed + 0.1))
+    energy_per_distance = total_power / (progress_speed + power_eff_eps)
 
     return {
         "motion_speed": motion_speed,
+        "progress_speed": progress_speed,
         "mech_power_main": main_power,
         "mech_power_abad": abad_power,
         "mech_power_total": total_power,
         "cot_proxy": cot_proxy,
+        "energy_per_distance": energy_per_distance,
         "spring_energy": spring_energy,
         "spring_release": spring_release,
         "spring_store": spring_store,
@@ -554,6 +580,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     cot_proxy_sum = 0.0
     damper_dissipation_sum = 0.0
     motion_speed_sum = 0.0
+    progress_speed_sum = 0.0
+    energy_per_distance_sum = 0.0
     energy_kpi_count = 0
 
     forward_phase_diff_sum = 0.0
@@ -571,6 +599,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     skill_cot_sum: defaultdict[str, float] = defaultdict(float)
     skill_spring_recovery_ratio_sum: defaultdict[str, float] = defaultdict(float)
     skill_motion_speed_sum: defaultdict[str, float] = defaultdict(float)
+    skill_progress_speed_sum: defaultdict[str, float] = defaultdict(float)
+    skill_energy_per_distance_sum: defaultdict[str, float] = defaultdict(float)
     score_sum = 0.0
 
     for name, cmd, skill in command_set:
@@ -598,6 +628,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cmd_spring_store_sum = 0.0
         cmd_spring_recovery_ratio_sum = 0.0
         cmd_motion_speed_sum = 0.0
+        cmd_progress_speed_sum = 0.0
+        cmd_energy_per_distance_sum = 0.0
         cmd_energy_steps = 0
 
         last_actions = None
@@ -773,7 +805,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             cmd_success_steps += int(torch.count_nonzero(success_mask).item())
 
-            energy_metrics = collect_energy_metrics(unwrapped_env, actual_vx, actual_vy, actual_wz)
+            energy_metrics = collect_energy_metrics(
+                unwrapped_env,
+                actual_vx,
+                actual_vy,
+                actual_wz,
+                float(cmd[0]),
+                float(cmd[1]),
+            )
             if torch.count_nonzero(energy_metrics["mech_power_total"]).item() > 0:
                 effort_proxy_name = "mean(total_mech_power)"
                 effort_proxy_sum += energy_metrics["mech_power_total"].mean().item()
@@ -794,6 +833,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             mech_power_total_sum += energy_metrics["mech_power_total"].mean().item()
             cot_proxy_sum += energy_metrics["cot_proxy"].mean().item()
             motion_speed_sum += energy_metrics["motion_speed"].mean().item()
+            progress_speed_sum += energy_metrics["progress_speed"].mean().item()
+            energy_per_distance_sum += energy_metrics["energy_per_distance"].mean().item()
 
             cmd_mech_power_main_sum += energy_metrics["mech_power_main"].mean().item()
             cmd_mech_power_total_sum += energy_metrics["mech_power_total"].mean().item()
@@ -803,12 +844,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             cmd_spring_store_sum += energy_metrics["spring_store"].mean().item()
             cmd_spring_recovery_ratio_sum += energy_metrics["spring_recovery_ratio"].mean().item()
             cmd_motion_speed_sum += energy_metrics["motion_speed"].mean().item()
+            cmd_progress_speed_sum += energy_metrics["progress_speed"].mean().item()
+            cmd_energy_per_distance_sum += energy_metrics["energy_per_distance"].mean().item()
             cmd_energy_steps += 1
 
             skill_mech_power_total_sum[skill] += energy_metrics["mech_power_total"].mean().item()
             skill_cot_sum[skill] += energy_metrics["cot_proxy"].mean().item()
             skill_spring_recovery_ratio_sum[skill] += energy_metrics["spring_recovery_ratio"].mean().item()
             skill_motion_speed_sum[skill] += energy_metrics["motion_speed"].mean().item()
+            skill_progress_speed_sum[skill] += energy_metrics["progress_speed"].mean().item()
+            skill_energy_per_distance_sum[skill] += energy_metrics["energy_per_distance"].mean().item()
             skill_energy_steps[skill] += 1
             energy_kpi_count += 1
 
@@ -839,9 +884,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         result["energy_spring_store_power_mean"] = cmd_spring_store_sum / cmd_energy_denom
         result["energy_spring_recovery_ratio"] = cmd_spring_recovery_ratio_sum / cmd_energy_denom
         result["energy_motion_speed_mean"] = cmd_motion_speed_sum / cmd_energy_denom
-        result["energy_power_per_motion"] = result["energy_mech_power_total_mean"] / max(
-            result["energy_motion_speed_mean"], 1e-6
-        )
+        result["energy_progress_speed_mean"] = cmd_progress_speed_sum / cmd_energy_denom
+        result["energy_per_distance"] = cmd_energy_per_distance_sum / cmd_energy_denom
+        # 保留舊欄位名稱，避免外部 CSV/plot 腳本中斷；其語意已改為每單位有效位移能耗。
+        result["energy_power_per_motion"] = result["energy_per_distance"]
 
         # Tracking quality (0~1), normalized by command magnitude
         if skill == "forward":
@@ -930,6 +976,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     mech_power_total_mean = mech_power_total_sum / float(max(1, energy_kpi_count))
     cot_proxy_mean = cot_proxy_sum / float(max(1, energy_kpi_count))
     motion_speed_mean = motion_speed_sum / float(max(1, energy_kpi_count))
+    progress_speed_mean = progress_speed_sum / float(max(1, energy_kpi_count))
+    energy_per_distance_mean = energy_per_distance_sum / float(max(1, energy_kpi_count))
     command_pass_ratio = float(sum(1 for row in results if row["accept_pass"])) / float(max(1, len(results)))
     overall_score_mean = score_sum / float(max(1, len(results)))
     skill_pass_ratio = {
@@ -941,6 +989,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "cost_of_transport_proxy": skill_cot_sum[skill] / float(max(1, skill_energy_steps[skill])),
             "spring_recovery_ratio": skill_spring_recovery_ratio_sum[skill] / float(max(1, skill_energy_steps[skill])),
             "motion_speed_mean": skill_motion_speed_sum[skill] / float(max(1, skill_energy_steps[skill])),
+            "progress_speed_mean": skill_progress_speed_sum[skill] / float(max(1, skill_energy_steps[skill])),
+            "energy_per_distance": skill_energy_per_distance_sum[skill] / float(max(1, skill_energy_steps[skill])),
         }
         for skill in sorted(skill_total.keys())
     }
@@ -987,16 +1037,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print("\n=== Energy By Command ===")
     print(
-        f"{'command':<14} {'skill':<9} {'P_total(W)':>11} {'CoT_proxy':>11} "
-        f"{'spring_rec':>11} {'motion_eq':>11}"
+        f"{'command':<14} {'skill':<9} {'P_total(W)':>11} {'E/dist':>11} "
+        f"{'progress':>11} {'spring_rec':>11}"
     )
     for row in results:
         print(
             f"{row['command']:<14} {row['skill']:<9} "
             f"{row['energy_mech_power_total_mean']:>11.4f} "
-            f"{row['energy_cost_of_transport_proxy']:>11.4f} "
-            f"{row['energy_spring_recovery_ratio']:>11.4f} "
-            f"{row['energy_motion_speed_mean']:>11.4f}"
+            f"{row['energy_per_distance']:>11.4f} "
+            f"{row['energy_progress_speed_mean']:>11.4f} "
+            f"{row['energy_spring_recovery_ratio']:>11.4f}"
         )
 
     print("\n=== Skill-level Pass Ratio ===")
@@ -1011,8 +1061,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     for skill, metrics in skill_energy_summary.items():
         print(
             f"{skill:<9} P_total={metrics['mech_power_total_mean']:.4f} W, "
-            f"CoT={metrics['cost_of_transport_proxy']:.4f}, "
+            f"E/dist={metrics['energy_per_distance']:.4f}, "
             f"spring_rec={metrics['spring_recovery_ratio']:.4f}, "
+            f"progress={metrics['progress_speed_mean']:.4f}, "
             f"motion_eq={metrics['motion_speed_mean']:.4f}"
         )
 
@@ -1055,6 +1106,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"energy.mech_power_main_mean(W): {mech_power_main_mean:.6f}")
     print(f"energy.mech_power_total_mean(W): {mech_power_total_mean:.6f}")
     print(f"energy.motion_speed_equiv_mean: {motion_speed_mean:.6f}")
+    print(f"energy.progress_speed_mean: {progress_speed_mean:.6f}")
+    print(f"energy.per_distance: {energy_per_distance_mean:.6f}")
     print(f"energy.cost_of_transport_proxy: {cot_proxy_mean:.6f}")
     if spring_release_sum + spring_store_sum > 0:
         print(f"energy.spring_recovery_ratio: {spring_release_sum / (spring_release_sum + spring_store_sum):.6f}")
@@ -1097,6 +1150,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "energy_spring_store_power_mean",
                     "energy_spring_recovery_ratio",
                     "energy_motion_speed_mean",
+                    "energy_progress_speed_mean",
+                    "energy_per_distance",
                     "energy_power_per_motion",
                     "tracking_quality",
                     "stability_quality",
@@ -1137,6 +1192,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             {"metric": "energy.mech_power_main_mean", "value": mech_power_main_mean},
             {"metric": "energy.mech_power_total_mean", "value": mech_power_total_mean},
             {"metric": "energy.motion_speed_equiv_mean", "value": motion_speed_mean},
+            {"metric": "energy.progress_speed_mean", "value": progress_speed_mean},
+            {"metric": "energy.per_distance", "value": energy_per_distance_mean},
             {"metric": "energy.cost_of_transport_proxy", "value": cot_proxy_mean},
             {"metric": "energy.spring_recovery_ratio", "value": spring_release_sum / max(spring_release_sum + spring_store_sum, 1e-6)},
             {"metric": "contact.histogram", "value": summarize_contact_hist(contact_hist)},
@@ -1152,6 +1209,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             summary_rows.append({"metric": f"energy.skill.{skill}.cost_of_transport_proxy", "value": metrics["cost_of_transport_proxy"]})
             summary_rows.append({"metric": f"energy.skill.{skill}.spring_recovery_ratio", "value": metrics["spring_recovery_ratio"]})
             summary_rows.append({"metric": f"energy.skill.{skill}.motion_speed_mean", "value": metrics["motion_speed_mean"]})
+            summary_rows.append({"metric": f"energy.skill.{skill}.progress_speed_mean", "value": metrics["progress_speed_mean"]})
+            summary_rows.append({"metric": f"energy.skill.{skill}.energy_per_distance", "value": metrics["energy_per_distance"]})
 
         with open(summary_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["metric", "value"])

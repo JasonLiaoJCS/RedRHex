@@ -1575,26 +1575,17 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
 
         # =====================================================================
         # 節能 reward（Energy-aware rewards）
-        # 設計原則：權重遠低於追蹤(~9.0)，讓省能不壓過命令追蹤
+        # 設計原則：reward 只看「馬達能耗 / 有效位移」這個最終結果，
+        #          不直接把 spring 吸能/釋能 proxy 寫進 reward。
+        #          若彈簧腳真的有優勢，policy 會自然學出更低的單位位移能耗。
         # =====================================================================
-        # E1: 有源機械功率效率 — 每單位速度的功率消耗越低越好
-        #     r = -w * sum(|τ*ω|) / (v + ε)
+        # E1: 單位有效位移能耗 — 每推進一段距離所需的馬達能耗越低越好
+        #     step-wise 形式下：(|τ*ω| * dt) / (progress * dt) = |τ*ω| / progress
         "power_efficiency": 0.3,
-        "power_efficiency_eps": 0.1,       # 速度分母的 ε，防除零
+        "power_efficiency_eps": 0.1,       # 位移/進度分母的 ε，防除零
         "power_efficiency_tanh_scale": 500.0,
 
-        # E2: 彈簧能量回收 — 鼓勵彈簧釋能佔驅動功率的比例
-        #     r = w * clamp(spring_release / (|P_main| + ε), 0, 1)
-        "spring_recovery": 0.4,
-        "spring_recovery_eps": 0.01,       # 功率分母的 ε
-        "spring_recovery_abad_weight": 0.35,
-
-        # E3: 彈簧活用度 — 彈簧偏轉 std 越大，表示彈簧被動態使用
-        #     r = w * clamp(std(Δθ) / max_deflection, 0, 1)
-        "spring_utilization": 0.2,
-        "spring_util_max_deflection": 0.3, # 歸一化用的最大偏轉 (rad)
-
-        # E4: 力矩平方懲罰（很輕，只防極端）
+        # E2: 力矩平方懲罰（很輕，只防極端）
         "torque_penalty": -0.0001,
         "torque_penalty_abad_weight": 0.5, # ABAD 力矩懲罰的相對權重
     }
@@ -1607,7 +1598,7 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     damper_damping = 20.0       # N·m·s/rad — 阻尼係數
     robot_mass_kg = 14.0        # 整機質量（用於 CoT 計算）
     energy_velocity_yaw_radius = 0.18  # m，將 yaw rate 換算成等效線速度
-    energy_min_command_motion = 0.05   # m/s-equivalent，低於此值不啟用正向 spring reward
+    energy_min_command_motion = 0.05   # m/s，低於此值不啟用位移型節能 reward（例如 pure yaw）
     main_drive_torque_estimate_damping = 50.0
     main_drive_torque_estimate_limit = 100.0
     abad_torque_estimate_stiffness = 40.0
@@ -1753,11 +1744,6 @@ class RedrhexForwardFastEnvCfg(RedrhexEnvCfg):
         "power_efficiency": 0.15,
         "power_efficiency_eps": 0.1,
         "power_efficiency_tanh_scale": 500.0,
-        "spring_recovery": 0.2,
-        "spring_recovery_eps": 0.01,
-        "spring_recovery_abad_weight": 0.35,
-        "spring_utilization": 0.1,
-        "spring_util_max_deflection": 0.3,
         "torque_penalty": -0.00005,
         "torque_penalty_abad_weight": 0.5,
     }

@@ -468,6 +468,7 @@ class RedrhexEnv(DirectRLEnv):
             "diag_stance_count": torch.zeros(self.num_envs, device=self.device),
             # ★★★ 節能 reward 與 diagnostic ★★★
             "rew_power_efficiency": torch.zeros(self.num_envs, device=self.device),
+            "rew_energy_per_distance": torch.zeros(self.num_envs, device=self.device),
             "rew_spring_recovery": torch.zeros(self.num_envs, device=self.device),
             "rew_spring_utilization": torch.zeros(self.num_envs, device=self.device),
             "rew_torque_penalty": torch.zeros(self.num_envs, device=self.device),
@@ -483,6 +484,8 @@ class RedrhexEnv(DirectRLEnv):
             "diag_cost_of_transport": torch.zeros(self.num_envs, device=self.device),
             "diag_motion_speed_equiv": torch.zeros(self.num_envs, device=self.device),
             "diag_cmd_motion_speed_equiv": torch.zeros(self.num_envs, device=self.device),
+            "diag_useful_progress_speed": torch.zeros(self.num_envs, device=self.device),
+            "diag_energy_per_distance": torch.zeros(self.num_envs, device=self.device),
             "diag_torque_rms_main": torch.zeros(self.num_envs, device=self.device),
         }
 
@@ -2404,7 +2407,10 @@ class RedrhexEnv(DirectRLEnv):
         main_torques, abad_torques = self._get_active_joint_torques(main_drive_vel, abad_vel)
 
         # --- E1: 有源機械功率效率 ---
-        # P = |τ * ω|，以等效運動速度（平移 + yaw）做歸一化。
+        # 設計改為最簡單的 outcome-based reward：
+        # 直接最小化「每單位有效位移所需的馬達能耗」。
+        # RL 若真的學出更省能的步態，彈簧腳的優勢會自然反映在這個結果上，
+        # 而不是靠 reward 額外指定 spring 應該怎麼工作。
         mech_power_main = torch.sum(torch.abs(main_torques * main_drive_vel), dim=1)  # [N]
         mech_power_abad = torch.sum(torch.abs(abad_torques * abad_vel), dim=1)
         total_mech_power = mech_power_main + mech_power_abad
@@ -2412,48 +2418,38 @@ class RedrhexEnv(DirectRLEnv):
         power_eff_tanh_scale = max(float(scales.get("power_efficiency_tanh_scale", 500.0)), 1.0)
         actual_motion_speed = self._compute_energy_equivalent_speed(actual_lin, actual_wz)
         cmd_motion_speed = self._compute_energy_equivalent_speed(cmd_lin, cmd_wz)
-        power_per_motion = total_mech_power / (actual_motion_speed + power_eff_eps)
-        rew_power_efficiency = -torch.tanh(power_per_motion / power_eff_tanh_scale) * scales.get("power_efficiency", 0.3)
-        rew_power_efficiency = rew_power_efficiency * healthy_gate
-        total_reward += rew_power_efficiency
+        cmd_translation_gate = (cmd_lin_speed > self._energy_min_cmd_motion).float()
+        useful_progress_speed = torch.where(
+            cmd_lin_speed > self._energy_min_cmd_motion,
+            torch.clamp(lin_progress, min=0.0),
+            torch.zeros_like(lin_progress),
+        )
+        energy_per_distance = total_mech_power / (useful_progress_speed + power_eff_eps)
+        rew_energy_per_distance = -torch.tanh(energy_per_distance / power_eff_tanh_scale) * scales.get(
+            "power_efficiency", 0.3
+        )
+        rew_energy_per_distance = rew_energy_per_distance * healthy_gate * cmd_translation_gate
+        # 保留舊名稱，避免既有 TensorBoard / 腳本讀值中斷。
+        rew_power_efficiency = rew_energy_per_distance
+        total_reward += rew_energy_per_distance
 
-        # --- E2: 彈簧能量回收 ---
+        # --- E2: 彈簧相關量改為 diagnostics only ---
         # 彈簧位能: E = 0.5 * k * Δθ²
         spring_energy = 0.5 * self._spring_k * torch.square(damper_deflection)  # [N, 6]
         # 彈簧功率 (位能變化率): dE/dt = k * Δθ * ω_damp
         spring_power = self._spring_k * damper_deflection * damper_vel  # [N, 6]
-        # 只在 phase-based stance contact proxy 下計入 spring exchange，避免 swing 中抖動作弊。
+        # 只在 phase-based stance contact proxy 下統計 spring exchange，避免 swing 中抖動污染診斷。
         if hasattr(self, "_current_leg_in_stance") and self._current_leg_in_stance.shape == damper_pos.shape:
             spring_contact_mask = self._current_leg_in_stance.float()
         else:
             spring_contact_mask = torch.ones_like(damper_pos)
         spring_release = torch.sum(torch.clamp(-spring_power, min=0.0) * spring_contact_mask, dim=1)  # [N]
         spring_store = torch.sum(torch.clamp(spring_power, min=0.0) * spring_contact_mask, dim=1)     # [N]
-        spring_recovery_eps = max(float(scales.get("spring_recovery_eps", 0.01)), 1e-5)
-        spring_recovery_abad_weight = float(scales.get("spring_recovery_abad_weight", 0.35))
-        cmd_motion_gate = (cmd_motion_speed > self._energy_min_cmd_motion).float()
-        motion_tracking_gate = torch.clamp(
-            actual_motion_speed / torch.clamp(cmd_motion_speed, min=power_eff_eps),
-            min=0.0,
-            max=1.0,
-        )
-        spring_reward_gate = healthy_gate * cmd_motion_gate * motion_tracking_gate
-        recovery_ratio = torch.clamp(
-            spring_release / (mech_power_main + spring_recovery_abad_weight * mech_power_abad + spring_recovery_eps),
-            min=0.0,
-            max=1.0,
-        )
-        rew_spring_recovery = recovery_ratio * scales.get("spring_recovery", 0.4)
-        rew_spring_recovery = rew_spring_recovery * spring_reward_gate
-        total_reward += rew_spring_recovery
-
-        # --- E3: 彈簧活用度 ---
+        spring_recovery_eps = 1e-5
+        spring_recovery_ratio = spring_release / (spring_release + spring_store + spring_recovery_eps)
         spring_deflection_std = torch.std(damper_deflection, dim=1, unbiased=False)  # [N]
-        max_defl = max(float(scales.get("spring_util_max_deflection", 0.3)), 1e-3)
-        spring_util_norm = torch.clamp(spring_deflection_std / max_defl, min=0.0, max=1.0)
-        rew_spring_utilization = spring_util_norm * scales.get("spring_utilization", 0.2)
-        rew_spring_utilization = rew_spring_utilization * spring_reward_gate
-        total_reward += rew_spring_utilization
+        rew_spring_recovery = torch.zeros_like(rew_power_efficiency)
+        rew_spring_utilization = torch.zeros_like(rew_power_efficiency)
 
         # --- E4: 力矩平方懲罰 ---
         abad_weight = float(scales.get("torque_penalty_abad_weight", 0.5))
@@ -2466,7 +2462,6 @@ class RedrhexEnv(DirectRLEnv):
 
         # --- 節能 diagnostics (不回饋到 reward) ---
         spring_energy_total = torch.sum(spring_energy, dim=1)
-        spring_recovery_ratio = spring_release / (spring_release + spring_store + spring_recovery_eps)
         damper_dissipation = self._spring_d * torch.sum(torch.square(damper_vel), dim=1)
         torque_rms_main = torch.sqrt(torch.mean(torch.square(main_torques), dim=1))
         # Cost of Transport proxy: P / (m * g * v_eq)
@@ -2535,6 +2530,7 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["rew_fall"] += rew_fall
         # ★ 節能 reward episode sums
         self.episode_sums["rew_power_efficiency"] += rew_power_efficiency
+        self.episode_sums["rew_energy_per_distance"] += rew_energy_per_distance
         self.episode_sums["rew_spring_recovery"] += rew_spring_recovery
         self.episode_sums["rew_spring_utilization"] += rew_spring_utilization
         self.episode_sums["rew_torque_penalty"] += rew_torque_penalty
@@ -2548,6 +2544,8 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_wz_error"] += wz_error
         self.episode_sums["diag_motion_speed_equiv"] += actual_motion_speed
         self.episode_sums["diag_cmd_motion_speed_equiv"] += cmd_motion_speed
+        self.episode_sums["diag_useful_progress_speed"] += useful_progress_speed
+        self.episode_sums["diag_energy_per_distance"] += energy_per_distance * cmd_translation_gate
         lin_vel_error = torch.linalg.norm(cmd_lin - actual_lin, dim=1)
         self.episode_sums["diag_vel_error"] += lin_vel_error
         self.episode_sums["diag_base_height"] += base_height
