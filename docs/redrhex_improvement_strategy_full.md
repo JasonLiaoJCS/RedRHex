@@ -6,6 +6,7 @@
 ## 目錄
 
 - [0. 報告主旨](#0-報告主旨)
+  - [0.1 現行落地訓練順序（重要）](#01-現行落地訓練順序重要)
 - [1. 世界頂尖腿足機器人 RL 研究全覽](#1-世界頂尖腿足機器人-rl-研究全覽)
   - [1.1 ETH RSL — Learning Robust Perceptive Locomotion (Miki 2022)](#11-eth-rsl--learning-robust-perceptive-locomotion-miki-2022)
   - [1.2 ETH RSL — ANYmal Parkour (Hoeller 2024)](#12-eth-rsl--anymal-parkour-hoeller-2024)
@@ -40,6 +41,70 @@
 > — *Akki & Chen, IEEE Access 2025, Benchmarking MPC and RL for Legged Locomotion*
 
 這一句就是你的故事線。你要做的是:**利用 RL 的擾動/能效優勢,同時靠訓練技巧(teacher-student + domain randomization + terrain curriculum)補上泛化弱點**。
+
+### 0.1 現行落地訓練順序（重要）
+
+在進入文獻與策略細節前，先把目前專案的實際落地順序講清楚，避免理論和操作脫節。
+
+現在的訓練路線應這樣理解：
+
+1. **快速驗證 / 快速直走**
+- `Task`：`Template-Redrhex-ForwardFast-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+- 用途：最快檢查 reward / 物理參數 / 直走行為是否有效
+
+2. **正式 forward-only 穩走路線（非 ForwardFast）**
+- `Task`：`Template-Redrhex-Direct-v0`
+- 額外加 Hydra override：`env.stage=1`
+- `Agent`：
+  - baseline：`rsl_rl_cfg_entry_point`
+  - teacher：`rsl_rl_teacher_cfg_entry_point`
+  - student distillation：`rsl_rl_distillation_cfg_entry_point`
+- 用途：只訓穩定前進，但保留主 task 的完整 observation / reward / teacher-student 架構
+
+3. **正式完整主線**
+- `Task`：`Template-Redrhex-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+- 用途：完整 locomotion 基線
+- 建議方式：五階段 `train_stage_pipeline.sh`
+
+4. **進階 teacher-student 路線**
+- 先 train `rsl_rl_teacher_cfg_entry_point`
+- 再做 `rsl_rl_distillation_cfg_entry_point`
+- 用途：追更高上限、研究蒸餾與部署 student
+
+最重要的 operational clarification：
+
+- 直接跑 `train.py --task Template-Redrhex-Direct-v0`
+- 並不等於五階段 curriculum
+- 目前它對應的是單段 mixed stage 訓練
+
+因此正確順序通常是：
+
+1. 先用一般 PPO 跑通 baseline
+2. 再用五階段 curriculum 做正式完整主線
+3. 最後才做 teacher / student distillation
+
+也就是說：
+
+- teacher-student 雖然是文獻上的強配方
+- 但工程上不應該是你今天第一步就先做的事情
+
+如果你目前的研究問題不是「完整多技能」，而是：
+
+- 只想把 forward locomotion 訓到很穩
+- 想保留節能 reward 與 spring-leg 優勢
+- 想保留 teacher / student 蒸餾接口
+
+那最適合的起點不是 ForwardFast，而是主 task 的：
+
+- `Template-Redrhex-Direct-v0 + env.stage=1`
+
+原因是：
+
+- 主 task 版本的節能 reward 權重比 ForwardFast 更完整
+- 主 task 的 history actor / asymmetric critic / privileged teacher 介面都已經接好
+- 這比較符合後續把單技能結果往正式部署模型擴充的工程路線
 
 ---
 

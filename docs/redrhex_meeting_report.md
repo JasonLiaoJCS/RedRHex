@@ -12,6 +12,50 @@
 
 這份文件的定位是「報告用的邏輯整理」。
 
+## 1.1 2026-04-16 補充：目前實際訓練流程怎麼選
+
+這裡補一個很重要的 operational clarification，因為現在路線比以前多，容易混淆：
+
+- 直接跑 `train.py --task Template-Redrhex-Direct-v0`
+- 不等於五階段 curriculum
+
+目前實際上：
+
+- `train.py` 直接跑主 task = 單段 mixed stage 訓練
+- `train_stage_pipeline.sh` = 真正的五階段 curriculum
+
+所以目前建議的使用方式是：
+
+1. **第一次上手 / 先確認整個 stack 正常**
+- 先跑 `Template-Redrhex-Direct-v0 + rsl_rl_cfg_entry_point`
+- 用一般 PPO 跑通 train / play / export
+
+2. **想快速看直走是否有效**
+- 跑 `Template-Redrhex-ForwardFast-Direct-v0 + rsl_rl_cfg_entry_point`
+- 這是快速驗證分支，不是完整主線替代品
+
+3. **只想穩定往前走，但不要 ForwardFast**
+- 跑 `Template-Redrhex-Direct-v0 + env.stage=1`
+- 如果只是 baseline，用 `rsl_rl_cfg_entry_point`
+- 如果要 privileged teacher，就用 `rsl_rl_teacher_cfg_entry_point`
+- 如果要 student distillation，就用 `rsl_rl_distillation_cfg_entry_point`
+- 這條路線的本質是：保留主 task 正式堆疊，但技能固定在 Stage1 forward-only
+
+4. **想做最正式的完整 locomotion 訓練**
+- 仍然建議使用主 task 的五階段 curriculum
+- 也就是跑 `train_stage_pipeline.sh`
+
+5. **想做 teacher / student**
+- 這是進階研究分支
+- 順序應該是：先有穩定 baseline，再 teacher，最後 distillation
+
+也就是說：
+
+- `rsl_rl_cfg_entry_point` 仍然是大多數情況下的第一選擇
+- 五階段 curriculum 仍然是完整主線
+- teacher / student 不是第一步
+- 如果你只想穩定直走，而且不想走 ForwardFast 快收斂路線，就用主 task 的 `env.stage=1`
+
 ## 2. 專案背景：我們原本在做什麼
 
 我們的目標是讓 RedRhex 這個六足 wheg 機器人，在同一套 policy 下具備完整的多技能 locomotion 能力，包含：
@@ -981,4 +1025,3 @@ Stage5 是整套 curriculum 的總整合階段。
 如果你要一段比較完整、可以直接講的結語，可以用下面這段：
 
 「這一輪我們的重點，不是單純把訓練時間拉長，而是把整個 RedRhex 多技能 locomotion 的開發流程重構。原本一次混訓所有技能，導致直走之外的技能互相干擾、也很難診斷問題。後來我們改成五階段 curriculum：先把直走打穩，再把側走、斜走、原地旋轉分別拆開訓練，最後再用 Stage5 做完整整合。配合這個流程，我們同時修改了環境控制邏輯、stage 接續訓練腳本、播放工具與評估工具，並加入 checkpoint 防呆、GUI 預檢與健康檢查，目標是避免整晚白跑、避免誤讀模型、並盡量保留舊版穩定直走能力。現在最大的進展是，整個問題已經被拆成可追蹤、可驗收、可逐步修正的工程流程；接下來的重點，不是重做架構，而是根據這套架構繼續把 lateral、diagonal、yaw 的品質推上去。」 
-

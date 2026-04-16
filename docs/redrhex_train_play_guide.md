@@ -22,6 +22,1055 @@
 
 ---
 
+## 0. 完全新手先看這裡
+
+如果你現在最大的感覺是：
+
+- 我不知道 `Train` 跟 `Play` 差在哪裡
+- 我不知道 `Agent` 是什麼
+- 我不知道 `Teacher` / `Student` 是什麼
+- 我不知道 `Policy` / `History` / `Actor` / `Critic` 是什麼
+- 我也不知道為什麼有些參數前面要加 `--`，有些卻寫成 `env.stage=1`
+
+那你先看這一節，再往下看操作指令。
+
+## 0.1 最白話的名詞解釋
+
+### `Train` 是什麼
+
+`Train` 就是「訓練模型」。
+
+你執行 `python scripts/rsl_rl/train.py ...` 之後，程式會：
+
+1. 建立很多個模擬環境
+2. 讓機器人在模擬裡不斷嘗試動作
+3. 根據 reward 判斷哪些動作比較好
+4. 更新神經網路參數
+5. 每隔一段時間存成 `model_*.pt`
+
+所以 `Train` 的產物是：
+
+- TensorBoard 訓練曲線
+- `model_*.pt` checkpoint
+- `params/env.yaml`、`params/agent.yaml`
+
+### `Play` 是什麼
+
+`Play` 就是「拿一個已經訓練好的 checkpoint 來播放、測試、觀察」。
+
+你執行 `python scripts/rsl_rl/play.py ...` 之後，程式不會再學習，它只會：
+
+1. 載入某個 `model_*.pt`
+2. 建立模擬環境
+3. 用這個模型持續輸出動作
+4. 讓你看它會怎麼走
+5. 順便自動匯出 `policy.pt` 和 `policy.onnx`
+
+所以 `Play` 的用途是：
+
+- 看訓練好的模型是不是會走
+- 測試鍵盤控制
+- 匯出部署用模型
+
+### `Task` 是什麼
+
+`Task` 可以理解成「你要用哪一種環境設定來訓練或播放」。
+
+目前最常用兩個：
+
+- `Template-Redrhex-Direct-v0`
+  - 完整主任務
+  - 包含 rough terrain、history、critic privileged obs、teacher obs、故障注入等完整改革
+- `Template-Redrhex-ForwardFast-Direct-v0`
+  - 快速直走版
+  - 比較適合快速測試與現場 sim2real 直走調參
+
+### `Agent` 是什麼
+
+這裡的 `Agent` 不是指「機器人本體」，而是指「這次要用哪一種 RL 訓練設定與網路結構」。
+
+也就是說，`--agent` 會決定：
+
+- 用哪個網路輸入
+- 用哪種 runner
+- actor / critic 吃哪些 observation
+- 是一般 PPO、teacher PPO，還是 distillation
+- log 會存到哪個 experiment root
+
+所以你可以把 `--agent` 想成：
+
+- 「這次我要用哪個訓練模式」
+
+### `Checkpoint` 是什麼
+
+`Checkpoint` 就是訓練途中存下來的模型檔。
+
+在這個專案裡，最重要的 checkpoint 檔名長這樣：
+
+- `model_50.pt`
+- `model_100.pt`
+- `model_2500.pt`
+
+你之後做 `resume`、`play`、`eval`，幾乎都是拿這種 `model_*.pt`。
+
+### `Run` 是什麼
+
+`Run` 就是某一次訓練實驗的資料夾。
+
+例如：
+
+```text
+logs/rsl_rl/redrhex_wheg/2026-04-16_12-10-22_wheg_locomotion_reform_v1/
+```
+
+這整個資料夾就是一個 run。
+
+裡面會有：
+
+- `model_*.pt`
+- TensorBoard event 檔
+- `params/`
+- `exported/`
+
+### `Resume` 是什麼
+
+`Resume` 就是「從舊 checkpoint 接著訓練，不是從零開始」。
+
+---
+
+## 0.2 `Actor`、`Critic`、`Policy`、`History` 到底是什麼
+
+這些名詞很像，但不是同一件事。
+
+### `Actor`
+
+`Actor` 是真正負責「輸出動作」的網路。
+
+它看到 observation 之後，會決定下一步關節要怎麼動。
+
+如果你把整個機器人 policy 想成一個大腦：
+
+- `Actor` = 負責下命令的部分
+
+### `Critic`
+
+`Critic` 不負責輸出動作，它負責評估：
+
+- 「這個狀態值不值得」
+- 「這條軌跡看起來有沒有前途」
+
+在 PPO 訓練裡，`Critic` 幫助 `Actor` 學得更穩定。
+
+非常重要的一點：
+
+- `Critic` 通常只在訓練時使用
+- 真正部署到機器人時，通常只需要 `Actor`
+
+所以你可以把它理解成：
+
+- `Actor` = 開車的人
+- `Critic` = 副駕兼教練，在旁邊評估你開得好不好
+
+### `Policy`
+
+`Policy` 這個詞在 RL 裡通常是「整個決策規則」。
+
+在這個專案裡你會看到兩種意思：
+
+1. 一般概念上的 `policy`
+   - 指整個控制策略，也就是模型學到的行為規則
+2. observation group 裡的 `policy`
+   - 指給 actor 用的「當前時刻基礎觀測」
+
+所以看到 `policy` 時要分辨上下文。
+
+### `History`
+
+`History` 是「前幾個時間步的觀測歷史」。
+
+為什麼要有它？
+
+因為如果 actor 只看當前瞬間，很可能不知道：
+
+- 腿剛剛是往前擺還是往後擺
+- 機器人是正在加速還是剛剛打滑
+- 當前動作是 gait 的哪個階段
+
+加入 `history` 之後，actor 雖然不是 RNN，但仍能看到一小段時間脈絡。
+
+你可以把它理解成：
+
+- `policy` = 現在這一瞬間看到的資料
+- `history` = 剛剛前幾幀發生了什麼
+
+### `Policy + History` 為什麼常一起出現
+
+因為目前這個專案的主力 deployable actor，就是吃：
+
+- `policy`
+- `history`
+
+也就是：
+
+- 當前觀測
+- 加上一小段過去歷史
+
+這樣在不依賴特權資訊的情況下，也能學到比較穩定的步態控制。
+
+---
+
+## 0.3 `Teacher`、`Student`、`Distillation` 是什麼
+
+### `Teacher`
+
+`Teacher` 是「訓練時比較強、可以看到更多資訊的老師模型」。
+
+它通常可以看到一些真機部署時不一定能直接拿到，或不想依賴的資訊，例如：
+
+- 更完整的 privileged observation
+- 更方便訓練的額外狀態資訊
+
+因為它看到的資訊更多，所以通常比較容易學得好。
+
+但是代價是：
+
+- 它不一定適合直接拿去真機部署
+
+### `Student`
+
+`Student` 是「最後想部署的學生模型」。
+
+它通常只能看部署時真的拿得到的資料，例如：
+
+- `policy`
+- `history`
+
+所以它比較符合真機條件。
+
+### `Distillation`
+
+`Distillation` 是「讓 student 去模仿 teacher」。
+
+概念是：
+
+1. 先訓練一個很強的 teacher
+2. 再讓 student 用較少的資訊去學 teacher 的行為
+3. 這樣 student 雖然看得比 teacher 少，但仍有機會學到 teacher 的好動作
+
+你可以把它理解成：
+
+- `Teacher` = 看答案教學的老師
+- `Student` = 考試時只能自己作答的學生
+- `Distillation` = 老師先做示範，學生再模仿
+
+---
+
+## 0.4 這個專案裡 observation group 的意思
+
+目前你最常看到四組 observation：
+
+### `policy`
+
+給 deployable actor 使用的基本當前觀測。
+
+### `history`
+
+給 actor 的觀測歷史，讓 actor 不只看單一瞬間。
+
+### `critic`
+
+只給 critic 使用的 privileged observation。
+
+重點是：
+
+- 這些資料幫助 critic 在訓練時更會評估
+- 但部署時通常不會給 actor
+
+### `teacher`
+
+給 teacher actor / critic 使用的更完整 privileged observation。
+
+所以這四組在概念上可以這樣記：
+
+- `policy` = 目前這一刻的基本資料
+- `history` = 過去一小段資料
+- `critic` = 訓練時只給 critic 的額外資訊
+- `teacher` = 訓練 teacher 時可看的更完整資訊
+
+---
+
+## 0.5 `Parser`、`CLI 參數`、`Hydra 覆寫` 到底差在哪
+
+這個專案有兩種常見的改參數方式。
+
+### 第一種：`--開頭` 的參數
+
+這些是由 `argparse` parser 處理的，也就是你說的 `Parser`。
+
+例如：
+
+- `--task`
+- `--agent`
+- `--num_envs`
+- `--max_iterations`
+- `--resume`
+- `--load_run`
+- `--checkpoint`
+- `--headless`
+- `--disable_keyboard_control`
+
+這些參數定義在：
+
+- `scripts/rsl_rl/train.py`
+- `scripts/rsl_rl/play.py`
+
+裡面的 `parser.add_argument(...)`。
+
+你可以把它理解成：
+
+- `Parser` 管的是「命令列上標準參數」
+
+### 第二種：`name=value` 形式的覆寫
+
+例如：
+
+- `env.stage=1`
+- `env.draw_debug_vis=False`
+
+這種不是 `argparse` parser 處理的，而是留給 Hydra 去覆寫設定物件。
+
+在 `train.py` / `play.py` 裡，你會看到：
+
+```python
+args_cli, hydra_args = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + hydra_args
+```
+
+意思就是：
+
+1. parser 先吃掉它認得的 `--xxx`
+2. 剩下不認得的東西，例如 `env.stage=1`
+3. 再交給 Hydra
+
+所以這個專案的實際規則是：
+
+- `--xxx` = parser 參數
+- `env.xxx=...` = Hydra 覆寫
+
+### 最常見的錯誤
+
+很多人會把：
+
+```bash
+stage=1
+```
+
+誤以為可以直接改 stage。
+
+但正確寫法是：
+
+```bash
+env.stage=1
+```
+
+因為 stage 是 environment config 裡的一個欄位，不是 parser 直接定義的獨立參數。
+
+---
+
+## 0.6 如果你以後要自己新增模式，要改哪裡
+
+這一段是給你之後自己維護專案時看的。
+
+### 如果你只是想「多一個命令列參數」
+
+例如你想新增：
+
+- `--my_debug_flag`
+
+那你要去改：
+
+- `scripts/rsl_rl/train.py`
+- 或 `scripts/rsl_rl/play.py`
+
+裡面的：
+
+```python
+parser.add_argument(...)
+```
+
+### 如果你想「多一個環境模式」
+
+例如你想加一個新 task，像：
+
+- `Template-Redrhex-Something-Direct-v0`
+
+那通常要改：
+
+1. `source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py`
+   - 新增或修改 env cfg 類別
+2. `source/RedRhex/RedRhex/tasks/direct/redrhex/__init__.py`
+   - 把新 task 註冊進 gym
+
+### 如果你想「多一個 agent 模式」
+
+例如你想新增：
+
+- 新的 PPO cfg
+- 新的 teacher cfg
+- 新的 distillation cfg
+
+那通常要改：
+
+1. `source/RedRhex/RedRhex/tasks/direct/redrhex/agents/`
+   - 新增或修改 agent config class
+2. `source/RedRhex/RedRhex/tasks/direct/redrhex/__init__.py`
+   - 把新的 `*_cfg_entry_point` 名稱註冊進 task
+
+然後之後你才能在終端機這樣用：
+
+```bash
+--agent 你新註冊的名字
+```
+
+### 如果你只是想臨時改某個 env 參數
+
+例如只想把 stage 改成 4，或關掉 debug vis，
+
+那不用改 parser，只要在命令最後加 Hydra override：
+
+```bash
+env.stage=4 env.draw_debug_vis=False
+```
+
+---
+
+## 0.7 完全照抄版：從零開始跑一次 Train + Play
+
+下面是一套最保守、最適合第一次操作的流程。
+
+### Terminal 1：進入專案
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+```
+
+### Terminal 1：先做 smoke test
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32
+```
+
+如果這一步出錯，先不要急著 train。
+
+### Terminal 1：開始訓練完整主 task
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name my_first_train
+```
+
+### Terminal 2：開 TensorBoard
+
+另外開一個新終端機：
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+tensorboard --logdir logs/rsl_rl --port 6006 --bind_all
+```
+
+瀏覽器打開：
+
+- 本機：`http://localhost:6006`
+- 遠端：`http://<你的主機IP>:6006`
+
+### Terminal 3：找最新 checkpoint
+
+再開一個新終端機：
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+
+RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/* | head -1)")
+CKPT=$(ls -v logs/rsl_rl/redrhex_wheg/$RUN/model_*.pt | tail -1)
+echo "RUN=$RUN"
+echo "CKPT=$CKPT"
+```
+
+### Terminal 3：播放模型
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --load_run "$RUN" \
+  --checkpoint "$CKPT"
+```
+
+### Terminal 3：只匯出 policy，不播放
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 1 \
+  --disable_keyboard_control \
+  --load_run "$RUN" \
+  --checkpoint "$CKPT" \
+  --export_policy
+```
+
+匯出後的檔案位置通常會在：
+
+```text
+logs/rsl_rl/redrhex_wheg/<你的 run>/exported/
+```
+
+---
+
+## 0.8 最常見的「我要改模式」到底怎麼改
+
+很多時候你不需要改程式，只需要改命令裡的一個參數。
+
+### 例 1：我要從完整主任務改成快速直走
+
+把：
+
+```bash
+--task Template-Redrhex-Direct-v0
+```
+
+改成：
+
+```bash
+--task Template-Redrhex-ForwardFast-Direct-v0
+```
+
+### 例 2：我要從一般 PPO 改成 teacher PPO
+
+把：
+
+```bash
+--agent rsl_rl_cfg_entry_point
+```
+
+改成：
+
+```bash
+--agent rsl_rl_teacher_cfg_entry_point
+```
+
+### 例 3：我要從一般 PPO 改成 distillation
+
+把：
+
+```bash
+--agent rsl_rl_cfg_entry_point
+```
+
+改成：
+
+```bash
+--agent rsl_rl_distillation_cfg_entry_point
+```
+
+### 例 4：我要讓主 task 固定在 stage 3
+
+在命令最後面加：
+
+```bash
+env.stage=3
+```
+
+例如：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2000 \
+  --run_name stage3_debug \
+  env.stage=3
+```
+
+### 例 5：我要關掉 GUI
+
+加上：
+
+```bash
+--headless
+```
+
+### 例 6：我要在 play 時不要鍵盤控制
+
+加上：
+
+```bash
+--disable_keyboard_control
+```
+
+### 例 7：我要只匯出模型，不播放
+
+加上：
+
+```bash
+--export_policy
+```
+
+### 例 8：我要從舊 checkpoint 接著訓練
+
+加上：
+
+```bash
+--resume --load_run <run 名稱> --checkpoint model_xxxxx.pt
+```
+
+### 例 9：我要改平行環境數量
+
+改：
+
+```bash
+--num_envs 2048
+```
+
+例如改成：
+
+```bash
+--num_envs 4096
+```
+
+### 例 10：我要縮短或拉長訓練時間
+
+改：
+
+```bash
+--max_iterations 2500
+```
+
+例如改成：
+
+```bash
+--max_iterations 800
+```
+
+或：
+
+```bash
+--max_iterations 5000
+```
+
+你可以把這一節記成一個最簡單規則：
+
+- 要換大方向，通常改 `--task` 或 `--agent`
+- 要改環境細節，通常加 `env.xxx=...`
+- 要改訓練長度或規模，通常改 `--num_envs`、`--max_iterations`
+
+---
+
+## 0.9 如果你現在就要開始 Train，請直接照這條流程做
+
+這一節就是回答你現在最在意的問題：
+
+- 我現在到底要跑 `train.py` 還是五階段 pipeline？
+- `Task` 要選哪一個？
+- `Agent` 要選哪一個？
+- 要不要一開始就 train teacher / student？
+- 最後哪條路最適合正式訓練？
+
+先講最短結論：
+
+1. 如果你現在只是想把訓練先跑起來，直接跑 `train.py` 就可以。
+2. 但是如果你要的是「完整 locomotion 能力最正式、最穩的主線訓練」，五階段 curriculum 仍然存在，而且仍然推薦使用。
+3. `Teacher` / `Student` 是進階路線，不是新手第一步。
+
+### 0.9.1 最重要的觀念
+
+目前主 task 的預設設定是：
+
+- `Template-Redrhex-Direct-v0`
+- `stage = 5`
+- `curriculum_auto_progress = False`
+
+這代表：
+
+- 你如果直接跑 `train.py --task Template-Redrhex-Direct-v0`
+- 它不會自動幫你跑 Stage1 -> Stage2 -> Stage3 -> Stage4 -> Stage5
+- 它現在跑的是「單段的 Stage5 mixed-skills 訓練」
+
+所以一定要記住：
+
+- `train.py` 直接跑主 task = 單段 mixed training
+- `train_stage_pipeline.sh` = 真正的五階段 curriculum training
+
+### 0.9.2 你現在該選哪一條路
+
+先看這張一頁式決策表：
+
+| 你的目標 | `Task` | `Agent` | 建議腳本 | 說明 |
+|---|---|---|---|---|
+| 第一次上手，把整個訓練跑通 | `Template-Redrhex-Direct-v0` | `rsl_rl_cfg_entry_point` | `train.py` | 先把 baseline 跑起來 |
+| 最快看直走結果 | `Template-Redrhex-ForwardFast-Direct-v0` | `rsl_rl_cfg_entry_point` | `train.py` | 快速驗證路線 |
+| 只想穩定往前走，不想訓練其他技能 | `Template-Redrhex-Direct-v0` + `env.stage=1` | `rsl_rl_cfg_entry_point` | `train.py` | 非 ForwardFast 的正式 forward-only 路線 |
+| 做最正式的完整 locomotion 主線 | `Template-Redrhex-Direct-v0` | `rsl_rl_cfg_entry_point` | `train_stage_pipeline.sh` | 真正五階段 curriculum |
+| 做 forward-only teacher | `Template-Redrhex-Direct-v0` + `env.stage=1` | `rsl_rl_teacher_cfg_entry_point` | `train.py` | 只訓 forward 的 teacher |
+| 做 forward-only student distillation | `Template-Redrhex-Direct-v0` + `env.stage=1` | `rsl_rl_distillation_cfg_entry_point` | `train.py` | 要先有 forward-only teacher checkpoint |
+| 做 teacher 上界 | `Template-Redrhex-Direct-v0` | `rsl_rl_teacher_cfg_entry_point` | `train.py` | 進階研究路線 |
+| 做 student distillation | `Template-Redrhex-Direct-v0` | `rsl_rl_distillation_cfg_entry_point` | `train.py` | 要先有 teacher checkpoint |
+
+#### 路線 A：我只是第一次要把訓練跑起來
+
+這是最推薦的新手起點。
+
+目標：
+
+- 先確認環境、訓練腳本、checkpoint、play、export 都正常
+
+做法：
+
+1. 啟動環境
+2. 跑 smoke test
+3. 直接跑一般 PPO
+4. 用 play 看模型
+
+這條路建議：
+
+- `Task`：`Template-Redrhex-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+
+也就是：
+
+- 不先做 teacher
+- 不先做 distillation
+- 先把最基本可部署主線跑通
+
+#### 路線 B：我想最快看到直走結果
+
+這條路最適合：
+
+- 現場快速迭代
+- reward / 物理參數剛改完
+- 想快速看 robot 有沒有往前動
+
+這條路建議：
+
+- `Task`：`Template-Redrhex-ForwardFast-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+
+也就是：
+
+- 用 ForwardFast
+- 但仍然先用一般 PPO
+- 不需要一開始就 teacher / student
+
+這條路是：
+
+- 快速驗證路線
+- 不是最正式的完整多技能主線
+
+#### 路線 B-2：我只想穩定往前走，但不要 ForwardFast
+
+這條路就是你現在問的模式，而且它其實已經存在。
+
+這條路的定位是：
+
+- 不追求 ForwardFast 那種快速收斂
+- 不訓練 lateral / diagonal / yaw
+- 只做穩定的 forward-only 訓練
+- 可以搭配一般 PPO、teacher、student distillation
+- 更接近「正式 forward-only 主線」，而不是快速驗證特化分支
+
+這條路建議：
+
+- `Task`：`Template-Redrhex-Direct-v0`
+- `env.stage=1`
+- `Agent`：
+  - 一般 PPO：`rsl_rl_cfg_entry_point`
+  - teacher：`rsl_rl_teacher_cfg_entry_point`
+  - student distillation：`rsl_rl_distillation_cfg_entry_point`
+
+這條路和 ForwardFast 的差別是：
+
+- **ForwardFast**
+  - 專門為了快
+  - 迭代數較短
+  - DR 較窄
+  - power / torque 相關 reward 權重較低
+  - 比較像 fast lane
+
+- **主 task + `env.stage=1`**
+  - 仍然使用完整主 task 架構
+  - 只是把技能固定在 Stage1 forward-only
+  - reward 裡的 `power_efficiency`、`torque_penalty` 權重也已經存在
+  - 比較適合你現在說的「穩定往前直走就好，不求快」
+
+如果你要的是：
+
+- 穩定前進
+- 不需要 lateral / diagonal / yaw
+- 可以用 teacher / student
+- 不想走 ForwardFast 快速收斂路線
+
+那我最推薦的就是這條。
+
+#### 路線 C：我要完整 locomotion 能力，而且希望最正式
+
+這條路就是目前最推薦的正式主線。
+
+這條路建議：
+
+- `Task`：`Template-Redrhex-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+- 訓練方式：`train_stage_pipeline.sh`
+
+也就是：
+
+- 仍然用一般 PPO 作為主線
+- 但不是直接跑單段 `train.py`
+- 而是用五階段 curriculum：
+  - Stage1 forward
+  - Stage2 lateral
+  - Stage3 diagonal
+  - Stage4 yaw
+  - Stage5 mixed integration
+
+如果你現在問我：
+
+- 「我最後想要完整能力最好，最應該跑哪條？」
+
+那我會回答：
+
+- 優先跑這條五階段主線
+
+#### 路線 D：我想做進階研究，追更高上限
+
+這才是 teacher / student 的位置。
+
+這條路建議順序是：
+
+1. 先有穩定 baseline
+   - 最好先完成一般 PPO 主線
+   - 最好先有一個你滿意的五階段或單段 mixed baseline
+2. 再 train teacher
+3. 最後再 distill student
+
+這條路的定位是：
+
+- 研究型、進階型
+- 不是第一次上手就先做的事
+
+### 0.9.3 我現在最推薦你的實際順序
+
+如果你現在整個流程很混亂，我最推薦你照這個順序：
+
+#### Step 0：啟動虛擬環境
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+```
+
+#### Step 1：先確認整個 stack 沒壞
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32
+```
+
+#### Step 2：如果你只是第一次要成功跑起來
+
+直接跑：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name my_first_train
+```
+
+這一步的意義是：
+
+- 先把主 task 的單段 mixed 訓練跑通
+- 先確認 checkpoint / play / export 全部正常
+
+#### Step 3：如果你想先快速看直走
+
+改跑：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-ForwardFast-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 1500 \
+  --run_name forward_fast_trial_a
+```
+
+#### Step 3-B：如果你想只做穩定 forward-only，而且不要 ForwardFast
+
+先做一般 PPO 的 forward-only 版本：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_student \
+  env.stage=1
+```
+
+這條路的特點是：
+
+- 還是主 task
+- 但固定在 Stage1
+- 所以不會去訓 lateral / diagonal / yaw
+- 又不像 ForwardFast 那樣特別追求快速收斂
+
+如果你要 forward-only teacher：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_teacher \
+  env.stage=1
+```
+
+如果你要 forward-only student distillation，先找 teacher：
+
+```bash
+TEACHER_RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg_teacher/* | head -1)")
+TEACHER_CKPT=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg_teacher/$TEACHER_RUN/model_*.pt | tail -1)")
+echo "TEACHER_RUN=$TEACHER_RUN"
+echo "TEACHER_CKPT=$TEACHER_CKPT"
+```
+
+因為 distillation 會從 `redrhex_wheg_distill` experiment root 找 resume 路徑，所以先建立連結：
+
+```bash
+mkdir -p logs/rsl_rl/redrhex_wheg_distill
+ln -s ../redrhex_wheg_teacher/$TEACHER_RUN logs/rsl_rl/redrhex_wheg_distill/$TEACHER_RUN
+```
+
+再啟動 forward-only student distillation：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --resume \
+  --load_run "$TEACHER_RUN" \
+  --checkpoint "$TEACHER_CKPT" \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 800 \
+  --run_name forward_stage1_distill \
+  env.stage=1
+```
+
+這一條路最推薦的實際順序是：
+
+1. 先做 forward-only 一般 PPO baseline
+2. 如果你想要更高上限，再做 forward-only teacher
+3. 最後再做 forward-only student distillation
+
+#### Step 4：如果你要正式完整訓練
+
+不要只停在單段 `train.py`，而是改跑：
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_a \
+  --num_envs 4096 \
+  --s1 8000 \
+  --s2 8000 \
+  --s3 9000 \
+  --s4 10000 \
+  --s5 12000
+```
+
+這一步才是：
+
+- 真正的五階段 curriculum
+- 目前最推薦的完整 locomotion 主線
+
+#### Step 5：如果主線已經穩了，才考慮 teacher / student
+
+先 train teacher：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name wheg_privileged_teacher_v1
+```
+
+再做 distillation：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --resume \
+  --load_run <teacher_run> \
+  --checkpoint <teacher_model>.pt \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 800 \
+  --run_name wheg_student_distill_v1
+```
+
+### 0.9.4 如果你只要我給你一句最簡單的建議
+
+如果你現在只問：
+
+- 「我今天到底應該先訓什麼？」
+
+我的建議是：
+
+1. 第一次上手：先跑 `Template-Redrhex-Direct-v0 + rsl_rl_cfg_entry_point`
+2. 想快速看直走：跑 `Template-Redrhex-ForwardFast-Direct-v0 + rsl_rl_cfg_entry_point`
+3. 想只做穩定 forward-only：跑 `Template-Redrhex-Direct-v0 + env.stage=1`
+4. 想做正式完整主線：跑 `train_stage_pipeline.sh`
+5. 想追更高上限：等主線穩了再做 teacher -> student
+
+也就是說，對大多數情況：
+
+- `rsl_rl_cfg_entry_point` 才是你的第一選擇
+- `train_stage_pipeline.sh` 才是完整正式路線
+- `teacher/student` 是進階路線，不是第一步
+- 如果你只想穩定往前走，不想混其他技能，也不用 ForwardFast，就用 `Template-Redrhex-Direct-v0 + env.stage=1`
+
 ## 1. 你先要知道的事
 
 目前專案有兩個主要 task：
@@ -1017,6 +2066,124 @@ stage=1
 ## 12.9 系統沒有 `rg`
 
 原本這曾經是 pipeline 會中斷的原因之一。現在 `train_stage_pipeline.sh` 已經有 `grep` fallback，所以不會因為少了 `rg` 就直接掛掉，但若你自己寫外部腳本，還是建議優先確認 `rg` 是否可用。
+
+## 12.10 訓練時看起來像被彈飛，不像在走路
+
+這是目前最容易讓人誤判的現象之一。
+
+如果你直接跑：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500
+```
+
+你現在跑到的不是「單純 forward-only 慢慢學走路」。
+
+你實際上跑到的是：
+
+- 主 task
+- 單段 Stage5 mixed training
+- rough terrain
+- domain randomization
+- terrain curriculum
+- fault injection
+- push randomization
+
+所以早期畫面常常會出現：
+
+- 往不同方向亂衝
+- 看起來像被彈出去
+- 很多機器人翻滾、滑移、跳起來
+
+這不一定表示 PhysX 壞掉，也不一定表示 reward 失效。  
+很多時候只是因為你現在的預設模式本來就很難，而且它不是只訓 forward。
+
+另外，這個環境的 actor 也不是「完全從零動作開始學」。
+
+- policy 會輸出 residual action
+- 但環境本身還會把 command-conditioned gait / drive bias 疊上去
+
+所以就算 policy 還很爛，機器人也已經會被餵一些驅動目標。  
+這也是為什麼你會看到它不是安靜站著，而是很早就開始很兇地亂動。
+
+### 你第一個應該做的排查
+
+先不要直接看 Stage5 mixed task。
+
+先改成主 task 的 forward-only 正式模式：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 256 \
+  --max_iterations 100 \
+  --run_name debug_stage1_forward \
+  env.stage=1
+```
+
+這一步的用途是：
+
+- 保留主 task 的正式 reward / observation stack
+- 但只訓 Stage1 forward-only
+- 不再混 lateral / diagonal / yaw
+
+如果你切到這裡之後，畫面就明顯比較像「往前掙扎學走」，那代表你原本看到的大多不是 bug，而是 mixed Stage5 本來就很兇。
+
+### 如果 Stage1 還是很像被炸出去
+
+再做第二層排查，把訓練難度先降到最乾淨：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 256 \
+  --max_iterations 100 \
+  --run_name debug_stage1_clean \
+  env.stage=1 \
+  env.domain_randomization_enable=False \
+  env.dr_push_enable=False \
+  env.dr_fault_enable=False \
+  env.terrain_curriculum_enable=False \
+  env.terrain.terrain_type=plane
+```
+
+如果這個版本明顯正常很多，通常代表主因不是程式爆炸，而是：
+
+- mixed command 太難
+- rough terrain 太難
+- push / fault / randomization 疊太多
+
+### 你該怎麼解讀結果
+
+有三種常見情況：
+
+1. `Template-Redrhex-Direct-v0` 預設 Stage5 很亂，但 `env.stage=1` 明顯正常很多
+- 這通常代表主因是預設 mixed-skill 訓練太激進
+- 不是單純物理錯誤
+
+2. `env.stage=1` 還是很亂，但關掉 randomization / push / fault / terrain 後正常很多
+- 這通常代表主因是訓練難度疊太高
+- 不是核心控制器完全壞掉
+
+3. 即使在 `env.stage=1 + plane + no DR` 還是高速亂飛
+- 這時才要高度懷疑：
+  - actuator / joint target 過大
+  - asset 碰撞或初始姿態有問題
+  - 接觸設定或重心設定不合理
+
+### 目前最實用的建議
+
+- 如果你只是想確認「它有沒有在學往前走」，不要直接盯 Stage5 mixed task。
+- 先用 `Template-Redrhex-Direct-v0 + env.stage=1`。
+- 如果你想要更乾淨的可視化起步，再先用 `ForwardFast`。
+- 等 forward-only 看起來合理後，再回去 mixed task 或五階段 curriculum。
 
 ---
 

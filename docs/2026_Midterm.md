@@ -1114,9 +1114,30 @@ checkpoint 檔案也實際存在：
 
 ### 9.1 必做
 
-1. 用 `PPORunnerPrivilegedTeacherCfg` 先正式訓一個 teacher。
-2. 再用 `RedrhexDistillationRunnerCfg` 訓 deployable student。
-3. 做以下對照：
+如果你下一階段的近期目標只是：
+
+- 先把機器人訓到「穩定往前直走」
+- 不急著混 lateral / diagonal / yaw
+- 但想保留 teacher / student 架構與節能 reward
+
+那我建議不要直接走 `ForwardFast`，也不要一開始就跑完整五階段。  
+最適合的起點是：
+
+- `Template-Redrhex-Direct-v0 + env.stage=1`
+
+這條路線的意義是：
+
+- 用主 task 的正式 observation / reward / deployment stack
+- 但把 curriculum 固定在 Stage1 forward-only
+- 主 task 的節能 reward 權重仍然保留，例如 `power_efficiency = 0.3`、`torque_penalty = -0.0001`
+- 相比之下，`ForwardFast` 比較偏向白天快速收斂與快速迭代，節能權重也刻意放得更保守
+
+因此我建議的實驗順序是：
+
+1. 先用 `Template-Redrhex-Direct-v0 + env.stage=1 + rsl_rl_cfg_entry_point` 訓一個正式 forward-only baseline。
+2. 再用 `PPORunnerPrivilegedTeacherCfg` 在同樣的 `env.stage=1` 條件下訓一個 forward-only teacher。
+3. 再用 `RedrhexDistillationRunnerCfg` 在同樣的 `env.stage=1` 條件下訓 deployable forward-only student。
+4. 做以下對照：
    - 舊版 plane + no-history
    - 新版 rough terrain + history + critic
    - 新版 + symmetry

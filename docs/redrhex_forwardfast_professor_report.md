@@ -19,6 +19,66 @@
 
 ---
 
+## 0.1 ForwardFast 在整體訓練體系中的定位
+
+這一段要特別講清楚，避免把 ForwardFast 誤解成「取代五階段 curriculum 的唯一主線」。
+
+目前整體訓練體系有三條不同定位的路：
+
+1. **快速驗證路線**
+- `Task`：`Template-Redrhex-ForwardFast-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+- 用途：快速看直走、快速重訓、快速上機
+
+2. **正式 forward-only 穩走路線（非 ForwardFast）**
+- `Task`：`Template-Redrhex-Direct-v0`
+- 額外加 Hydra override：`env.stage=1`
+- `Agent`：
+  - baseline：`rsl_rl_cfg_entry_point`
+  - teacher：`rsl_rl_teacher_cfg_entry_point`
+  - student distillation：`rsl_rl_distillation_cfg_entry_point`
+- 用途：不追求最快收斂，但想只訓前進，而且保留主 task 的完整 reward / observation / teacher-student 堆疊
+
+3. **正式完整主線**
+- `Task`：`Template-Redrhex-Direct-v0`
+- `Agent`：`rsl_rl_cfg_entry_point`
+- 用途：最終完整 locomotion 能力訓練
+- 建議方式：五階段 `train_stage_pipeline.sh`
+
+4. **進階研究路線**
+- `Task`：通常仍以 `Template-Redrhex-Direct-v0` 為主
+- `Agent`：先 `rsl_rl_teacher_cfg_entry_point`，再 `rsl_rl_distillation_cfg_entry_point`
+- 用途：teacher-student / distillation / 上限研究
+
+最重要的 operational clarification：
+
+- 直接跑 `train.py --task Template-Redrhex-Direct-v0`
+- 並不等於五階段 curriculum
+- 它目前是單段 mixed stage 訓練
+
+所以這份 ForwardFast 報告的正確定位是：
+
+- 它描述的是「快速驗證、快速校參」分支
+- 不是「完整多技能訓練正式主線的替代品」
+
+因此對外說明時建議用這句話：
+
+> ForwardFast 是白天快速校參、快速上機的 fast lane；完整多技能最終模型仍建議在主 task 上以五階段 curriculum 完成整合。
+
+如果今天的目標只有「穩定往前走」，而不是「盡快收斂」，那不一定要用 ForwardFast。  
+更貼近正式部署路線的做法是：
+
+- `Template-Redrhex-Direct-v0 + env.stage=1`
+
+這樣做的好處是：
+
+- 仍然沿用主 task 的 observation stack
+- 仍然沿用 teacher / student distillation 入口
+- 仍然沿用主 task 的節能 reward 權重
+- 只是把技能固定在 forward-only，不再混其他能力
+
+---
+
 ## 1) 起點：為什麼要做這件事
 
 我們在實驗室要做的是 Sim2Real，不是只在模擬器內得高分。
