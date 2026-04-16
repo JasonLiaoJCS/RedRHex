@@ -1,0 +1,634 @@
+% !TeX program = XeLaTeX
+\documentclass[12pt,a4paper,UTF8]{ctexart}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs,longtable,array,multirow}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{setspace}
+\usepackage{float}
+\usepackage{fontspec}
+
+\IfFontExistsTF{Noto Serif CJK TC}{
+    \setCJKmainfont{Noto Serif CJK TC}
+    \setCJKsansfont{Noto Sans CJK TC}
+}{
+    \IfFontExistsTF{Noto Serif CJK SC}{
+        \setCJKmainfont{Noto Serif CJK SC}
+        \setCJKsansfont{Noto Sans CJK SC}
+    }{
+        \setCJKmainfont{FandolSong-Regular}
+        \setCJKsansfont{FandolHei-Regular}
+    }
+}
+
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{Latin Modern Mono}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black
+}
+
+\lstdefinestyle{pythonstyle}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black},
+    commentstyle=\color{green!40!black},
+    stringstyle=\color{red!60!black},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible
+}
+
+\title{RedRhex 彈簧腿節能導向強化學習 Reward 整合報告}
+\author{Codex Research Assistant}
+\date{2026-03-31}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{研究問題重述}
+
+\subsection{系統背景}
+
+本研究對象為 RedRhex 六足 wheg 機器人。每條腿包含三種功能不同的關節：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{main drive 關節}：速度控制，負責 wheg 旋轉與主要推進。
+    \item \textbf{ABAD 關節}：位置控制，負責外展/內收與側向落點調整。
+    \item \textbf{damper/spring-like 關節}：被動關節，負責吸震、儲能與釋能。
+\end{enumerate}
+
+目前使用 Isaac Lab 環境：
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{Template-Redrhex-Direct-v0}
+    \item \texttt{Template-Redrhex-ForwardFast-Direct-v0}
+\end{itemize}
+
+主要目標不是只讓策略學會「能走」，而是讓策略學會：
+\begin{enumerate}[leftmargin=2em]
+    \item 追蹤命令速度；
+    \item 保持穩定與不摔倒；
+    \item 避免暴力輸出與 reward hacking；
+    \item 降低有源能耗；
+    \item 實際利用彈簧腿儲能與釋能優勢。
+\end{enumerate}
+
+\subsection{核心研究問題}
+
+本研究要回答的核心問題為：
+
+\begin{quote}
+如何把 RedRhex 的被動彈簧腿機制，正式整合進 Isaac Lab 強化學習 reward，使策略不僅能 locomote，還能在保持穩定與追蹤性能的前提下，學會更低能耗且更具彈簧回能特性的步態？
+\end{quote}
+
+\section{物理與數學推導}
+
+\subsection{關節角度、角速度與力矩}
+
+對每條腿定義：
+\begin{align}
+q_m &: \text{main drive 關節角}, \\
+q_a &: \text{ABAD 關節角}, \\
+q_s &: \text{spring/damper 關節角}.
+\end{align}
+
+角速度定義為
+\begin{equation}
+\omega = \dot{q} = \frac{dq}{dt}.
+\end{equation}
+
+\subsection{Main drive 力矩模型}
+
+對 main drive 關節，Isaac Lab implicit actuator 可近似為速度控制器：
+\begin{equation}
+\tau_{m,i} \approx b_m \left( \omega^{cmd}_{m,i} - \omega_{m,i} \right),
+\end{equation}
+其中本專案採用
+\begin{equation}
+b_m = 50, \qquad |\tau_{m,i}| \le 100 \text{ N$\cdot$m}.
+\end{equation}
+
+因此 fallback 力矩估計為
+\begin{equation}
+\tau^{est}_{m,i} =
+\mathrm{clip}\left(
+50(\omega^{cmd}_{m,i} - \omega_{m,i}), -100, 100
+\right).
+\end{equation}
+
+\subsection{ABAD 力矩模型}
+
+對 ABAD 關節，採位置控制近似：
+\begin{equation}
+\tau_{a,i} \approx k_a(q^{cmd}_{a,i} - q_{a,i}) - b_a \omega_{a,i},
+\end{equation}
+其中
+\begin{equation}
+k_a = 40, \qquad b_a = 4, \qquad |\tau_{a,i}| \le 8 \text{ N$\cdot$m}.
+\end{equation}
+
+因此 fallback 估計為
+\begin{equation}
+\tau^{est}_{a,i} =
+\mathrm{clip}\left(
+40(q^{cmd}_{a,i} - q_{a,i}) - 4\omega_{a,i}, -8, 8
+\right).
+\end{equation}
+
+\subsection{被動彈簧與阻尼模型}
+
+令 damper 偏轉為
+\begin{equation}
+\Delta q_{s,i} = q_{s,i} - q^{rest}_{s,i}.
+\end{equation}
+
+則彈簧力矩與阻尼力矩可寫為
+\begin{align}
+\tau^{spring}_{s,i} &= -k_s \Delta q_{s,i}, \\
+\tau^{damp}_{s,i} &= -d_s \omega_{s,i},
+\end{align}
+其中目前設計使用
+\begin{equation}
+k_s = 200 \text{ N$\cdot$m/rad}, \qquad d_s = 20 \text{ N$\cdot$m$\cdot$s/rad}.
+\end{equation}
+
+\subsection{機械功率與機械能}
+
+單一關節的瞬時機械功率為
+\begin{equation}
+P_i = \tau_i \omega_i.
+\end{equation}
+
+由於本研究希望估計有源輸出成本，而非淨做功，因此使用絕對值：
+\begin{align}
+P_{main} &= \sum_{i \in main} |\tau_i \omega_i|, \\
+P_{abad} &= \sum_{j \in abad} |\tau_j \omega_j|, \\
+P_{act} &= P_{main} + P_{abad}.
+\end{align}
+
+每一步機械能 proxy 為
+\begin{equation}
+E_{step} = P_{act}\Delta t,
+\end{equation}
+單回合則為
+\begin{equation}
+E_{episode} = \sum_t P_{act}(t)\Delta t.
+\end{equation}
+
+\subsection{電流與電功率估計}
+
+若真機可量到 motor current，則可由
+\begin{equation}
+\tau_{joint} = N \eta_g K_t I
+\end{equation}
+得
+\begin{equation}
+I = \frac{\tau_{joint}}{N \eta_g K_t}.
+\end{equation}
+
+電功率可近似為
+\begin{equation}
+P_{elec} \approx I^2R + \frac{\tau \omega}{\eta_m \eta_d}.
+\end{equation}
+
+因此即使不知道完整電機常數，仍可用兩個重要 proxy：
+\begin{enumerate}[leftmargin=2em]
+    \item $|\tau \omega|$：機械功率 proxy；
+    \item $\tau^2$：銅損 proxy。
+\end{enumerate}
+
+\subsection{彈簧位能、釋能與耗散}
+
+彈簧位能為
+\begin{equation}
+E_{s,i} = \frac{1}{2}k_s(\Delta q_{s,i})^2.
+\end{equation}
+
+位能變化率為
+\begin{equation}
+\dot{E}_{s,i} = k_s \Delta q_{s,i} \dot{q}_{s,i}.
+\end{equation}
+
+定義儲能與釋能功率為
+\begin{align}
+P_{store} &= \sum_i \max(\dot{E}_{s,i}, 0), \\
+P_{release} &= \sum_i \max(-\dot{E}_{s,i}, 0).
+\end{align}
+
+阻尼耗散功率為
+\begin{equation}
+P_{diss} = d_s \sum_i \omega_{s,i}^2.
+\end{equation}
+
+\subsection{等效運動速度與 CoT proxy}
+
+本研究為了讓 yaw 模式也能合理做能耗比較，引入等效運動速度
+\begin{equation}
+v_{eq} = \sqrt{v_x^2 + v_y^2 + (r_{yaw}\omega_z)^2},
+\end{equation}
+其中
+\begin{equation}
+r_{yaw} = 0.18 \text{ m}.
+\end{equation}
+
+定義 CoT proxy 為
+\begin{equation}
+CoT^* = \frac{P_{act}}{mg(v_{eq} + \epsilon)}.
+\end{equation}
+
+\subsection{彈簧回收率與活用度}
+
+本研究實際使用的 spring recovery ratio 為
+\begin{equation}
+\eta_{rec}
+=
+\mathrm{clamp}\left(
+\frac{P_{release}}{P_{main} + \alpha P_{abad} + \epsilon_{rec}},
+0,1
+\right),
+\end{equation}
+其中
+\begin{equation}
+\alpha = 0.35.
+\end{equation}
+
+彈簧活用度則採用六條腿偏轉的標準差：
+\begin{equation}
+U_s = \mathrm{std}(\Delta q_{s,1}, \ldots, \Delta q_{s,6}).
+\end{equation}
+
+\section{模擬 / 真機感測映射}
+
+\subsection{模擬中可直接取得的量}
+
+\begin{longtable}{p{3cm}p{4cm}p{6cm}}
+\toprule
+物理量 & 模擬中理想讀取方式 & 備註 \\
+\midrule
+關節角度 $q$ & \texttt{self.joint\_pos[:, idx]} & 直接由 articulation data 提供 \\
+關節角速度 $\omega$ & \texttt{self.joint\_vel[:, idx]} & 直接可用 \\
+力矩 $\tau$ & \texttt{applied\_torque} / \texttt{computed\_torque} / \texttt{joint\_torque} & 視 Isaac Lab 版本而定 \\
+base 線速度 & \texttt{self.base\_lin\_vel} & 可直接用於 tracking 與 CoT \\
+base 角速度 & \texttt{self.base\_ang\_vel} & yaw 模式很重要 \\
+damper rest pose & \texttt{cfg.robot\_cfg.init\_state.joint\_pos} & 用於計算 $\Delta q_s$ \\
+接觸資訊 & \texttt{\_current\_leg\_in\_stance} & 目前為 phase-based proxy \\
+\bottomrule
+\end{longtable}
+
+\subsection{真機感測的三層方案}
+
+\subsubsection*{Ideal sensing}
+\begin{itemize}[leftmargin=2em]
+    \item encoder 量測 $q$；
+    \item torque transducer 量測 $\tau$；
+    \item motion capture 或 state estimator 量測 $(v_x,v_y,\omega_z)$；
+    \item foot force plate 或 load cell 量測 GRF/contact。
+\end{itemize}
+
+\subsubsection*{Practical sensing}
+\begin{itemize}[leftmargin=2em]
+    \item encoder 差分估 $\omega$；
+    \item motor current 轉 torque；
+    \item IMU + odometry fusion 估 base velocity；
+    \item 利用 linkage 幾何回推 damper 偏轉。
+\end{itemize}
+
+\subsubsection*{Fallback proxy}
+\begin{itemize}[leftmargin=2em]
+    \item 若無 torque sensor 與 current，退回 controller-based torque estimate；
+    \item 若無真實 contact sensor，退回 gait phase/contact proxy；
+    \item 若無彈簧位移量測，退回相對幾何壓縮 proxy。
+\end{itemize}
+
+\section{Reward 設計}
+
+\subsection{設計哲學}
+
+本設計遵循以下優先順序：
+\begin{equation}
+\text{stability} > \text{tracking} > \text{anti-cheat} > \text{energy} > \text{spring use}.
+\end{equation}
+
+也就是說：
+\begin{itemize}[leftmargin=2em]
+    \item 先保命；
+    \item 再追蹤；
+    \item 最後才對能效與彈簧利用做二階優化。
+\end{itemize}
+
+\subsection{E1: Power Efficiency}
+
+\begin{equation}
+r_{E1}
+=
+-\tanh\left(
+\frac{P_{act}}{(v_{eq}+\epsilon_v)s_{tanh}}
+\right)
+\cdot w_{power}
+\cdot \mathbb{1}_{healthy}
+\end{equation}
+
+本專案目前設定：
+\begin{align}
+w_{power} &= 0.3, \\
+\epsilon_v &= 0.1, \\
+s_{tanh} &= 500.0.
+\end{align}
+
+\subsection{E2: Spring Recovery}
+
+\begin{equation}
+r_{E2}
+=
+\eta_{rec}\cdot w_{rec}
+\cdot \mathbb{1}_{healthy}
+\cdot \mathbb{1}_{cmd}
+\cdot g_{track}
+\end{equation}
+
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item $\mathbb{1}_{cmd}$：命令等效速度超過門檻；
+    \item $g_{track}$：實際等效速度相對命令等效速度的達成比例；
+    \item 並且僅在 stance contact proxy 成立的腿上計入 $P_{release}$ 與 $P_{store}$。
+\end{itemize}
+
+\subsection{E3: Spring Utilization}
+
+\begin{equation}
+r_{E3}
+=
+\mathrm{clamp}\left(
+\frac{U_s}{\Delta q_{max}}, 0, 1
+\right)
+\cdot w_{util}
+\cdot \mathbb{1}_{healthy}
+\cdot \mathbb{1}_{cmd}
+\cdot g_{track}
+\end{equation}
+
+其中
+\begin{equation}
+\Delta q_{max} = 0.3 \text{ rad}.
+\end{equation}
+
+\subsection{E4: Torque Penalty}
+
+\begin{equation}
+r_{E4}
+=
+\left(
+\sum \tau_m^2 + \beta \sum \tau_a^2
+\right) w_{\tau}
+\end{equation}
+其中
+\begin{equation}
+\beta = 0.5, \qquad w_{\tau} = -10^{-4}.
+\end{equation}
+
+\subsection{為何需要 spring reward gating}
+
+若只獎勵 spring release 或 spring utilization，策略可能學會：
+\begin{itemize}[leftmargin=2em]
+    \item 原地抖動 damper；
+    \item 空中甩腿刷彈簧偏轉；
+    \item 不追蹤命令，卻拿到正面 spring reward。
+\end{itemize}
+
+因此目前正式實作採用
+\begin{equation}
+\texttt{spring\_reward\_gate}
+=
+\texttt{healthy\_gate}
+\cdot
+\texttt{cmd\_motion\_gate}
+\cdot
+\texttt{motion\_tracking\_gate}.
+\end{equation}
+
+\section{模擬實作與程式修改}
+
+\subsection{\texttt{redrhex\_env\_cfg.py} 中新增的參數}
+
+\begin{lstlisting}[style=pythonstyle,caption={節能 reward 權重與物理常數}]
+"power_efficiency": 0.3,
+"power_efficiency_eps": 0.1,
+"power_efficiency_tanh_scale": 500.0,
+"spring_recovery": 0.4,
+"spring_recovery_eps": 0.01,
+"spring_recovery_abad_weight": 0.35,
+"spring_utilization": 0.2,
+"spring_util_max_deflection": 0.3,
+"torque_penalty": -0.0001,
+"torque_penalty_abad_weight": 0.5,
+
+damper_stiffness = 200.0
+damper_damping = 20.0
+robot_mass_kg = 14.0
+energy_velocity_yaw_radius = 0.18
+energy_min_command_motion = 0.05
+main_drive_torque_estimate_damping = 50.0
+main_drive_torque_estimate_limit = 100.0
+abad_torque_estimate_stiffness = 40.0
+abad_torque_estimate_damping = 4.0
+abad_torque_estimate_limit = 8.0
+\end{lstlisting}
+
+\subsection{\texttt{redrhex\_env.py} 中新增的 helper}
+
+\begin{lstlisting}[style=pythonstyle,caption={等效運動速度 helper}]
+def _compute_energy_equivalent_speed(self, lin_xy, yaw_rate):
+    yaw_equiv = self._energy_yaw_radius * yaw_rate
+    return torch.sqrt(torch.sum(torch.square(lin_xy), dim=1) + torch.square(yaw_equiv))
+\end{lstlisting}
+
+\begin{lstlisting}[style=pythonstyle,caption={主動關節力矩讀取與 fallback}]
+def _get_active_joint_torques(self, main_drive_vel, abad_vel):
+    for attr_name in ("applied_torque", "computed_torque", "joint_torque"):
+        candidate = getattr(self.robot.data, attr_name, None)
+        if isinstance(candidate, torch.Tensor) and candidate.ndim == 2:
+            return candidate[:, self._main_drive_indices], candidate[:, self._abad_indices]
+
+    main_torques = self._main_drive_torque_estimate_damping * (self._target_drive_vel - main_drive_vel)
+    main_torques = torch.clamp(main_torques, -self._main_drive_torque_estimate_limit, self._main_drive_torque_estimate_limit)
+
+    abad_pos_err = self._target_abad_pos - self.joint_pos[:, self._abad_indices]
+    abad_torques = self._abad_torque_estimate_stiffness * abad_pos_err - self._abad_torque_estimate_damping * abad_vel
+    abad_torques = torch.clamp(abad_torques, -self._abad_torque_estimate_limit, self._abad_torque_estimate_limit)
+    return main_torques, abad_torques
+\end{lstlisting}
+
+\subsection{ABAD 目標位置 cache}
+
+\begin{lstlisting}[style=pythonstyle,caption={ABAD target cache}]
+target_abad_pos = torch.clamp(target_abad_pos, min=-abad_limit, max=abad_limit)
+self._target_abad_pos = target_abad_pos.clone()
+self.robot.set_joint_position_target(target_abad_pos, joint_ids=self._abad_indices)
+\end{lstlisting}
+
+\subsection{reward 核心節能片段}
+
+\begin{lstlisting}[style=pythonstyle,caption={節能 reward 核心計算}]
+main_torques, abad_torques = self._get_active_joint_torques(main_drive_vel, abad_vel)
+
+mech_power_main = torch.sum(torch.abs(main_torques * main_drive_vel), dim=1)
+mech_power_abad = torch.sum(torch.abs(abad_torques * abad_vel), dim=1)
+total_mech_power = mech_power_main + mech_power_abad
+
+actual_motion_speed = self._compute_energy_equivalent_speed(actual_lin, actual_wz)
+cmd_motion_speed = self._compute_energy_equivalent_speed(cmd_lin, cmd_wz)
+
+rew_power_efficiency = -torch.tanh(
+    (total_mech_power / (actual_motion_speed + power_eff_eps)) / power_eff_tanh_scale
+) * scales.get("power_efficiency", 0.3)
+
+if hasattr(self, "_current_leg_in_stance") and self._current_leg_in_stance.shape == damper_pos.shape:
+    spring_contact_mask = self._current_leg_in_stance.float()
+else:
+    spring_contact_mask = torch.ones_like(damper_pos)
+
+spring_release = torch.sum(torch.clamp(-spring_power, min=0.0) * spring_contact_mask, dim=1)
+spring_store = torch.sum(torch.clamp(spring_power, min=0.0) * spring_contact_mask, dim=1)
+
+cmd_motion_gate = (cmd_motion_speed > self._energy_min_cmd_motion).float()
+motion_tracking_gate = torch.clamp(
+    actual_motion_speed / torch.clamp(cmd_motion_speed, min=power_eff_eps),
+    min=0.0,
+    max=1.0,
+)
+spring_reward_gate = healthy_gate * cmd_motion_gate * motion_tracking_gate
+\end{lstlisting}
+
+\subsection{\texttt{eval\_command\_sweep.py} 中新增的 energy evaluation}
+
+\begin{lstlisting}[style=pythonstyle,caption={energy KPI 收集 helper}]
+def collect_energy_metrics(unwrapped_env, actual_vx, actual_vy, actual_wz):
+    lin_xy = torch.stack((actual_vx, actual_vy), dim=1)
+    yaw_radius = float(getattr(unwrapped_env, "_energy_yaw_radius", 0.18))
+    motion_speed = torch.sqrt(torch.sum(torch.square(lin_xy), dim=1) + torch.square(yaw_radius * actual_wz))
+    return {
+        "motion_speed": motion_speed,
+        "mech_power_main": main_power,
+        "mech_power_abad": abad_power,
+        "mech_power_total": total_power,
+        "cot_proxy": cot_proxy,
+        "spring_energy": spring_energy,
+        "spring_release": spring_release,
+        "spring_store": spring_store,
+        "spring_recovery_ratio": spring_recovery_ratio,
+        "damper_dissipation": damper_dissipation,
+    }
+\end{lstlisting}
+
+每個 command 目前都會記錄：
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{energy\_mech\_power\_main\_mean}
+    \item \texttt{energy\_mech\_power\_total\_mean}
+    \item \texttt{energy\_cost\_of\_transport\_proxy}
+    \item \texttt{energy\_spring\_energy\_mean}
+    \item \texttt{energy\_spring\_release\_power\_mean}
+    \item \texttt{energy\_spring\_store\_power\_mean}
+    \item \texttt{energy\_spring\_recovery\_ratio}
+    \item \texttt{energy\_motion\_speed\_mean}
+    \item \texttt{energy\_power\_per\_motion}
+\end{itemize}
+
+\section{權重設計與調參建議}
+
+\begin{longtable}{p{4cm}p{2cm}p{2cm}p{6cm}}
+\toprule
+項目 & Default & ForwardFast & 調參原則 \\
+\midrule
+\texttt{power\_efficiency} & 0.30 & 0.15 & 先保守，tracking 穩後再加強 \\
+\texttt{spring\_recovery} & 0.40 & 0.20 & 是最核心的 spring reward \\
+\texttt{spring\_utilization} & 0.20 & 0.10 & 小權重，避免刷偏轉 \\
+\texttt{torque\_penalty} & -1e-4 & -5e-5 & 只抑制極端有源輸出 \\
+\texttt{torque\_penalty\_abad\_weight} & 0.50 & 0.50 & 避免 ABAD 被過度壓制 \\
+\bottomrule
+\end{longtable}
+
+推薦調整順序：
+\begin{enumerate}[leftmargin=2em]
+    \item baseline tracking/stability；
+    \item 加 torque penalty；
+    \item 加 power efficiency；
+    \item 最後加 spring recovery / spring utilization。
+\end{enumerate}
+
+\section{Ablation 與驗證流程}
+
+\subsection{四版本比較}
+
+\begin{enumerate}[leftmargin=2em]
+    \item A：baseline；
+    \item B：baseline + torque penalty；
+    \item C：baseline + power efficiency；
+    \item D：baseline + power efficiency + spring recovery/utilization。
+\end{enumerate}
+
+\subsection{TensorBoard 必看曲線}
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{rew\_power\_efficiency}
+    \item \texttt{rew\_spring\_recovery}
+    \item \texttt{rew\_spring\_utilization}
+    \item \texttt{rew\_torque\_penalty}
+    \item \texttt{diag\_mech\_power\_total}
+    \item \texttt{diag\_cost\_of\_transport}
+    \item \texttt{diag\_spring\_recovery\_ratio}
+    \item \texttt{diag\_motion\_speed\_equiv}
+    \item \texttt{diag\_cmd\_motion\_speed\_equiv}
+\end{itemize}
+
+\subsection{如何判斷「真的變省能」}
+
+以下條件至少應同時成立：
+\begin{enumerate}[leftmargin=2em]
+    \item tracking quality 不顯著下降；
+    \item success ratio 不顯著下降；
+    \item fall rate 不惡化；
+    \item $CoT^*$ 下降；
+    \item power-per-motion 下降。
+\end{enumerate}
+
+若只看到功率下降，但 motion speed 也大幅下降，則不能聲稱真正更高效。
+
+\section{風險與注意事項}
+
+\begin{itemize}[leftmargin=2em]
+    \item 目前 damper contact gating 仍是 phase-based proxy，不是真實 GRF。
+    \item 真機若缺 torque/current sensing，很多電功率結果只能作 proxy。
+    \item \texttt{spring\_utilization} 是結構 proxy，不是直接機械能收益。
+    \item yaw 等效半徑 $r_{yaw}$ 是工程近似，未來可再做系統辨識。
+    \item 本次已完成程式實作與靜態語法檢查，但未在本 shell 內直接做 Isaac Lab runtime rollout。
+\end{itemize}
+
+\section{結論}
+
+本研究已將 RedRhex 的節能議題從概念層推進到可執行的 Isaac Lab reward engineering 實作。其核心貢獻包括：
+\begin{enumerate}[leftmargin=2em]
+    \item 以物理一致的方式建構 main drive、ABAD、damper 的能量模型；
+    \item 以 $v_{eq}$ 解決 pure yaw 任務的能耗正規化問題；
+    \item 將 spring recovery 與 spring utilization 納入 reward，並加入 anti-hacking gating；
+    \item 在 evaluation pipeline 中加入 per-command 與 per-skill energy KPI；
+    \item 將所有設計落實到 \texttt{redrhex\_env\_cfg.py}、\texttt{redrhex\_env.py} 與 \texttt{eval\_command\_sweep.py}。
+\end{enumerate}
+
+因此，這套方法不僅能回答「機器人有沒有走起來」，也能回答更重要的研究問題：
+\begin{quote}
+機器人是否在保持 locomotion 任務品質的前提下，真的學會用更低的有源功率，並更有效地利用被動彈簧腿機制？
+\end{quote}
+
+\end{document}

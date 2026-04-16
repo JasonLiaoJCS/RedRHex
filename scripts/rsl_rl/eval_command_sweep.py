@@ -360,6 +360,96 @@ def build_command_set(env_cfg, profile: str, command_scale: float) -> list[tuple
     return _generate_named_commands(commands)
 
 
+def collect_energy_metrics(
+    unwrapped_env,
+    actual_vx: torch.Tensor,
+    actual_vy: torch.Tensor,
+    actual_wz: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Collect per-step energy metrics with simulator-first torque lookup and safe fallbacks."""
+    num_envs = unwrapped_env.num_envs
+    device = unwrapped_env.device
+    zeros = torch.zeros(num_envs, device=device)
+
+    lin_xy = torch.stack((actual_vx, actual_vy), dim=1)
+    yaw_radius = float(getattr(unwrapped_env, "_energy_yaw_radius", getattr(unwrapped_env.cfg, "energy_velocity_yaw_radius", 0.18)))
+    motion_speed = torch.sqrt(torch.sum(torch.square(lin_xy), dim=1) + torch.square(yaw_radius * actual_wz))
+
+    main_power = zeros.clone()
+    abad_power = zeros.clone()
+    total_power = zeros.clone()
+
+    if hasattr(unwrapped_env, "_main_drive_indices"):
+        main_omega = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
+        abad_omega = (
+            unwrapped_env.joint_vel[:, unwrapped_env._abad_indices]
+            if hasattr(unwrapped_env, "_abad_indices")
+            else None
+        )
+        main_torque = None
+        abad_torque = None
+
+        if hasattr(unwrapped_env, "_get_active_joint_torques") and abad_omega is not None:
+            try:
+                main_torque, abad_torque = unwrapped_env._get_active_joint_torques(main_omega, abad_omega)
+            except Exception:
+                main_torque, abad_torque = None, None
+
+        if main_torque is None and hasattr(unwrapped_env.robot.data, "applied_torque"):
+            main_torque = unwrapped_env.robot.data.applied_torque[:, unwrapped_env._main_drive_indices]
+            if abad_omega is not None and hasattr(unwrapped_env, "_abad_indices"):
+                abad_torque = unwrapped_env.robot.data.applied_torque[:, unwrapped_env._abad_indices]
+
+        if main_torque is not None:
+            main_power = torch.sum(torch.abs(main_torque * main_omega), dim=1)
+            if abad_torque is not None and abad_omega is not None:
+                abad_power = torch.sum(torch.abs(abad_torque * abad_omega), dim=1)
+            total_power = main_power + abad_power
+        elif hasattr(unwrapped_env, "_target_drive_vel"):
+            # Last-resort proxy used only when torque is unavailable.
+            main_power = torch.sum(torch.abs(unwrapped_env._target_drive_vel * main_omega), dim=1)
+            total_power = main_power
+
+    spring_energy = zeros.clone()
+    spring_release = zeros.clone()
+    spring_store = zeros.clone()
+    spring_recovery_ratio = zeros.clone()
+    damper_dissipation = zeros.clone()
+
+    if hasattr(unwrapped_env, "_damper_indices") and hasattr(unwrapped_env, "_damper_initial_pos"):
+        damp_pos = unwrapped_env.joint_pos[:, unwrapped_env._damper_indices]
+        damp_vel = unwrapped_env.joint_vel[:, unwrapped_env._damper_indices]
+        damp_defl = damp_pos - unwrapped_env._damper_initial_pos
+        spring_k = float(getattr(unwrapped_env, "_spring_k", 200.0))
+        spring_d = float(getattr(unwrapped_env, "_spring_d", 20.0))
+        spring_energy = torch.sum(0.5 * spring_k * torch.square(damp_defl), dim=1)
+        spring_power = spring_k * damp_defl * damp_vel
+        if hasattr(unwrapped_env, "_current_leg_in_stance") and unwrapped_env._current_leg_in_stance.shape == damp_defl.shape:
+            contact_mask = unwrapped_env._current_leg_in_stance.float()
+        else:
+            contact_mask = torch.ones_like(damp_defl)
+        spring_release = torch.sum(torch.clamp(-spring_power, min=0.0) * contact_mask, dim=1)
+        spring_store = torch.sum(torch.clamp(spring_power, min=0.0) * contact_mask, dim=1)
+        spring_recovery_ratio = spring_release / (spring_release + spring_store + 1e-6)
+        damper_dissipation = spring_d * torch.sum(torch.square(damp_vel), dim=1)
+
+    robot_mass = float(getattr(unwrapped_env, "_robot_mass", getattr(unwrapped_env.cfg, "robot_mass_kg", 14.0)))
+    cot_proxy = total_power / (robot_mass * 9.81 * (motion_speed + 0.1))
+
+    return {
+        "motion_speed": motion_speed,
+        "mech_power_main": main_power,
+        "mech_power_abad": abad_power,
+        "mech_power_total": total_power,
+        "cot_proxy": cot_proxy,
+        "spring_energy": spring_energy,
+        "spring_release": spring_release,
+        "spring_store": spring_store,
+        "spring_recovery_ratio": spring_recovery_ratio,
+        "damper_dissipation": damper_dissipation,
+    }
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -460,8 +550,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     spring_release_sum = 0.0
     spring_store_sum = 0.0
     mech_power_main_sum = 0.0
+    mech_power_total_sum = 0.0
     cot_proxy_sum = 0.0
     damper_dissipation_sum = 0.0
+    motion_speed_sum = 0.0
     energy_kpi_count = 0
 
     forward_phase_diff_sum = 0.0
@@ -474,6 +566,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     skill_total: defaultdict[str, int] = defaultdict(int)
     skill_pass: defaultdict[str, int] = defaultdict(int)
+    skill_energy_steps: defaultdict[str, int] = defaultdict(int)
+    skill_mech_power_total_sum: defaultdict[str, float] = defaultdict(float)
+    skill_cot_sum: defaultdict[str, float] = defaultdict(float)
+    skill_spring_recovery_ratio_sum: defaultdict[str, float] = defaultdict(float)
+    skill_motion_speed_sum: defaultdict[str, float] = defaultdict(float)
     score_sum = 0.0
 
     for name, cmd, skill in command_set:
@@ -493,6 +590,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cmd_yaw_tilt_ok_steps = 0
         cmd_fall_events = 0
         cmd_episode_ends = 0
+        cmd_mech_power_main_sum = 0.0
+        cmd_mech_power_total_sum = 0.0
+        cmd_cot_sum = 0.0
+        cmd_spring_energy_sum = 0.0
+        cmd_spring_release_sum = 0.0
+        cmd_spring_store_sum = 0.0
+        cmd_spring_recovery_ratio_sum = 0.0
+        cmd_motion_speed_sum = 0.0
+        cmd_energy_steps = 0
 
         last_actions = None
 
@@ -667,12 +773,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             cmd_success_steps += int(torch.count_nonzero(success_mask).item())
 
-            if hasattr(unwrapped_env.robot.data, "applied_torque"):
-                effort_proxy_name = "mean(|tau * omega|)"
-                torques = unwrapped_env.robot.data.applied_torque[:, unwrapped_env._main_drive_indices]
-                omegas = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
-                effort_proxy = torch.mean(torch.abs(torques * omegas), dim=1)
-                effort_proxy_sum += effort_proxy.mean().item()
+            energy_metrics = collect_energy_metrics(unwrapped_env, actual_vx, actual_vy, actual_wz)
+            if torch.count_nonzero(energy_metrics["mech_power_total"]).item() > 0:
+                effort_proxy_name = "mean(total_mech_power)"
+                effort_proxy_sum += energy_metrics["mech_power_total"].mean().item()
             elif hasattr(unwrapped_env, "_target_drive_vel"):
                 effort_proxy_name = "mean(|target_vel * omega|)"
                 omegas = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
@@ -680,39 +784,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 effort_proxy_sum += effort_proxy.mean().item()
             else:
                 effort_proxy_sum += 0.0
-
             energy_count += 1
 
-            # ★ Spring energy & CoT KPIs
-            if hasattr(unwrapped_env, "_damper_indices") and hasattr(unwrapped_env, "_damper_initial_pos"):
-                _damp_pos = unwrapped_env.joint_pos[:, unwrapped_env._damper_indices]
-                _damp_vel = unwrapped_env.joint_vel[:, unwrapped_env._damper_indices]
-                _damp_defl = _damp_pos - unwrapped_env._damper_initial_pos
-                _spring_k = float(getattr(unwrapped_env, "_spring_k", 200.0))
-                _spring_d = float(getattr(unwrapped_env, "_spring_d", 20.0))
-                _robot_m = float(getattr(unwrapped_env, "_robot_mass", 14.0))
+            spring_energy_sum += energy_metrics["spring_energy"].mean().item()
+            spring_release_sum += energy_metrics["spring_release"].mean().item()
+            spring_store_sum += energy_metrics["spring_store"].mean().item()
+            damper_dissipation_sum += energy_metrics["damper_dissipation"].mean().item()
+            mech_power_main_sum += energy_metrics["mech_power_main"].mean().item()
+            mech_power_total_sum += energy_metrics["mech_power_total"].mean().item()
+            cot_proxy_sum += energy_metrics["cot_proxy"].mean().item()
+            motion_speed_sum += energy_metrics["motion_speed"].mean().item()
 
-                _se = 0.5 * _spring_k * (_damp_defl ** 2)
-                _sp = _spring_k * _damp_defl * _damp_vel
-                _sr = torch.sum(torch.clamp(-_sp, min=0.0), dim=1)
-                _ss = torch.sum(torch.clamp(_sp, min=0.0), dim=1)
-                _dd = _spring_d * torch.sum(_damp_vel ** 2, dim=1)
+            cmd_mech_power_main_sum += energy_metrics["mech_power_main"].mean().item()
+            cmd_mech_power_total_sum += energy_metrics["mech_power_total"].mean().item()
+            cmd_cot_sum += energy_metrics["cot_proxy"].mean().item()
+            cmd_spring_energy_sum += energy_metrics["spring_energy"].mean().item()
+            cmd_spring_release_sum += energy_metrics["spring_release"].mean().item()
+            cmd_spring_store_sum += energy_metrics["spring_store"].mean().item()
+            cmd_spring_recovery_ratio_sum += energy_metrics["spring_recovery_ratio"].mean().item()
+            cmd_motion_speed_sum += energy_metrics["motion_speed"].mean().item()
+            cmd_energy_steps += 1
 
-                spring_energy_sum += torch.sum(_se).item() / float(num_envs)
-                spring_release_sum += _sr.mean().item()
-                spring_store_sum += _ss.mean().item()
-                damper_dissipation_sum += _dd.mean().item()
-
-                _speed = torch.sqrt(actual_vx ** 2 + actual_vy ** 2)
-                if hasattr(unwrapped_env.robot.data, "applied_torque"):
-                    _mt = unwrapped_env.robot.data.applied_torque[:, unwrapped_env._main_drive_indices]
-                    _mo = unwrapped_env.joint_vel[:, unwrapped_env._main_drive_indices]
-                    _mp = torch.sum(torch.abs(_mt * _mo), dim=1)
-                    mech_power_main_sum += _mp.mean().item()
-                    _cot = _mp / (_robot_m * 9.81 * (_speed + 0.1))
-                    cot_proxy_sum += _cot.mean().item()
-
-                energy_kpi_count += 1
+            skill_mech_power_total_sum[skill] += energy_metrics["mech_power_total"].mean().item()
+            skill_cot_sum[skill] += energy_metrics["cot_proxy"].mean().item()
+            skill_spring_recovery_ratio_sum[skill] += energy_metrics["spring_recovery_ratio"].mean().item()
+            skill_motion_speed_sum[skill] += energy_metrics["motion_speed"].mean().item()
+            skill_energy_steps[skill] += 1
+            energy_kpi_count += 1
 
         denom = float(max(1, cmd_samples))
         result = {
@@ -732,6 +830,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         result["diag_sign_match_ratio"] = float(cmd_diag_sign_match) / float(max(1, cmd_diag_sign_total))
         result["yaw_tilt_ok_ratio"] = float(cmd_yaw_tilt_ok_steps) / float(max(1, args_cli.sweep_steps * num_envs))
         result["fall_rate"] = float(cmd_fall_events) / float(max(1, cmd_episode_ends))
+        cmd_energy_denom = float(max(1, cmd_energy_steps))
+        result["energy_mech_power_main_mean"] = cmd_mech_power_main_sum / cmd_energy_denom
+        result["energy_mech_power_total_mean"] = cmd_mech_power_total_sum / cmd_energy_denom
+        result["energy_cost_of_transport_proxy"] = cmd_cot_sum / cmd_energy_denom
+        result["energy_spring_energy_mean"] = cmd_spring_energy_sum / cmd_energy_denom
+        result["energy_spring_release_power_mean"] = cmd_spring_release_sum / cmd_energy_denom
+        result["energy_spring_store_power_mean"] = cmd_spring_store_sum / cmd_energy_denom
+        result["energy_spring_recovery_ratio"] = cmd_spring_recovery_ratio_sum / cmd_energy_denom
+        result["energy_motion_speed_mean"] = cmd_motion_speed_sum / cmd_energy_denom
+        result["energy_power_per_motion"] = result["energy_mech_power_total_mean"] / max(
+            result["energy_motion_speed_mean"], 1e-6
+        )
 
         # Tracking quality (0~1), normalized by command magnitude
         if skill == "forward":
@@ -816,10 +926,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     action_rate_mean = action_rate_sum / float(max(1, energy_count))
     effort_proxy_mean = effort_proxy_sum / float(max(1, energy_count))
+    mech_power_main_mean = mech_power_main_sum / float(max(1, energy_kpi_count))
+    mech_power_total_mean = mech_power_total_sum / float(max(1, energy_kpi_count))
+    cot_proxy_mean = cot_proxy_sum / float(max(1, energy_kpi_count))
+    motion_speed_mean = motion_speed_sum / float(max(1, energy_kpi_count))
     command_pass_ratio = float(sum(1 for row in results if row["accept_pass"])) / float(max(1, len(results)))
     overall_score_mean = score_sum / float(max(1, len(results)))
     skill_pass_ratio = {
         skill: float(skill_pass[skill]) / float(max(1, skill_total[skill])) for skill in sorted(skill_total.keys())
+    }
+    skill_energy_summary = {
+        skill: {
+            "mech_power_total_mean": skill_mech_power_total_sum[skill] / float(max(1, skill_energy_steps[skill])),
+            "cost_of_transport_proxy": skill_cot_sum[skill] / float(max(1, skill_energy_steps[skill])),
+            "spring_recovery_ratio": skill_spring_recovery_ratio_sum[skill] / float(max(1, skill_energy_steps[skill])),
+            "motion_speed_mean": skill_motion_speed_sum[skill] / float(max(1, skill_energy_steps[skill])),
+        }
+        for skill in sorted(skill_total.keys())
     }
     min_skill_pass_ratio = min(skill_pass_ratio.values()) if len(skill_pass_ratio) > 0 else 0.0
     overall_accept_pass = (
@@ -862,12 +985,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         status = "PASS" if row["accept_pass"] else "FAIL"
         print(f"{row['command']:<14} {status:<4} {extra}")
 
+    print("\n=== Energy By Command ===")
+    print(
+        f"{'command':<14} {'skill':<9} {'P_total(W)':>11} {'CoT_proxy':>11} "
+        f"{'spring_rec':>11} {'motion_eq':>11}"
+    )
+    for row in results:
+        print(
+            f"{row['command']:<14} {row['skill']:<9} "
+            f"{row['energy_mech_power_total_mean']:>11.4f} "
+            f"{row['energy_cost_of_transport_proxy']:>11.4f} "
+            f"{row['energy_spring_recovery_ratio']:>11.4f} "
+            f"{row['energy_motion_speed_mean']:>11.4f}"
+        )
+
     print("\n=== Skill-level Pass Ratio ===")
     for skill, ratio in skill_pass_ratio.items():
         status = "PASS" if ratio >= args_cli.accept_skill_pass_ratio else "FAIL"
         print(
             f"{skill:<9} {status:<4} pass_ratio={ratio:.3f} "
             f"(threshold={args_cli.accept_skill_pass_ratio:.2f}, {skill_pass[skill]}/{skill_total[skill]})"
+        )
+
+    print("\n=== Skill-level Energy Summary ===")
+    for skill, metrics in skill_energy_summary.items():
+        print(
+            f"{skill:<9} P_total={metrics['mech_power_total_mean']:.4f} W, "
+            f"CoT={metrics['cost_of_transport_proxy']:.4f}, "
+            f"spring_rec={metrics['spring_recovery_ratio']:.4f}, "
+            f"motion_eq={metrics['motion_speed_mean']:.4f}"
         )
 
     overall_status = "PASS" if overall_accept_pass else "FAIL"
@@ -906,8 +1052,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"energy.spring_release_power_mean(W): {spring_release_sum / _ekc:.6f}")
     print(f"energy.spring_store_power_mean(W): {spring_store_sum / _ekc:.6f}")
     print(f"energy.damper_dissipation_mean(W): {damper_dissipation_sum / _ekc:.6f}")
-    print(f"energy.mech_power_main_mean(W): {mech_power_main_sum / _ekc:.6f}")
-    print(f"energy.cost_of_transport_proxy: {cot_proxy_sum / _ekc:.6f}")
+    print(f"energy.mech_power_main_mean(W): {mech_power_main_mean:.6f}")
+    print(f"energy.mech_power_total_mean(W): {mech_power_total_mean:.6f}")
+    print(f"energy.motion_speed_equiv_mean: {motion_speed_mean:.6f}")
+    print(f"energy.cost_of_transport_proxy: {cot_proxy_mean:.6f}")
     if spring_release_sum + spring_store_sum > 0:
         print(f"energy.spring_recovery_ratio: {spring_release_sum / (spring_release_sum + spring_store_sum):.6f}")
     else:
@@ -941,6 +1089,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "diag_sign_match_ratio",
                     "yaw_tilt_ok_ratio",
                     "fall_rate",
+                    "energy_mech_power_main_mean",
+                    "energy_mech_power_total_mean",
+                    "energy_cost_of_transport_proxy",
+                    "energy_spring_energy_mean",
+                    "energy_spring_release_power_mean",
+                    "energy_spring_store_power_mean",
+                    "energy_spring_recovery_ratio",
+                    "energy_motion_speed_mean",
+                    "energy_power_per_motion",
                     "tracking_quality",
                     "stability_quality",
                     "score",
@@ -977,8 +1134,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             {"metric": "energy.spring_release_power_mean", "value": spring_release_sum / _ekc},
             {"metric": "energy.spring_store_power_mean", "value": spring_store_sum / _ekc},
             {"metric": "energy.damper_dissipation_mean", "value": damper_dissipation_sum / _ekc},
-            {"metric": "energy.mech_power_main_mean", "value": mech_power_main_sum / _ekc},
-            {"metric": "energy.cost_of_transport_proxy", "value": cot_proxy_sum / _ekc},
+            {"metric": "energy.mech_power_main_mean", "value": mech_power_main_mean},
+            {"metric": "energy.mech_power_total_mean", "value": mech_power_total_mean},
+            {"metric": "energy.motion_speed_equiv_mean", "value": motion_speed_mean},
+            {"metric": "energy.cost_of_transport_proxy", "value": cot_proxy_mean},
             {"metric": "energy.spring_recovery_ratio", "value": spring_release_sum / max(spring_release_sum + spring_store_sum, 1e-6)},
             {"metric": "contact.histogram", "value": summarize_contact_hist(contact_hist)},
             {"metric": "acceptance.command_pass_ratio", "value": command_pass_ratio},
@@ -988,6 +1147,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ]
         for skill, ratio in skill_pass_ratio.items():
             summary_rows.append({"metric": f"acceptance.skill_pass_ratio.{skill}", "value": ratio})
+        for skill, metrics in skill_energy_summary.items():
+            summary_rows.append({"metric": f"energy.skill.{skill}.mech_power_total_mean", "value": metrics["mech_power_total_mean"]})
+            summary_rows.append({"metric": f"energy.skill.{skill}.cost_of_transport_proxy", "value": metrics["cost_of_transport_proxy"]})
+            summary_rows.append({"metric": f"energy.skill.{skill}.spring_recovery_ratio", "value": metrics["spring_recovery_ratio"]})
+            summary_rows.append({"metric": f"energy.skill.{skill}.motion_speed_mean", "value": metrics["motion_speed_mean"]})
 
         with open(summary_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["metric", "value"])
