@@ -1,980 +1,1067 @@
-# RedRhex 五階段訓練整合指南（Train + Explainer + Eval + Play）
+# RedRhex 終極操作指南
 
-> 這份文件已整併原本兩份：
-> - `docs/redrhex_train_play_guide.md`
-> - `docs/redrhex_stage_training_explainer.md`
+更新日期：2026-04-16
 
-## 模式總覽（先選一種）
+這份文件是 RedRhex 專案目前唯一的操作手冊，目標不是講理論，而是讓一個第一次碰這個專案的人也能知道：
 
-| 模式 | 適用情境 | 核心目的 | 入口章節 |
-|---|---|---|---|
-| 快速訓練（ForwardFast） | 實驗室現場反覆調參、要快 | 盡快得到可上機直走 policy | A 區 |
-| 一般訓練（五階段） | 要完整技能（前進/側移/斜向/旋轉） | 最終整合能力與泛化 | B 區 |
+- 要先做什麼檢查
+- 怎麼開始 train
+- 怎麼用 play 看模型
+- 怎麼匯出 policy
+- 怎麼跑五階段 curriculum
+- 怎麼用 teacher / distillation
+- 怎麼做 smoke test、command sweep、除錯
 
-閱讀建議：
-- 只要快速上機：先看 `A`，最後看 `C`（FAQ）
-- 要完整能力訓練：看 `B`，最後看 `C`（FAQ）
+如果你要看「這次改革背後參考了哪些論文、理論、程式修改細節、reward 設計、驗證結果」，請看：
 
----
+- `docs/2026_Midterm.md`
+- `docs/redrhex_improvement_strategy_full.md`
+- `docs/redrhex_forwardfast_professor_report.md`
 
-## 導言：一般訓練為什麼從單段改成五階段
-
-你原本是一次混合訓練所有技能（forward/lateral/diagonal/yaw）。
-現在改成 **5-stage curriculum**，目的是降低技能互相干擾：
-
-1. Stage1: Forward-only（先把直走練穩）
-2. Stage2: Lateral-only（把側移獨立練出來）
-3. Stage3: Diagonal-only（融合 vx+vy）
-4. Stage4: Yaw-only（先把原地旋轉單獨練穩）
-5. Stage5: Mixed（整合前四段，持續潤化）
-
-這 5 段不是 5 個模型，而是 **同一個 policy 連續微調**：每段都接續上一段 checkpoint。
+這份文件只負責把操作流程講清楚。
 
 ---
 
-## 共用 0) 先做一致性檢查（兩種模式都建議）
+## 1. 你先要知道的事
 
-先確認你目前腳本可正常解析（避免半夜才發現指令不相容）：
+目前專案有兩個主要 task：
+
+| 用途 | Task ID | 說明 |
+|---|---|---|
+| 完整能力訓練 | `Template-Redrhex-Direct-v0` | 主任務，包含 rough terrain、history actor、asymmetric critic、teacher obs、symmetry augmentation、actuator randomization、fault injection 等改革 |
+| 快速直走收斂 | `Template-Redrhex-ForwardFast-Direct-v0` | forward-only 快速版，適合現場快速迭代與 sim2real 直走調參 |
+
+目前 `train.py` / `play.py` 都支援三種 agent 入口：
+
+| `--agent` 值 | 用途 | 可否直接當部署學生策略 |
+|---|---|---|
+| `rsl_rl_cfg_entry_point` | 一般 PPO，actor 吃 `policy + history`，critic 吃 privileged obs | 可以，這是最常用的部署路線 |
+| `rsl_rl_teacher_cfg_entry_point` | privileged teacher PPO，actor/critic 都吃 `teacher` obs | 不建議直接當真機部署策略，主要用來做 teacher 上界或蒸餾 |
+| `rsl_rl_distillation_cfg_entry_point` | teacher-student distillation | 可以，這是把 teacher 壓縮成可部署 student 的路線 |
+
+最重要的實務觀念：
+
+- `rsl_rl_cfg_entry_point` 已經是改革後的主力設定，不是舊版 baseline。
+- 現在的主 task 內建 history、critic privileged obs、teacher obs、對稱增強、rough terrain、故障注入與 actuator randomization，不需要另外開很多旗標才會生效。
+- `play.py` 現在每次載入 checkpoint 都會自動匯出 `policy.pt` 和 `policy.onnx` 到該 run 的 `exported/` 目錄。
+- `play.py` 和 `eval_command_sweep.py` 會自動幫你把錯誤的 checkpoint 參數修正成真正的 `model_*.pt`。就算你誤傳資料夾、`events.out.tfevents...` 或 `exported/policy.pt`，它也會盡量 fallback 到同 run 裡最新的訓練 checkpoint。
+
+---
+
+## 2. 先做環境準備
 
 ```bash
 cd ~/RedRhex/RedRhex
 conda activate env_isaaclab
+```
 
+建議第一次操作前先做一次最小檢查：
+
+```bash
 bash -n scripts/rsl_rl/train_stage_pipeline.sh
+
 python -m py_compile \
+  scripts/rsl_rl/train.py \
   scripts/rsl_rl/play.py \
   scripts/rsl_rl/eval_command_sweep.py \
-  source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py
+  scripts/rsl_rl/validate_reform_stack.py \
+  scripts/rsl_rl/validate_distillation_stack.py
 ```
+
+如果你只是想先確認新改革的訓練堆疊能不能跑，再加做這個 smoke test：
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32
+```
+
+這個腳本會檢查：
+
+- 環境能否成功 reset / rollout
+- `policy/history/critic/teacher` observation 維度是否一致
+- reward 和 observation 是否有 NaN / Inf
+- rough terrain / fault injection / actuator scaling 是否真的在跑
 
 ---
 
-## A) 快速訓練流程（ForwardFast，現場 Sim2Real）
+## 3. 最短成功路徑
 
-## A1) 最快直接執行（Train / TensorBoard / Play）
+如果你完全是第一次使用這個專案，推薦照這個順序：
 
-以下是現場最常用的最小流程，直接複製即可。
+1. 跑 `validate_reform_stack.py`，確認環境與 observation stack 正常。
+2. 選一條訓練路線：
+   - 想先快速拿到直走模型：用 `Template-Redrhex-ForwardFast-Direct-v0`
+   - 想直接做完整能力模型：用 `Template-Redrhex-Direct-v0`
+3. 開 TensorBoard 看訓練。
+4. 用 `play.py` 載入最新 checkpoint。
+5. 從 `exported/policy.onnx` 或 `exported/policy.pt` 拿部署檔。
 
-### Step A: 開始訓練（ForwardFast）
+---
+
+## 4. 日誌、checkpoint、輸出檔會放在哪裡
+
+所有 RSL-RL 訓練都會寫到：
+
+```text
+logs/rsl_rl/<experiment_name>/<timestamp>_<run_name>/
+```
+
+常見 experiment root：
+
+| 模式 | experiment root |
+|---|---|
+| 主 task PPO | `logs/rsl_rl/redrhex_wheg/` |
+| ForwardFast PPO | `logs/rsl_rl/redrhex_forward_fast/` |
+| 主 task teacher PPO | `logs/rsl_rl/redrhex_wheg_teacher/` |
+| ForwardFast teacher PPO | `logs/rsl_rl/redrhex_forward_fast_teacher/` |
+| 主 task distillation | `logs/rsl_rl/redrhex_wheg_distill/` |
+| ForwardFast distillation | `logs/rsl_rl/redrhex_forward_fast_distill/` |
+
+每個 run 內通常有：
+
+- `model_*.pt`：真正可拿來 resume / play / eval 的訓練 checkpoint
+- `events.out.tfevents...`：TensorBoard 日誌，不是模型
+- `params/env.yaml`、`params/agent.yaml`：該次訓練實際用到的設定
+- `exported/policy.pt`：JIT 匯出
+- `exported/policy.onnx`：ONNX 匯出
+
+實務上要記住：
+
+- 能拿來 `--checkpoint` 的主角永遠是 `model_*.pt`
+- `events.out.tfevents...` 不能拿去 `play.py`
+- `exported/policy.pt` 不是訓練 checkpoint，不能拿來 resume 訓練
+
+---
+
+## 5. 最常用的訓練指令
+
+## 5.1 主 task 一般 PPO
+
+這是目前最推薦的主線訓練入口。它用 deployable actor 設計：
+
+- actor：`policy + history`
+- critic：`policy + history + critic privileged obs`
+
+也就是說，訓練時 critic 會看到比較多資訊，但最後部署時 actor 不需要 teacher-only 的特權資訊。
 
 ```bash
-cd ~/RedRhex/RedRhex
-conda activate env_isaaclab
-
 python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
   --headless \
-  --num_envs=2048 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_trial_a
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name wheg_locomotion_reform_v1
 ```
 
-### Step B: 開 TensorBoard 監看訓練曲線
+如果你要把 env 數量拉高：
 
 ```bash
-cd ~/RedRhex/RedRhex
-conda activate env_isaaclab
-
-tensorboard --logdir . --port 6006 --bind_all
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 4096 \
+  --max_iterations 2500 \
+  --run_name wheg_locomotion_reform_v1_big
 ```
 
-開瀏覽器：
-- 本機：`http://localhost:6006`
-- 遠端機器：`http://<你的主機IP>:6006`
+## 5.2 ForwardFast 快速直走 PPO
 
-建議先看這幾條：
+這條路線適合：
+
+- 現場想快速得到可上機的直走 policy
+- reward / 物理參數剛調完，想快點看到行為變化
+- 不想一開始就訓完整 mixed locomotion
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-ForwardFast-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 1500 \
+  --run_name forward_fast_reform_v1
+```
+
+如果 GPU 夠，可以加到 4096 env：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-ForwardFast-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 4096 \
+  --max_iterations 1500 \
+  --run_name forward_fast_reform_v1_big
+```
+
+## 5.3 主 task 五階段 curriculum
+
+如果你要完整能力整合，推薦直接使用五階段 pipeline，而不是手動一段一段拚。
+
+這裡有兩個原本指南很重要、現在也仍然成立的觀念：
+
+- 五階段不是五個互不相干的模型，而是同一個 policy 連續微調
+- 目的不是把所有技能一次混著硬學，而是降低 forward / lateral / diagonal / yaw 彼此干擾
+
+你可以把它理解成：
+
+1. Stage1 先把直走打穩
+2. Stage2 再把側移獨立拉起來
+3. Stage3 再學 `vx + vy` 的耦合控制
+4. Stage4 單獨練 yaw，避免旋轉技能干擾其他技能
+5. Stage5 最後再整合前四段
+
+五個 stage 的意義：
+
+| Stage | 重點 |
+|---|---|
+| `env.stage=1` | forward-only，先把直走穩定性打底 |
+| `env.stage=2` | lateral-only，讓側移獨立成型 |
+| `env.stage=3` | diagonal-only，讓 `vx + vy` 組合動作成型 |
+| `env.stage=4` | yaw-only，先把原地旋轉單獨練穩 |
+| `env.stage=5` | mixed，整合前四段 |
+
+補充一個很重要的訓練邏輯：
+
+- Stage5 不是暴力覆蓋前四段
+- 目前環境裡有前進防遺忘機制，會盡量保護 Stage1 已建立的穩定直走能力，再慢慢把 lateral / diagonal / yaw 拉上來
+
+### 一鍵跑完整 pipeline
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_a \
+  --num_envs 4096 \
+  --s1 8000 \
+  --s2 8000 \
+  --s3 9000 \
+  --s4 10000 \
+  --s5 12000
+```
+
+### 先做 GUI 預檢再放整晚
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_a \
+  --precheck_gui 1 \
+  --precheck_stage 1 \
+  --precheck_envs 64 \
+  --precheck_iters 120 \
+  --num_envs 4096 \
+  --s1 8000 \
+  --s2 8000 \
+  --s3 9000 \
+  --s4 10000 \
+  --s5 12000
+```
+
+### pipeline 會幫你做什麼
+
+- 每個 stage 自動接前一段 checkpoint
+- 預設使用 full resume，也就是 policy、optimizer、iteration continuity 都會接續
+- 自動做 stage health gate
+- 寫 pipeline log 到 `logs/rsl_rl/pipeline/<run_tag>.log`
+- 最後會印出 `FINAL_CKPT=...`
+
+### 中途斷掉後從某 stage 接著跑
+
+注意：如果你要從 stage 3 或 stage 4 接著跑，`--run_tag` 必須和前一次一致，因為 pipeline 會用它去找前一段 run。
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_a \
+  --start_stage 3 \
+  --num_envs 4096 \
+  --s1 8000 \
+  --s2 8000 \
+  --s3 9000 \
+  --s4 10000 \
+  --s5 12000
+```
+
+### 若你真的要用 policy-only handoff
+
+這通常只適合做實驗，不建議當正式 curriculum。
+
+```bash
+bash scripts/rsl_rl/train_stage_pipeline.sh \
+  --run_tag overnight_policy_only \
+  --resume_policy_only 1 \
+  --reset_action_std 0.8
+```
+
+它的效果是：
+
+- 只載入 policy 權重
+- optimizer state 不接續
+- iteration 會重置，所以 `model_*.pt` 編號會重新開始
+
+## 5.4 手動指定 stage 的一般訓練
+
+如果你不要 pipeline，也可以直接在 `train.py` 後面加 Hydra override：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 8000 \
+  --run_name stage1_manual \
+  env.stage=1 \
+  env.draw_debug_vis=False
+```
+
+如果你要手動接上一段：
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 8000 \
+  --run_name stage2_manual \
+  --resume \
+  --load_run <上一段 run 名稱> \
+  --checkpoint model_xxxxx.pt \
+  env.stage=2
+```
+
+如果你是在做手動逐段 debug，原本文件裡常用的兩個額外 override 仍然有用：
+
+```bash
+env.draw_debug_vis=False \
+env.dr_try_physical_material_randomization=False
+```
+
+用途是：
+
+- `env.draw_debug_vis=False`：減少不必要視覺除錯負擔
+- `env.dr_try_physical_material_randomization=False`：在某些手動除錯情境下，先把物理材質隨機化關掉，讓問題更容易重現與定位
+
+---
+
+## 6. Teacher 與 Distillation 操作
+
+## 6.1 Teacher PPO
+
+teacher 版本是為了訓練上界與之後做蒸餾。它的 actor/critic 都吃 `teacher` privileged obs。
+
+重要提醒：
+
+- teacher 很適合在模擬裡追求更高學習效率或當蒸餾來源
+- teacher 不等於真機可直接部署策略
+- 真機或 sim2real 部署仍應優先使用一般 PPO student 或 distillation student
+
+### 主 task teacher
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name wheg_privileged_teacher_v1
+```
+
+### ForwardFast teacher
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-ForwardFast-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 1500 \
+  --run_name forward_fast_privileged_teacher_v1
+```
+
+## 6.2 Distillation 先做 smoke test
+
+現在專案已經把 distillation runner 接好了，但蒸餾流程比一般 PPO 更容易因 checkpoint 路徑規則而卡住，所以推薦先做 smoke test。
+
+### 一次檢查 reform stack + teacher + distillation
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32 \
+  --runner_smoke \
+  --distill_smoke \
+  --runner_steps 8 \
+  --distill_steps 8 \
+  --log_dir /tmp/redrhex_reform_smoke
+```
+
+這會做三件事：
+
+- random rollout smoke
+- 1 iteration PPO smoke
+- teacher PPO + distillation smoke
+
+輸出檔常見位置：
+
+- `/tmp/redrhex_validate_stats.json`
+- `/tmp/redrhex_reform_smoke/teacher/teacher_smoke.pt`
+- `/tmp/redrhex_reform_smoke/distill/distill_smoke.pt`
+
+### 已有 teacher checkpoint，單獨檢查 distillation
+
+```bash
+python scripts/rsl_rl/validate_distillation_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 8 \
+  --teacher_ckpt /absolute/path/to/model_xxxxx.pt \
+  --log_dir /tmp/redrhex_reform_distill
+```
+
+## 6.3 正式做 distillation
+
+### Step 1：先訓練 teacher
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name wheg_privileged_teacher_v1
+```
+
+### Step 2：確認 teacher checkpoint
+
+```bash
+TEACHER_RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg_teacher/* | head -1)")
+TEACHER_CKPT=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg_teacher/$TEACHER_RUN/model_*.pt | tail -1)")
+echo "TEACHER_RUN=$TEACHER_RUN"
+echo "TEACHER_CKPT=$TEACHER_CKPT"
+```
+
+### Step 3：讓 distillation runner 找得到 teacher run
+
+這一步很重要。現在 `train.py` 在 distillation 模式下，會用 distill config 的 `experiment_name` 當 resume 根目錄：
+
+- 主 task distill：`logs/rsl_rl/redrhex_wheg_distill/`
+- ForwardFast distill：`logs/rsl_rl/redrhex_forward_fast_distill/`
+
+也就是說，你不能假設 teacher run 放在 `redrhex_wheg_teacher/` 時，`--agent rsl_rl_distillation_cfg_entry_point --resume --load_run <teacher_run>` 一定會直接找到。
+
+最簡單的做法是建立軟連結，讓 teacher run 同時出現在 distill experiment root 下面：
+
+```bash
+mkdir -p logs/rsl_rl/redrhex_wheg_distill
+ln -s ../redrhex_wheg_teacher/$TEACHER_RUN logs/rsl_rl/redrhex_wheg_distill/$TEACHER_RUN
+```
+
+如果是 ForwardFast distill，對應改成：
+
+```bash
+mkdir -p logs/rsl_rl/redrhex_forward_fast_distill
+ln -s ../redrhex_forward_fast_teacher/$TEACHER_RUN logs/rsl_rl/redrhex_forward_fast_distill/$TEACHER_RUN
+```
+
+### Step 4：開始 distillation
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --resume \
+  --load_run "$TEACHER_RUN" \
+  --checkpoint "$TEACHER_CKPT" \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 800 \
+  --run_name wheg_student_distill_v1
+```
+
+ForwardFast 版本只要把 task 換成 `Template-Redrhex-ForwardFast-Direct-v0` 即可。
+
+### Step 5：播放 distillation student
+
+```bash
+STUDENT_RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg_distill/* | head -1)")
+STUDENT_CKPT=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg_distill/$STUDENT_RUN/model_*.pt | tail -1)")
+
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --load_run "$STUDENT_RUN" \
+  --checkpoint "$STUDENT_CKPT"
+```
+
+`play.py` 已經有處理 distillation runner，會自動用 `student_obs_normalizer` 匯出 student policy。
+
+---
+
+## 7. TensorBoard 怎麼看
+
+最簡單的開法：
+
+```bash
+tensorboard --logdir logs/rsl_rl --port 6006 --bind_all
+```
+
+常先看這幾類：
+
 - `Train/mean_reward`
 - `Train/mean_episode_length`
+- `Episode_Termination/terminated`
 - `Episode_Reward/rew_fall`
-- `Episode_Reward/rew_tracking`
+- 各種 `diag_*` 診斷指標
 
-### Step C: 找最新 checkpoint 並播放（Play）
+對主 task 而言，現在常見的診斷重點是：
 
-```bash
-cd ~/RedRhex/RedRhex
-conda activate env_isaaclab
+- episode length 有沒有穩定上升
+- terminated 有沒有下降
+- base height / tilt 相關診斷有沒有長期惡化
+- forward / lateral / diagonal / yaw 是否都真的有學起來，而不是只剩一種技能
 
-RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_forward_fast/* | head -1)")
-CKPT=$(ls -v logs/rsl_rl/redrhex_forward_fast/$RUN/model_*.pt | tail -1)
-echo "RUN=$RUN"
-echo "CKPT=$CKPT"
+如果你跑的是五階段 curriculum，原本指南裡每個 stage 的觀察重點也值得保留：
 
-python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --num_envs=64 \
-  --disable_keyboard_control \
-  --load_run="$RUN" \
-  --checkpoint="$CKPT"
-```
+### 五階段各 stage 建議觀察
 
----
+全階段共通：
 
-## A2) 快速訓練設定說明（現場 Sim2Real：直走專用）
-
-已新增一個 forward-only 快速收斂 task：
-- Task ID: `Template-Redrhex-ForwardFast-Direct-v0`
-- 特色：
-  - 只訓練前進（`stage=1` 固定）
-  - reward 權重集中在 forward progress + velocity tracking
-  - 弱化 lateral/diagonal/yaw shaping，減少干擾
-  - domain randomization 改為窄範圍（保留基本 sim2real 魯棒）
-  - 關閉隨機推擠，讓 TensorBoard 更快進入平穩段
-
-快速開訓（建議先用 2048 env 進行現場迭代）：
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --headless \
-  --num_envs=2048 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_trial_a
-```
-
-如果 GPU 足夠，再拉到 4096：
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_trial_b
-```
-
-訓練後直接匯出 ONNX（play.py 會自動輸出 `exported/policy.onnx`）：
-
-```bash
-python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --headless \
-  --disable_keyboard_control \
-  --load_run=<你的 run 資料夾> \
-  --checkpoint=<model_xxxxx.pt>
-```
-
----
-
-## A3) 2026-03-16 第一輪品質修正（歷程）：解決「六腳同轉、趴地死亡循環」
-
-你回報的症狀是：
-- TensorBoard 看起來有收斂，但上機後六隻腳常一起轉動
-- 機身很快觸地，被判定死亡
-- 形成「倒地 -> reset -> 再倒地」循環
-
-這類問題的本質通常是「學到可拿分但不可用的策略」。  
-這次修正不是只加重某一個 reward，而是同時調整「控制邏輯 + reward gate + termination + PPO」。
-
-### A3.1) 控制器核心修正（最關鍵）
-
-檔案：`source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py`
-
-1. Forward bias 的著地/擺動判斷改成 **duty-cycle 時間制**：
-- 由 `desired_cycle < duty_target` 判斷（`duty_target` 由 `forward_duty_target` 讀取）
-- 避免固定角度窗造成六腳同速旋轉，提升 tripod 交替穩定性
-
-2. 新增「健康姿態 gating」：
-- 當機身過低或傾斜過大時，會關閉主要正向獎勵
-- 避免策略靠趴地抖動拿到 tracking/progress 分數
-
-### A3.2) ForwardFast 參數修正（環境層）
-
-檔案：`source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py`  
-類別：`RedrhexForwardFastEnvCfg`
-
-重點更新：
-- 命令帶寬再縮窄：`lin_vel_x_range=[0.20, 0.32]`
-- 動作更保守：`main_drive_vel_scale=5.8`、`stage_forward_policy_drive_residual_scale=[0.03]`
-- 起步更平順：`stage_action_warmup_steps=[120]`
-- 倒地判定更嚴格：`max_tilt_magnitude=0.75`、`fall_height_threshold=0.11`
-- 獎勵防作弊開關：`gate_positive_rewards_when_unhealthy=True`
-- 站姿目標提高：`target_base_height=0.15`
-- 移除「只會轉腿也有分」：`leg_moving=0.0`
-
-### A3.3) PPO 穩定化修正（演算法層）
-
-檔案：`source/RedRhex/RedRhex/tasks/direct/redrhex/agents/rsl_rl_ppo_cfg.py`  
-類別：`PPORunnerForwardFastCfg`
-
-重點更新：
-- `num_steps_per_env=32`
-- `init_noise_std=0.30`
-- `learning_rate=4.0e-4`
-- `entropy_coef=0.0010`
-- `desired_kl=0.008`
-
-目的是降低早期高噪聲亂探索，讓策略更快進入「可走、可穩」區間。
-
-### A3.4) 這輪修正後要看哪幾條 TensorBoard
-
-優先順序：
-1. `Train/mean_episode_length`：應該上升，且不是只靠 timeout 漂亮
-2. `Episode_Termination/terminated`：要持續下降
-3. `Episode_Reward/rew_fall`：絕對值要往 0 靠近
-4. `Episode_Reward/diag_base_height`：不能長期下滑
-5. `Episode_Reward/rew_forward_gait` + `diag_forward_duty_ema`：要維持 tripod 節奏
-
-如果 `mean_reward` 上升，但 `terminated` 不降、`rew_fall` 很差，代表是「假收斂」，不能上機。
-
-> 註：A3 是第一輪修正歷程。若你要跑目前最新版，請看下面 A4。
-
----
-
-## A4) 2026-03-16 第二輪修正（目前推薦）：回到 Stage1 成功邏輯再加速
-
-你最新回報是：
-- 比第一輪更不容易動
-- 起步後仍會六腳同轉並趴地死亡
-
-這代表第一輪修正「太保守」，把策略活動度壓掉了。  
-因此第二輪策略是：**以原本五階段 Stage1 成功設定為底，只保留必要的加速訓練改動**。
-
-### A4.1) 核心回調（與原 Stage1 對齊）
-
-1. 控制器 stance 判定回到原本穩定邏輯：
-- `desired_in_stance = self._in_stance_phase(desired_phase)`
-- 不再使用 duty-time stance 控制（保留 duty/tripod reward 診斷）
-
-2. ForwardFast 參數改為 Stage1 風格：
-- `curriculum_stage_scales=[0.05]`（沿用 stage1 低隨機擾動）
-- `lin_vel_x_range=[0.22, 0.42]`
-- `command_resample_on_timer=False`
-- `main_drive_vel_scale=8.0`
-- `stage_forward_policy_drive_residual_scale=[0.10]`
-- `stage_action_warmup_steps=[30]`（從 120 回到 30）
-
-3. 終止條件放回 Stage1 穩定區：
-- `stage1_min_base_height=0.03`
-- `stage1_body_contact_height_threshold=0.06`
-- `stage_body_contact_tilt_threshold=[1.80]`
-- `stage_termination_grace_steps=[120]`
-- `gate_positive_rewards_when_unhealthy=False`
-
-4. PPO 恢復探索能力：
-- `num_steps_per_env=24`
-- `init_noise_std=0.55`
-- `entropy_coef=0.0035`
-- `learning_rate=5.0e-4`
-- `desired_kl=0.01`
-
-### A4.2) 這樣改的原因
-
-第一輪的「低殘差 + 長暖機 + 嚴終止 + 低探索」組合，雖然能壓住暴衝，但也容易讓 policy 學成「不太動」。  
-第二輪改法是回到你已驗證過的 Stage1 穩定策略空間，讓「會走」先成立，再用 forward-only 任務縮短總訓練時間。
-
-### A4.3) 目前推薦重訓指令
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --headless \
-  --num_envs=2048 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_stage1ref_v1
-```
-
-### A4.4) 第二輪修正後先看這些 TensorBoard
-
-1. `Train/mean_episode_length`：不能再卡在極短回合  
-2. `Episode_Termination/terminated`：應下降  
-3. `Episode_Reward/rew_forward_gait`：應持續上升  
-4. `Episode_Reward/diag_base_height`：要穩，不要長期下滑  
-5. `Episode_Reward/diag_cmd_vx` vs `diag_forward_vel`：追蹤要更貼近
-
----
-
-## B) 一般訓練流程（五階段完整能力）
-
-## B1) 每個 Stage 在做什麼
-
-## B1-Stage1（Forward-only）
-- 命令分布：`vx > 0, vy = 0, wz = 0`
-- 硬限制：ABAD 鎖住
-- 主要目標：穩定前進 + tripod 節奏 + 不倒地
-
-## B1-Stage2（Lateral-only）
-- 命令分布：`vy != 0, vx ~= 0, wz ~= 0`
-- 硬限制：main-drive lock/soft-lock
-- 流程：`GO_TO_STAND -> LATERAL_STEP`
-- 主要目標：側移速度要起來，不是站著抖動
-
-## B1-Stage3（Diagonal-only）
-- 命令分布：`vx > 0 且 vy != 0, wz ~= 0`
-- 控制：main-drive + ABAD 都開放
-- 主要目標：vx/vy 方向同時正確（不能只會一邊斜走）
-
-## B1-Stage4（Yaw-only）
-- 命令分布：`wz != 0, vx ~= 0, vy ~= 0`
-- 控制：允許 per-leg signed main-drive（可反轉）
-- 主要目標：原地旋轉穩定，避免「掀機身作弊」
-
-## B1-Stage5（Mixed）
-- 命令分布：FWD/LAT/DIAG/YAW 混合
-- 主要目標：整合技能且保留 Stage1 的穩定直走能力
-
----
-
-## B2) 現在程式如何保留「穩定直走」不被後續洗掉
-
-目前環境已加入前進防遺忘機制：
-- Forward 模式殘差上限（cap）避免 policy 大幅破壞前進 bias
-- stage-specific main-drive residual scale（各 stage 強度不同）
-- Stage5 仍保留 forward 專屬 reward multiplier
-
-你可以把 Stage5 理解成：
-- 不是暴力覆蓋前四段
-- 是在保護 forward 基底下，把 lateral/diag/yaw 慢慢拉上來
-
----
-
-## B3) 訓練前建議（先肉眼確認）
-
-## B3.1) 前置
-
-```bash
-cd ~/RedRhex/RedRhex
-conda activate env_isaaclab
-```
-
-## B3.2) 建議先做 GUI 預檢（非 headless）
-
-```bash
-bash scripts/rsl_rl/train_stage_pipeline.sh \
-  --run_tag precheck_a \
-  --precheck_gui 1 \
-  --precheck_stage 1 \
-  --precheck_envs 64 \
-  --precheck_iters 120 \
-  --num_envs 512 \
-  --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
-```
-
-確認「不是一出生就觸地死亡」後，再放整晚 headless。
-
----
-
-## B4) 一鍵跑完五階段（推薦）
-
-```bash
-bash scripts/rsl_rl/train_stage_pipeline.sh \
-  --run_tag overnight_a \
-  --num_envs 4096 \
-  --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
-```
-
-若你想先看 2~5 分鐘 GUI 再放整晚：
-
-```bash
-bash scripts/rsl_rl/train_stage_pipeline.sh \
-  --run_tag overnight_a \
-  --precheck_gui 1 \
-  --precheck_stage 1 \
-  --precheck_envs 64 \
-  --precheck_iters 120 \
-  --num_envs 4096 \
-  --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
-```
-
-補充：
-- pipeline 會自動串接 stage checkpoint
-- 預設使用「完整 resume」（policy + optimizer + iteration），是**真正 curriculum 接續學習**
-- 因此 stage2~stage5 的 `model_*.pt` 數字會延續成長，不會每段從 0 重來
-- 現在即使系統沒有 `rg`，也會 fallback `grep`，不會因缺 `rg` 直接中斷
-- 會輸出：`FINAL_CKPT=.../model_xxxxx.pt`
-
-快速檢查「是否真的接續」：
-
-```bash
-RUN1=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage1* | head -1)")
-RUN2=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage2* | head -1)")
-S1=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN1/model_*.pt | tail -1)")
-S2=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN2/model_*.pt | tail -1)")
-echo "S1=$S1"
-echo "S2=$S2"
-# 正常 full-resume：S2 的數字應 > S1
-```
-
-## B4.1) 若中斷後續跑
-
-```bash
-bash scripts/rsl_rl/train_stage_pipeline.sh \
-  --run_tag overnight_a \
-  --start_stage 2 \
-  --num_envs 4096 \
-  --s1 8000 --s2 8000 --s3 9000 --s4 10000 --s5 12000
-```
-
----
-
-## B5) 手動逐段跑（可精細控制）
-
-## B5-Stage1（手動）
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=8000 \
-  --run_name=stage1 \
-  env.stage=1 \
-  env.draw_debug_vis=False \
-  env.dr_try_physical_material_randomization=False
-```
-
-```bash
-RUN1=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage1* | head -1)")
-CKPT1=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN1/model_*.pt | tail -1)")
-echo "RUN1=$RUN1"
-echo "CKPT1=$CKPT1"
-```
-
-## B5-Stage2（接 Stage1）
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=8000 \
-  --run_name=stage2 \
-  --resume \
-  --load_run="$RUN1" \
-  --checkpoint="$CKPT1" \
-  env.stage=2 \
-  env.draw_debug_vis=False \
-  env.dr_try_physical_material_randomization=False
-```
-
-## B5-Stage3（接 Stage2）
-
-```bash
-RUN2=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage2* | head -1)")
-CKPT2=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN2/model_*.pt | tail -1)")
-
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=9000 \
-  --run_name=stage3 \
-  --resume \
-  --load_run="$RUN2" \
-  --checkpoint="$CKPT2" \
-  env.stage=3 \
-  env.draw_debug_vis=False \
-  env.dr_try_physical_material_randomization=False
-```
-
-## B5-Stage4（接 Stage3）
-
-```bash
-RUN3=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage3* | head -1)")
-CKPT3=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN3/model_*.pt | tail -1)")
-
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=10000 \
-  --run_name=stage4 \
-  --resume \
-  --load_run="$RUN3" \
-  --checkpoint="$CKPT3" \
-  env.stage=4 \
-  env.draw_debug_vis=False \
-  env.dr_try_physical_material_randomization=False
-```
-
-## B5-Stage5（接 Stage4）
-
-```bash
-RUN4=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage4* | head -1)")
-CKPT4=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg/$RUN4/model_*.pt | tail -1)")
-
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=4096 \
-  --max_iterations=12000 \
-  --run_name=stage5 \
-  --resume \
-  --load_run="$RUN4" \
-  --checkpoint="$CKPT4" \
-  env.stage=5 \
-  env.draw_debug_vis=False \
-  env.dr_try_physical_material_randomization=False
-```
-
-若你要刻意使用 policy-only（會讓每段迭代號重新從 0 開始，不建議做正式 curriculum）：
-
-```bash
-python scripts/rsl_rl/train.py ... --resume --resume_policy_only --reset_action_std=0.8 ...
-```
-
-```bash
-RUN5=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage5* | head -1)")
-FINAL_CKPT=$(ls -v logs/rsl_rl/redrhex_wheg/$RUN5/model_*.pt | tail -1)
-echo "FINAL_CKPT=$FINAL_CKPT"
-```
-
----
-
-## B6) TensorBoard 每階段要看什麼
-
-## B6-全階段共通
-- `Train/mean_episode_length`：上升且穩定
+- `Train/mean_episode_length`：要上升且穩定
 - `Train/mean_reward`：整體往上
 - `Episode_Termination/terminated`：下降
-- `Episode_Reward/rew_fall`：接近 0（少摔）
+- `Episode_Reward/rew_fall`：接近 0
 - `Episode_Reward/diag_base_height`：不要長期崩掉
 
-## B6-Stage1
-- `diag_cmd_vx` > 0，`diag_cmd_vy/wz` ~ 0
-- `rew_tracking`、`rew_forward_gait` 上升
-- `diag_forward_duty_ema` 靠近 0.65
+Stage1：
 
-## B6-Stage2
-- `diag_lateral_fsm_state` 能進到 2（LATERAL_STEP）
-- `rew_lateral_speed_deficit` 往 0 靠近（少負）
+- `diag_cmd_vx` 應大於 0，`diag_cmd_vy/wz` 應接近 0
+- `rew_tracking`、`rew_forward_gait` 應上升
+- `diag_forward_duty_ema` 建議往穩定 tripod 節奏收斂
+
+Stage2：
+
+- `diag_lateral_fsm_state` 最好能進到 `2`，也就是 `LATERAL_STEP`
+- `rew_lateral_speed_deficit` 往 0 靠近
 - `diag_lateral_vel` 絕對值上升且方向正確
 
-## B6-Stage3
+Stage3：
+
 - `rew_diag_sign` 轉正且穩定
 - `diag_vel_error` 下降
 
-## B6-Stage4
+Stage4：
+
 - `rew_yaw_track` 上升
 - `diag_wz_error` 下降
-- `diag_roll_rms`、`diag_pitch_rms` 不爆
+- `diag_roll_rms`、`diag_pitch_rms` 不要爆掉
 
-## B6-Stage5
-- forward/lateral/diag/yaw 四類指標都要有反應
-- 不能只剩一種技能表現好
+Stage5：
 
----
-
-## B7) 驗收（Command Sweep）
-
-## B7.1) 最終混合驗收（Stage5）
-
-```bash
-python scripts/rsl_rl/eval_command_sweep.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=256 \
-  --checkpoint="$FINAL_CKPT" \
-  --eval_profile=stage5 \
-  --warmup_steps=120 \
-  --sweep_steps=600 \
-  --accept_duration_s=2.0 \
-  --accept_vx_abs=0.15 \
-  --accept_vy_abs=0.15 \
-  --accept_wz_abs=0.40 \
-  --accept_lin_ratio=0.55 \
-  --accept_wz_ratio=0.55 \
-  --accept_yaw_tilt_bound=0.60 \
-  --accept_yaw_tilt_ratio=0.70 \
-  --accept_diag_sign_ratio=0.70 \
-  --accept_diag_component_ratio=0.50 \
-  --accept_max_fall_rate=0.20 \
-  --accept_skill_pass_ratio=0.60 \
-  --accept_overall_pass_ratio=0.70
-```
-
-可輸出 CSV：
-
-```bash
-python scripts/rsl_rl/eval_command_sweep.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --num_envs=256 \
-  --checkpoint="$FINAL_CKPT" \
-  --eval_profile=stage5 \
-  --warmup_steps=120 \
-  --sweep_steps=600 \
-  --accept_duration_s=2.0 \
-  --accept_vx_abs=0.15 \
-  --accept_vy_abs=0.15 \
-  --accept_wz_abs=0.40 \
-  --accept_lin_ratio=0.55 \
-  --accept_wz_ratio=0.55 \
-  --accept_yaw_tilt_bound=0.60 \
-  --accept_yaw_tilt_ratio=0.70 \
-  --accept_diag_sign_ratio=0.70 \
-  --accept_diag_component_ratio=0.50 \
-  --accept_max_fall_rate=0.20 \
-  --accept_skill_pass_ratio=0.60 \
-  --accept_overall_pass_ratio=0.70 \
-  --csv logs/rsl_rl/redrhex_wheg/${RUN5}/eval_command_sweep.csv
-```
+- forward / lateral / diagonal / yaw 四類指標都要有反應
+- 不能只剩其中一種技能表現好
 
 ---
 
-## B8) Play（播放最終模型）
+## 8. Play、匯出、鍵盤控制
 
-先確定抓到的是模型檔，不是 TensorBoard 事件檔：
+## 8.1 播放最新 checkpoint
+
+### 主 task PPO
 
 ```bash
-RUN5=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/*stage5* | head -1)")
-FINAL_CKPT=$(ls -v "logs/rsl_rl/redrhex_wheg/$RUN5"/model_*.pt | tail -1)
-echo "RUN5=$RUN5"
-echo "FINAL_CKPT=$FINAL_CKPT"
-basename "$FINAL_CKPT"   # 必須是 model_xxxxx.pt
+RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg/* | head -1)")
+CKPT=$(ls -v logs/rsl_rl/redrhex_wheg/$RUN/model_*.pt | tail -1)
+
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --load_run "$RUN" \
+  --checkpoint "$CKPT"
 ```
 
-建議先用 `stop` 起步，再用鍵盤切換方向（較安全）：
+### ForwardFast PPO
+
+```bash
+RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_forward_fast/* | head -1)")
+CKPT=$(ls -v logs/rsl_rl/redrhex_forward_fast/$RUN/model_*.pt | tail -1)
+
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-ForwardFast-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --load_run "$RUN" \
+  --checkpoint "$CKPT"
+```
+
+你也可以直接傳絕對路徑：
 
 ```bash
 python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --num_envs=64 \
-  --initial_command=stop \
-  --checkpoint="$FINAL_CKPT"
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --checkpoint /absolute/path/to/model_xxxxx.pt
 ```
 
-Headless 錄影：
-
-```bash
-python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --headless \
-  --video \
-  --video_length=1000 \
-  --num_envs=64 \
-  --initial_command=stop \
-  --checkpoint="$FINAL_CKPT"
-```
-
-若你要先排除鍵盤控制干擾（直接看模型在訓練命令分佈下的行為）：
-
-```bash
-python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-Direct-v0 \
-  --num_envs=64 \
-  --disable_keyboard_control \
-  --checkpoint="$FINAL_CKPT"
-```
-
-註：
-- `play.py` 會自動從 checkpoint 路徑推斷 `env.stage`（例如 `..._stage4/...` 會自動用 stage4 設定）
-- 若你要手動固定 stage，可加 `--disable_auto_stage_from_checkpoint` 再用 Hydra 覆寫（例：`env.stage=5`）
-- `play.py` 現在若你誤傳 `events.out.tfevents...`，會自動嘗試改抓同資料夾 `model_*.pt`
-
-注意：`--checkpoint` 只能是一個完整路徑，不要把兩段路徑黏在一起。
-
-檢查檔案是否正確：
-
-```bash
-test -f "$FINAL_CKPT" && echo "checkpoint exists"
-basename "$FINAL_CKPT"   # 應該是 model_xxxxx.pt
-```
-
-如果你是從 pipeline log 取得最終模型，也請用這種方式：
+如果你是從五階段 pipeline 完成後要抓最終模型，原本手冊這段仍然很好用：
 
 ```bash
 PIPE_LOG=$(ls -t logs/rsl_rl/pipeline/*.log | head -1)
 FINAL_CKPT=$(grep -F "[DONE] FINAL_CKPT=" "$PIPE_LOG" | tail -1 | sed 's/.*FINAL_CKPT=//')
+echo "PIPE_LOG=$PIPE_LOG"
 echo "FINAL_CKPT=$FINAL_CKPT"
+basename "$FINAL_CKPT"
 ```
 
----
+如果 `basename "$FINAL_CKPT"` 不是 `model_xxxxx.pt`，就不要直接拿去 play。
 
-## C) 共用常見問題（FAQ）
+## 8.2 Play 的實用行為
 
-## Q1: Stage1 訓練完就中斷（`rg: 指令找不到`）
-- 原因：舊 pipeline 健康檢查解析依賴 `rg`
-- 現況：已改為 `rg` 不存在時自動 fallback `grep`
+- 若 `--checkpoint` 是資料夾，會自動抓其中最新 `model_*.pt`
+- 若 `--checkpoint` 指到 `events.out.tfevents...` 或 `exported/policy.pt`，會自動嘗試 fallback 到相鄰的訓練 checkpoint
+- 若 run 名稱像 `..._stage4`，`play.py` 會自動把 `env.stage` 推成 4
+- 若你不想讓它自動推 stage，可以加 `--disable_auto_stage_from_checkpoint`
+- 每次 `play.py` 成功載入模型後，都會自動匯出：
+  - `exported/policy.pt`
+  - `exported/policy.onnx`
 
-## Q2: `stage=1` 覆寫失敗
-- 要用 `env.stage=1`（不是 `stage=1`）
-
-## Q3: `play.py` 找不到 checkpoint
-- 請先 `echo "$FINAL_CKPT"` 確認只是一條路徑
-- 再把同一條路徑傳給 `--checkpoint`
-- 若看到 `FileNotFoundError: Unable to find the file: model_xxxx.pt`
-  表示你只傳了檔名；請改傳完整路徑（例如 `logs/rsl_rl/.../model_1199.pt`）
-
-## Q4: `omni.platforminfo` CPU 錯誤很多
-- 多數情況是平台偵測告警，不是主因
-- 優先看：是否一出生就 `terminated`、是否 base height 崩掉
-
-## Q5: `play.py` 報錯 `UnpicklingError: invalid load key, 'H'`
-- 原因：`--checkpoint` 指到非模型檔（通常是 `events.out.tfevents...`）
-- 修正：
-  1. 重新設定 `FINAL_CKPT` 為 `model_*.pt`
-  2. `echo "$FINAL_CKPT"` 確認只是一條路徑
-  3. `basename "$FINAL_CKPT"` 必須是 `model_xxxxx.pt`
-  4. 現在 `play.py/eval_command_sweep.py` 已內建 fallback，但仍建議手動確認
-
----
-
-## C1) 建議訓練節奏（避免再浪費整晚）
-
-1. 先跑 GUI precheck（2~5 分鐘）
-2. 再跑 Stage1 500~1000 iter 快篩，確認非出生即死
-3. 通過後再放整晚全 pipeline
-4. 隔天先跑 `eval_command_sweep.py` 再決定是否繼續加訓
-
----
-
-## D) ForwardFast 改版完整說明（教授報告版）
-
-本章是「給教授看的工程說明版」，內容與目前程式碼同步（更新日期：2026-03-16）。
-
-## D1) 問題定義（Sim2Real 現場真實痛點）
-
-實驗室流程不是一次訓練完就成功，而是：
-1. 先在模擬訓練 policy。  
-2. 匯出 ONNX 上機。  
-3. 發現行為偏差後，回頭調 reward/物理參數。  
-4. 再訓練、再上機，反覆迭代。  
-
-原本最大瓶頸是「每輪重訓太久」，尤其在現場調參時效率非常差。
-
----
-
-## D2) 這次做了哪些事情（總覽）
-
-本次改版分成兩個階段：
-
-1. **ForwardFast 路徑建立**  
-- 新增 forward-only task 與專用 env/PPO 設定，目標是快速收斂。
-
-2. **品質修正（解決假收斂）**  
-- 針對你回報的「六腳同轉、趴地死亡循環」做控制器與 reward 機制修正，確保不只是曲線好看，而是真的能走。
-
----
-
-## D3) 程式碼改動清單（檔案層級）
-
-1. `source/RedRhex/RedRhex/tasks/direct/redrhex/__init__.py`  
-- 新增 task：`Template-Redrhex-ForwardFast-Direct-v0`
-
-2. `source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py`  
-- 新增 `RedrhexForwardFastEnvCfg`（forward-only 快速訓練配置）
-- 補上 play 相容參數（舊 checkpoint 在新版控制器下更穩定）
-
-3. `source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py`  
-- 修正 forward bias 相位邏輯（duty-time scheduling）
-- 新增健康姿態 reward gate（避免趴地拿分）
-
-4. `source/RedRhex/RedRhex/tasks/direct/redrhex/agents/rsl_rl_ppo_cfg.py`  
-- 新增 `PPORunnerForwardFastCfg` 並做穩定化調整
-
-5. `scripts/rsl_rl/play.py`  
-- 新增 checkpoint 路徑相容：`--load_run <run> --checkpoint model_xxxx.pt` 可自動組出完整路徑  
-- 失配檔案時自動 fallback 到 `model_*.pt`
-
-6. 文件更新  
-- `docs/redrhex_train_play_guide.md`（本文件）
-- `docs/redrhex_forwardfast_professor_report.md`（獨立報告）
-
----
-
-## D4) ForwardFast 主要設計（做法與理由）
-
-### D4.1) 任務降維（只保留直走）
-
-關鍵設定（`RedrhexForwardFastEnvCfg`）：
-- `stage=1`
-- `curriculum_auto_progress=False`
-- `lin_vel_x_range=[0.20, 0.32]`
-- `lin_vel_y_range=[0.0, 0.0]`
-- `ang_vel_z_range=[0.0, 0.0]`
-
-理由：
-- 現場目標是「先打通直走」，不是一次解完整四技能。
-- 把命令分布縮窄，能顯著提高樣本效率。
-
-### D4.2) 控制器改成更穩定的 tripod 節奏
-
-在 `redrhex_env.py`，forward bias 的 `desired_in_stance` 由固定角窗改為 duty-time：
-- `desired_cycle < duty_target`
-
-理由：
-- 直接按照 duty 比例（例如 65/35）去排時間，較不容易出現六腳同相亂轉。
-
-### D4.3) 加入「健康狀態才給正向獎勵」
-
-新增：
-- `gate_positive_rewards_when_unhealthy=True`
-- `reward_gate_min_base_height=0.105`
-- `reward_gate_max_body_tilt=0.70`
-
-機制：
-- 當 base 高度太低或 body tilt 太大時，forward/tracking/gait 等正向獎勵會被 gate。
-
-理由：
-- 防止策略學到「趴地抖腿也有分」的 reward hacking。
-
-### D4.4) 終止與倒地懲罰提早介入
-
-關鍵設定：
-- `max_tilt_magnitude=0.75`
-- `body_contact_height_threshold=0.090`
-- `body_contact_tilt_threshold=0.72`
-- `termination_grace_steps=4`
-- `fall=-24.0`
-- `fall_height_threshold=0.11`
-- `fall_tilt_threshold=0.75`
-
-理由：
-- 讓低價值軌跡更快結束，把訓練預算留給可行步態。
-
-### D4.5) 動作激進度下修，起步更平順
-
-關鍵設定：
-- `main_drive_vel_scale=5.8`
-- `main_drive_residual_scale=0.07`
-- `stage_forward_policy_drive_residual_scale=[0.03]`
-- `stage_action_warmup_steps=[120]`
-
-理由：
-- 降低 reset 後大動作衝擊，減少起步翻倒。
-
----
-
-## D5) PPO 設定（快速收斂但不失穩）
-
-`PPORunnerForwardFastCfg`：
-- `max_iterations=1500`
-- `num_steps_per_env=32`
-- `init_noise_std=0.30`
-- `learning_rate=4.0e-4`
-- `entropy_coef=0.0010`
-- `desired_kl=0.008`
-
-理由：
-- 降低初期過度探索與策略抖動。
-- 用更平穩更新把「會走」放在「只看曲線快升」之前。
-
----
-
-## D6) 為什麼這樣改（方法論）
-
-我們不是單純「加獎勵」，而是按優先順序做三層修正：
-
-1. **控制器層**：先保證產生合理 gait 的可行空間。  
-2. **獎勵層**：再用 gate 阻止不健康行為拿分。  
-3. **優化層**：最後調 PPO，避免在壞策略附近亂晃。  
-
-這比單純堆高某個 reward weight 更穩，也比較符合你希望的「盡量保留原始獎勵精神」。
-
----
-
-## D7) 現場操作 SOP（Train / TensorBoard / Play）
-
-### 訓練
-
-```bash
-python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --headless \
-  --num_envs=2048 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_trial_a
-```
-
-### TensorBoard
-
-```bash
-tensorboard --logdir . --port 6006 --bind_all
-```
-
-### Play（可直接吃完整 checkpoint 路徑）
+## 8.3 只匯出，不進入 play 迴圈
 
 ```bash
 python scripts/rsl_rl/play.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
-  --num_envs=64 \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 1 \
   --disable_keyboard_control \
-  --load_run="$RUN" \
-  --checkpoint="$CKPT"
+  --checkpoint /absolute/path/to/model_xxxxx.pt \
+  --export_policy
+```
+
+## 8.4 關閉鍵盤控制
+
+如果你想看模型在環境命令採樣下自然表現，不要手動切指令：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --disable_keyboard_control \
+  --checkpoint /absolute/path/to/model_xxxxx.pt
+```
+
+## 8.5 開啟鍵盤控制時可用的初始命令
+
+`--initial_command` 可選：
+
+- `forward`
+- `backward`
+- `left`
+- `right`
+- `diag_left`
+- `diag_right`
+- `yaw_ccw`
+- `yaw_cw`
+- `stop`
+
+初次使用建議：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --checkpoint /absolute/path/to/model_xxxxx.pt
+```
+
+## 8.6 鍵盤對應
+
+鍵盤控制是切換模式，不是按住才有作用。按一次就會維持該命令，直到你按下一個按鍵。
+
+| 按鍵 | 命令 |
+|---|---|
+| `W` | 前進 |
+| `S` | 後退 |
+| `A` | 左移 |
+| `D` | 右移 |
+| `T` | 左前 |
+| `R` | 右前 |
+| `F` | 左後 |
+| `G` | 右後 |
+| `Q` | 逆時針旋轉 |
+| `E` | 順時針旋轉 |
+| `Space` | 停止 |
+
+注意：
+
+- Isaac Sim 視窗必須是焦點視窗
+- 如果你發現按鍵沒反應，先點一下 Isaac Sim 視窗再試
+
+## 8.7 Headless 錄影
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --video \
+  --video_length 1000 \
+  --num_envs 64 \
+  --disable_keyboard_control \
+  --checkpoint /absolute/path/to/model_xxxxx.pt
 ```
 
 ---
 
-## D8) 驗證指標（教授可直接看）
+## 9. 評估與驗收
 
-最重要不是「有收斂」，而是「收斂到可上機行為」。
+## 9.1 `validate_reform_stack.py`
 
-建議看：
-1. `Train/mean_episode_length`：應穩定上升。  
-2. `Episode_Termination/terminated`：要下降。  
-3. `Episode_Reward/rew_fall`：負值幅度要收斂。  
-4. `Episode_Reward/diag_base_height`：不能長期下滑。  
-5. `Episode_Reward/rew_forward_gait` + `diag_forward_duty_ema`：tripod 節奏要穩。  
+這是改革後最基礎的健康檢查。
 
-判讀原則：
-- 若 `mean_reward` 上升但 `terminated` 不降，屬於假收斂，不可直接上機。
+### 只做 random rollout smoke
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32
+```
+
+### 加做 1 iteration PPO smoke
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32 \
+  --runner_smoke \
+  --runner_steps 8
+```
+
+### 加做 teacher + distillation smoke
+
+```bash
+python scripts/rsl_rl/validate_reform_stack.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 32 \
+  --steps 32 \
+  --runner_smoke \
+  --distill_smoke \
+  --runner_steps 8 \
+  --distill_steps 8 \
+  --log_dir /tmp/redrhex_reform_smoke
+```
+
+## 9.2 `eval_command_sweep.py`
+
+這個腳本適合做量化驗收，不是只靠肉眼看 play。
+
+### 主 task 最終 mixed 驗收
+
+```bash
+python scripts/rsl_rl/eval_command_sweep.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 256 \
+  --checkpoint /absolute/path/to/model_xxxxx.pt \
+  --eval_profile stage5
+```
+
+如果你要沿用原本那套比較嚴格的 Stage5 驗收門檻，可以直接用這個版本：
+
+```bash
+python scripts/rsl_rl/eval_command_sweep.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 256 \
+  --checkpoint /absolute/path/to/model_xxxxx.pt \
+  --eval_profile stage5 \
+  --warmup_steps 120 \
+  --sweep_steps 600 \
+  --accept_duration_s 2.0 \
+  --accept_vx_abs 0.15 \
+  --accept_vy_abs 0.15 \
+  --accept_wz_abs 0.40 \
+  --accept_lin_ratio 0.55 \
+  --accept_wz_ratio 0.55 \
+  --accept_yaw_tilt_bound 0.60 \
+  --accept_yaw_tilt_ratio 0.70 \
+  --accept_diag_sign_ratio 0.70 \
+  --accept_diag_component_ratio 0.50 \
+  --accept_max_fall_rate 0.20 \
+  --accept_skill_pass_ratio 0.60 \
+  --accept_overall_pass_ratio 0.70
+```
+
+### 輸出 CSV
+
+```bash
+python scripts/rsl_rl/eval_command_sweep.py \
+  --task Template-Redrhex-Direct-v0 \
+  --headless \
+  --num_envs 256 \
+  --checkpoint /absolute/path/to/model_xxxxx.pt \
+  --eval_profile stage5 \
+  --csv logs/rsl_rl/redrhex_wheg/eval_command_sweep.csv
+```
+
+`--eval_profile` 常用值：
+
+- `stage1`
+- `stage2`
+- `stage3`
+- `stage4`
+- `stage5`
+- `full`
 
 ---
 
-## D9) 目前狀態與限制
+## 10. 恢復訓練與常用參數
 
-已完成：
-1. ForwardFast task + env + PPO + play 相容修正皆已落地。  
-2. `play.py` 的 checkpoint 常見錯誤已處理（basename / event 檔誤傳）。  
-3. 文件與指令已同步到目前程式版本。  
-
-限制：
-1. ForwardFast 是現場快迭代工具，不是多技能最終模型。  
-2. 仍需實機回饋資料持續微調。  
-
----
-
-## D10) 報告給教授的建議講法（可直接拿去用）
-
-1. 問題：現場 Sim2Real 需要高頻迭代，原多技能訓練週期太慢。  
-2. 解法：建立 ForwardFast 任務，把問題降維到 forward-only。  
-3. 成果：訓練週期縮短，且新增反作弊機制，避免「趴地也算收斂」。  
-4. 核心技術：Stage1-reference stance 控制 + 健康姿態 gate（功能保留）+ 穩定化 PPO。  
-5. 下一步：白天 ForwardFast 校參，夜間再接五階段整合。  
-
----
-
-## D11) 對應獨立報告檔
-
-詳細版請看：
-- `docs/redrhex_forwardfast_professor_report.md`
-
-## D12) 第二輪更新（v2.1，現在請以這版為準）
-
-你最新回報「更不好動、起步後仍六腳同轉趴地」後，我們做了第二輪回調。  
-這一輪的核心不是再加懲罰，而是 **回到原本五階段 Stage1 已驗證成功的控制骨架**，只保留 ForwardFast 的加速訓練優勢。
-
-最終重點：
-1. 控制器 stance 判定回退到原 Stage1：
-- `desired_in_stance = self._in_stance_phase(desired_phase)`
-
-2. ForwardFast 參數回到 Stage1 風格：
-- `curriculum_stage_scales=[0.05]`
-- `lin_vel_x_range=[0.22, 0.42]`
-- `main_drive_vel_scale=8.0`
-- `stage_forward_policy_drive_residual_scale=[0.10]`
-- `stage_action_warmup_steps=[30]`
-
-3. 終止條件從過嚴回到穩定區：
-- `stage1_min_base_height=0.03`
-- `stage1_body_contact_height_threshold=0.06`
-- `stage_body_contact_tilt_threshold=[1.80]`
-- `stage_termination_grace_steps=[120]`
-
-4. PPO 恢復探索能力：
-- `num_steps_per_env=24`
-- `init_noise_std=0.55`
-- `entropy_coef=0.0035`
-- `learning_rate=5.0e-4`
-- `desired_kl=0.01`
-
-目前推薦的重訓入口：
+## 10.1 一般 resume
 
 ```bash
 python scripts/rsl_rl/train.py \
-  --task=Template-Redrhex-ForwardFast-Direct-v0 \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
   --headless \
-  --num_envs=2048 \
-  --max_iterations=1500 \
-  --run_name=forward_fast_stage1ref_v1
+  --num_envs 2048 \
+  --resume \
+  --load_run <run 名稱> \
+  --checkpoint model_xxxxx.pt
 ```
+
+## 10.2 policy-only resume
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --resume \
+  --resume_policy_only \
+  --reset_action_std 0.8 \
+  --load_run <run 名稱> \
+  --checkpoint model_xxxxx.pt
+```
+
+## 10.3 常用 train 參數
+
+| 參數 | 用途 |
+|---|---|
+| `--task` | 選 task |
+| `--agent` | 選 PPO / teacher / distill 入口 |
+| `--num_envs` | 環境數量 |
+| `--max_iterations` | 訓練迭代數 |
+| `--resume` | 從既有 checkpoint 繼續 |
+| `--load_run` | 要從哪個 run 繼續 |
+| `--checkpoint` | 指定 `model_*.pt` |
+| `--resume_policy_only` | 只載 policy，不載 optimizer |
+| `--reset_action_std` | 搭配 policy-only 時重新設 action std |
+| `env.stage=<1..5>` | 指定主 task 的 curriculum stage |
+
+---
+
+## 11. 這次改革後，操作上有什麼實際變化
+
+這一段專門講「你現在操作這個專案時，和舊版相比，哪些地方不同」。
+
+### 11.1 現在不是只有單一 observation
+
+環境現在會同時提供：
+
+- `policy`
+- `history`
+- `critic`
+- `teacher`
+
+這帶來的操作差異是：
+
+- 一般 PPO 直接用 `rsl_rl_cfg_entry_point`
+- teacher PPO 要改成 `rsl_rl_teacher_cfg_entry_point`
+- distillation 要改成 `rsl_rl_distillation_cfg_entry_point`
+
+### 11.2 現在有 asymmetric critic
+
+所以你不需要另外手改 train 腳本來分 actor/critic input，配置已經在 agent cfg 中接好。
+
+### 11.3 現在有 symmetry augmentation
+
+這已經在 PPO cfg 中啟用，不需要你額外傳旗標。
+
+### 11.4 現在有 rough terrain、actuator randomization、fault injection
+
+這些已經在主 task 環境裡。代表：
+
+- 主 task 的訓練難度比舊版平地 baseline 更高
+- 但理論上更接近真機部署需求
+- 如果你只是想先快速看到「會往前走」，請先用 ForwardFast
+
+### 11.5 `play.py` 現在會自動匯出 policy
+
+所以現在一般流程可以簡化成：
+
+1. train
+2. play 一次
+3. 直接去該 run 的 `exported/` 取 `policy.onnx` 或 `policy.pt`
+
+不需要再另外寫一支 export script。
+
+---
+
+## 12. 最容易踩的坑
+
+## 12.1 把 TensorBoard 檔案當 checkpoint
+
+錯誤示範：
+
+- `events.out.tfevents...`
+- `params/agent.yaml`
+- `exported/policy.pt`
+
+正確做法：
+
+- 傳 `model_*.pt`
+
+## 12.2 `--checkpoint` 只給檔名，但沒給 `--load_run`
+
+如果你只傳：
+
+```bash
+--checkpoint model_2500.pt
+```
+
+那通常還要搭配：
+
+```bash
+--load_run <run 名稱>
+```
+
+否則就直接傳完整絕對路徑。
+
+## 12.3 pipeline 續跑時換了 `--run_tag`
+
+如果你要 `--start_stage 3` 或 `--start_stage 4`，`--run_tag` 必須和前一次一致，否則 pipeline 找不到前一段 run。
+
+## 12.4 `env.stage=1` 寫法錯了
+
+Hydra 覆寫一定要寫：
+
+```bash
+env.stage=1
+```
+
+不是：
+
+```bash
+stage=1
+```
+
+## 12.5 鍵盤沒反應
+
+先確認：
+
+- 你沒有加 `--disable_keyboard_control`
+- Isaac Sim 視窗有被點到
+- 你不是在 headless 模式
+
+## 12.6 `omni.platforminfo` 或 CPU 告警很多
+
+這類訊息很多時候只是平台偵測或環境告警，不一定是主因。先優先檢查：
+
+- 是否一出生就 `terminated`
+- `Episode_Reward/diag_base_height` 是否崩掉
+- 是否是 checkpoint 路徑傳錯
+
+## 12.7 teacher 和 student 混用
+
+記住這個原則：
+
+- 要一般部署：優先用 `rsl_rl_cfg_entry_point`
+- 要做蒸餾上界：先訓 `rsl_rl_teacher_cfg_entry_point`
+- 要可部署的蒸餾學生：用 `rsl_rl_distillation_cfg_entry_point`
+
+## 12.8 distillation 找不到 teacher checkpoint
+
+先檢查三件事：
+
+1. `TEACHER_RUN` 是否真的存在
+2. `TEACHER_CKPT` 是否真的是 `model_*.pt`
+3. 該 run 是否對 distill experiment root 可見
+
+最穩的做法通常是先建立軟連結，再啟動 distillation。
+
+## 12.9 系統沒有 `rg`
+
+原本這曾經是 pipeline 會中斷的原因之一。現在 `train_stage_pipeline.sh` 已經有 `grep` fallback，所以不會因為少了 `rg` 就直接掛掉，但若你自己寫外部腳本，還是建議優先確認 `rg` 是否可用。
+
+---
+
+## 13. 建議工作流
+
+### 情境 A：第一次接觸專案
+
+```text
+validate_reform_stack.py
+-> ForwardFast train
+-> TensorBoard
+-> play.py
+-> exported/policy.onnx
+```
+
+### 情境 B：要做完整 locomotion 能力
+
+```text
+GUI precheck
+-> 5-stage pipeline
+-> eval_command_sweep.py
+-> play.py
+-> exported/policy.onnx
+```
+
+### 情境 C：要研究 teacher-student
+
+```text
+teacher PPO
+-> validate_distillation_stack.py
+-> distillation train
+-> play distill student
+-> exported/policy.onnx
+```
+
+---
+
+## 14. 最後的實務建議
+
+- 先確定 `validate_reform_stack.py` 能過，再開長訓練。
+- 要快速直走，就先用 ForwardFast，不要一開始就硬打完整 mixed task。
+- 要正式完整能力，優先跑五階段 pipeline，不要只靠單段 mixed 硬練。
+- 要做 sim2real 部署，優先使用一般 PPO student 或 distillation student。
+- 每次找到可用模型後，記得去對應 run 目錄確認 `exported/policy.onnx` 是否已經生成。
+- 如果你看到行為很好但數值驗收不清楚，補跑 `eval_command_sweep.py`，不要只靠目視判斷。
+- 一個很實用的節奏是：先 GUI precheck 2 到 5 分鐘，再做短迭代快篩，確認不是出生即死後，再放長訓練或整晚 pipeline。
+
+這份文件未來若再有 train / play / export / validation 流程變更，應優先更新這裡。

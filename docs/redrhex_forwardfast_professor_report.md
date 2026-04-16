@@ -2,7 +2,7 @@
 
 日期：2026-03-16  
 專案：RedRhex Sim2Real 現場快速迭代  
-版本：ForwardFast v2.1（回歸 Stage1 成功邏輯 + anti-collapse 保留）
+版本：ForwardFast v2.2（回歸 Stage1 成功邏輯 + 快收斂驗證）
 
 ---
 
@@ -310,6 +310,71 @@ python scripts/rsl_rl/play.py \
 
 ---
 
-## 10) 給教授的結論句
+## 10) 最新 TensorBoard 結果（v2.2，Stage1-reference 快收斂版）
+
+本輪訓練條件：
+1. Task：`Template-Redrhex-ForwardFast-Direct-v0`  
+2. Iteration：到 `step=1491`  
+3. 時間：`18.63 min`（約 19 分鐘）
+
+### 10.1 指標讀值（你這次提供的圖）
+
+1. `Train/mean_episode_length`  
+- Smoothed：`186.4888`，Value：`182.41`  
+- 解讀：episode 明顯拉長，策略不再是「很快倒地重置」。
+
+2. `Train/mean_reward`  
+- Smoothed：`1168.8815`，Value：`1137.9`  
+- 解讀：整體回報持續增長，且後段不是無序震盪。
+
+3. `Episode_Termination/terminated`  
+- Smoothed：`10.521`，Value：`9.875`  
+- 解讀：終止率相較前段下降，代表可存活步數提升。
+
+4. `Episode_Reward/rew_fall`  
+- Smoothed：`-19.7258`，Value：`-19.6792`  
+- 解讀：雖仍有跌倒懲罰，但已進入較穩定區間，沒有持續惡化。
+
+5. `Episode_Reward/diag_base_height`  
+- 約落在 `0.094~0.095` 並緩升  
+- 解讀：機身高度維持在健康範圍附近，未出現長期塌陷。
+
+6. `Episode_Reward/diag_cmd_vx`  
+- Smoothed：`0.3287`，Value：`0.3291`  
+- 解讀：前進命令跟隨穩定，直走目標一致。
+
+7. `Episode_Reward/rew_tracking`  
+- Smoothed：`31.8764`，Value：`31.6534`  
+- 解讀：速度追蹤能力持續改善。
+
+8. `Episode_Reward/rew_forward_gait`  
+- Smoothed：`13.6738`，Value：`13.6345`  
+- 解讀：前進步態品質有持續提升。
+
+9. `Episode_Reward/diag_forward_duty_ema`  
+- Smoothed：`0.3018`，Value：`0.3022`  
+- 解讀：duty ratio 收斂到穩定帶，tripod 節奏趨於固定。
+
+### 10.2 「點平」解讀（收斂分段）
+
+以曲線形狀可分三段：
+1. `step 0~400`：快速爬升段  
+- `mean_reward`、`mean_episode_length` 斜率大，代表快速學到可行前進策略。
+
+2. `step 400~900`：第一平臺段  
+- 上升趨緩但仍正成長，終止率持續下降，屬於「從會動到穩定動」。
+
+3. `step 900~1491`：第二平臺微增段  
+- 指標波動縮小，主要 KPI 維持高位，顯示模型已進入可部署前的穩定訓練區。
+
+### 10.3 結論（本輪）
+
+1. 這版符合「以原 Stage1 成功邏輯為底，只做快收斂優化」的目標。  
+2. 收斂速度與曲線穩定度達到「成效還行、可用於現場迭代」的標準。  
+3. 下一步不是大改 reward，而是用這版做實機對照，針對真機誤差做小步調參。
+
+---
+
+## 11) 給教授的結論句
 
 本專題已把 Sim2Real 從「慢速大訓練」轉為「可現場快速重訓、快速驗證、可控品質」的工程流程，並且針對假收斂問題完成可重現的技術修正。

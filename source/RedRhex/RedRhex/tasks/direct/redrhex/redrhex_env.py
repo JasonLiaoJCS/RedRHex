@@ -459,6 +459,8 @@ class RedrhexEnv(DirectRLEnv):
             "diag_dr_friction_scale": torch.zeros(self.num_envs, device=self.device),
             "diag_dr_main_strength": torch.zeros(self.num_envs, device=self.device),
             "diag_dr_abad_strength": torch.zeros(self.num_envs, device=self.device),
+            "diag_fault_active": torch.zeros(self.num_envs, device=self.device),
+            "diag_fault_strength": torch.zeros(self.num_envs, device=self.device),
             "diag_obs_latency_steps": torch.zeros(self.num_envs, device=self.device),
             "diag_push_events": torch.zeros(self.num_envs, device=self.device),
             "diag_terrain_level": torch.zeros(self.num_envs, device=self.device),
@@ -517,6 +519,7 @@ class RedrhexEnv(DirectRLEnv):
         self._roll_rms = torch.zeros(self.num_envs, device=self.device)
         self._pitch_rms = torch.zeros(self.num_envs, device=self.device)
         self._yaw_slip_proxy = torch.zeros(self.num_envs, device=self.device)
+        self._current_leg_in_stance = torch.zeros(self.num_envs, 6, dtype=torch.bool, device=self.device)
         # 終止條件狀態（避免 reset 後沿用上一回合的 body contact 狀態）
         self._body_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._body_tilt = torch.zeros(self.num_envs, device=self.device)
@@ -554,6 +557,10 @@ class RedrhexEnv(DirectRLEnv):
         self._friction_scale = torch.ones(self.num_envs, device=self.device)
         self._main_strength_scale = torch.ones(self.num_envs, device=self.device)
         self._abad_strength_scale = torch.ones(self.num_envs, device=self.device)
+        self._main_strength_scale_per_leg = torch.ones(self.num_envs, 6, device=self.device)
+        self._abad_strength_scale_per_leg = torch.ones(self.num_envs, 6, device=self.device)
+        self._fault_mask = torch.zeros(self.num_envs, 6, dtype=torch.bool, device=self.device)
+        self._fault_strength_scale = torch.ones(self.num_envs, 6, device=self.device)
         self._obs_noise_scale = torch.ones(self.num_envs, device=self.device)
         self._terrain_level = torch.zeros(self.num_envs, device=self.device)
 
@@ -563,6 +570,10 @@ class RedrhexEnv(DirectRLEnv):
         obs_history_len = max(1, max_latency + 1)
         self._obs_history = torch.zeros(
             self.num_envs, obs_history_len, self.cfg.observation_space, device=self.device
+        )
+        self._policy_history_length = max(2, int(getattr(self.cfg, "policy_history_length", 5)))
+        self._policy_obs_history = torch.zeros(
+            self.num_envs, self._policy_history_length, self.cfg.observation_space, device=self.device
         )
 
         self._last_push_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -904,6 +915,10 @@ class RedrhexEnv(DirectRLEnv):
             self._friction_scale[env_ids] = 1.0
             self._main_strength_scale[env_ids] = 1.0
             self._abad_strength_scale[env_ids] = 1.0
+            self._main_strength_scale_per_leg[env_ids] = 1.0
+            self._abad_strength_scale_per_leg[env_ids] = 1.0
+            self._fault_mask[env_ids] = False
+            self._fault_strength_scale[env_ids] = 1.0
             self._obs_noise_scale[env_ids] = 1.0
             self._obs_latency_steps[env_ids] = 0
             return
@@ -929,11 +944,41 @@ class RedrhexEnv(DirectRLEnv):
         if getattr(self.cfg, "dr_randomize_actuator_strength", True):
             main_low, main_high = _scaled_range(getattr(self.cfg, "dr_main_actuator_strength_range", [0.85, 1.15]))
             abad_low, abad_high = _scaled_range(getattr(self.cfg, "dr_abad_actuator_strength_range", [0.85, 1.15]))
-            self._main_strength_scale[env_ids] = sample_uniform(main_low, main_high, (len(env_ids),), self.device)
-            self._abad_strength_scale[env_ids] = sample_uniform(abad_low, abad_high, (len(env_ids),), self.device)
+            self._main_strength_scale_per_leg[env_ids] = sample_uniform(
+                main_low, main_high, (len(env_ids), 6), self.device
+            )
+            self._abad_strength_scale_per_leg[env_ids] = sample_uniform(
+                abad_low, abad_high, (len(env_ids), 6), self.device
+            )
         else:
-            self._main_strength_scale[env_ids] = 1.0
-            self._abad_strength_scale[env_ids] = 1.0
+            self._main_strength_scale_per_leg[env_ids] = 1.0
+            self._abad_strength_scale_per_leg[env_ids] = 1.0
+
+        self._fault_mask[env_ids] = False
+        self._fault_strength_scale[env_ids] = 1.0
+        if getattr(self.cfg, "dr_fault_enable", False):
+            stage_fault_scale = float(self._get_stage_value("stage_fault_probability_scale", 1.0))
+            fault_prob = float(getattr(self.cfg, "dr_fault_probability", 0.0)) * max(stage_fault_scale, 0.0)
+            if fault_prob > 0.0:
+                fault_env_mask = torch.rand(len(env_ids), device=self.device) < fault_prob
+                fault_env_ids = env_ids[fault_env_mask]
+                if len(fault_env_ids) > 0:
+                    fault_low = max(0.01, float(getattr(self.cfg, "dr_fault_strength_range", [0.15, 0.60])[0]))
+                    fault_high = max(fault_low + 1.0e-3, float(getattr(self.cfg, "dr_fault_strength_range", [0.15, 0.60])[1]))
+                    fault_max_legs = max(1, int(getattr(self.cfg, "dr_fault_max_legs", 1)))
+                    fault_apply_to_abad = bool(getattr(self.cfg, "dr_fault_apply_to_abad", True))
+                    for env_id in fault_env_ids.tolist():
+                        num_fault_legs = int(torch.randint(1, fault_max_legs + 1, (1,), device=self.device).item())
+                        leg_perm = torch.randperm(6, device=self.device)[:num_fault_legs]
+                        fault_scale = sample_uniform(fault_low, fault_high, (num_fault_legs,), self.device)
+                        self._fault_mask[env_id, leg_perm] = True
+                        self._fault_strength_scale[env_id, leg_perm] = fault_scale
+                        self._main_strength_scale_per_leg[env_id, leg_perm] *= fault_scale
+                        if fault_apply_to_abad:
+                            self._abad_strength_scale_per_leg[env_id, leg_perm] *= fault_scale
+
+        self._main_strength_scale[env_ids] = self._main_strength_scale_per_leg[env_ids].mean(dim=1)
+        self._abad_strength_scale[env_ids] = self._abad_strength_scale_per_leg[env_ids].mean(dim=1)
 
         if getattr(self.cfg, "dr_obs_noise_enable", True):
             noise_low = max(0.25, 1.0 - 0.4 * stage_scale)
@@ -1059,6 +1104,48 @@ class RedrhexEnv(DirectRLEnv):
         latency = torch.clamp(self._obs_latency_steps, min=0, max=self._obs_history.shape[1] - 1)
         env_ids = torch.arange(self.num_envs, device=self.device)
         return self._obs_history[env_ids, latency, :]
+
+    def _append_policy_history(self, policy_obs: torch.Tensor) -> None:
+        if policy_obs.shape[-1] != self._policy_obs_history.shape[-1]:
+            self._policy_obs_history = torch.zeros(
+                self.num_envs, self._policy_history_length, policy_obs.shape[-1], device=self.device
+            )
+        self._policy_obs_history = torch.roll(self._policy_obs_history, shifts=1, dims=1)
+        self._policy_obs_history[:, 0, :] = policy_obs
+
+    def _get_history_observations(self) -> torch.Tensor:
+        history = self._policy_obs_history[:, 1:, :]
+        return history.reshape(self.num_envs, -1)
+
+    def _get_privileged_observations(self) -> torch.Tensor:
+        drive_scale = max(float(getattr(self.cfg, "main_drive_vel_scale", 8.0)), 1.0)
+        abad_scale = max(float(getattr(self.cfg, "abad_pos_scale", 0.5)), 1.0e-6)
+        base_height = self.robot.data.root_pos_w[:, 2:3]
+        contact_frac = torch.clamp(self._contact_count.unsqueeze(1) / 6.0, min=0.0, max=1.0)
+
+        privileged_obs = torch.cat(
+            [
+                self._target_drive_vel / drive_scale,
+                self._target_abad_pos / abad_scale,
+                self._current_leg_in_stance.float(),
+                self._main_strength_scale_per_leg,
+                self._abad_strength_scale_per_leg,
+                self._fault_mask.float(),
+                self._mass_scale.unsqueeze(1),
+                self._friction_scale.unsqueeze(1),
+                self._terrain_level.unsqueeze(1),
+                self._dr_stage_scale.unsqueeze(1),
+                contact_frac,
+                self._action_warmup_scale.unsqueeze(1),
+                self._body_tilt.unsqueeze(1),
+                base_height,
+                self._forward_stance_frac_ema.unsqueeze(1),
+                self._forward_vel_ratio_proxy.unsqueeze(1),
+                self._push_events_step.unsqueeze(1),
+            ],
+            dim=-1,
+        )
+        return torch.nan_to_num(privileged_obs, nan=0.0, posinf=10.0, neginf=-10.0)
 
     def _maybe_apply_random_pushes(self) -> None:
         self._push_events_step[:] = 0.0
@@ -1476,6 +1563,8 @@ class RedrhexEnv(DirectRLEnv):
         stance_speed = (signed_speed * stance_mask).sum(dim=1) / stance_mask.sum(dim=1).clamp(min=1.0)
         swing_speed = (signed_speed * swing_mask).sum(dim=1) / swing_mask.sum(dim=1).clamp(min=1.0)
         ratio_proxy = swing_speed / torch.clamp(stance_speed, min=1e-4)
+        ratio_cap = max(float(getattr(self.cfg, "forward_velocity_ratio_cap", 20.0)), 1.0)
+        ratio_proxy = torch.clamp(ratio_proxy, min=0.0, max=ratio_cap)
 
         stance_angle = max(float(getattr(self.cfg, "forward_stance_angle_deg", 60.0)), 1e-3)
         swing_angle = max(float(getattr(self.cfg, "forward_swing_angle_deg", 300.0)), 1e-3)
@@ -1829,7 +1918,7 @@ class RedrhexEnv(DirectRLEnv):
             self._stand_pose_error[:] = 0.0
 
         # Domain randomization：作用在控制層的 proxy
-        final_drive_vel = final_drive_vel * self._main_strength_scale.unsqueeze(1)
+        final_drive_vel = final_drive_vel * self._main_strength_scale_per_leg
         if not self._mass_physical_randomized:
             final_drive_vel = final_drive_vel / torch.clamp(self._mass_scale.unsqueeze(1), min=0.2)
         if not self._friction_physical_randomized:
@@ -1938,7 +2027,7 @@ class RedrhexEnv(DirectRLEnv):
 
         target_abad_pos = target_abad_pos * action_warmup_scale.unsqueeze(1)
         
-        target_abad_pos = target_abad_pos * self._abad_strength_scale.unsqueeze(1)
+        target_abad_pos = target_abad_pos * self._abad_strength_scale_per_leg
         abad_limit = float(
             self._get_stage_value("stage_abad_pos_limit", getattr(self.cfg, "abad_pos_limit", max(float(self.cfg.abad_pos_scale), 0.5)))
         )
@@ -2012,14 +2101,21 @@ class RedrhexEnv(DirectRLEnv):
         # Domain randomization：觀測噪音 + latency
         obs = self._apply_observation_domain_randomization(obs)
 
-        # 【數值保護：防止異常值】
-        # nan = 「不是數字」（計算錯誤時會出現）
-        # inf = 「無限大」（除以零等情況會出現）
-        # 這些異常值會讓神經網路爆炸，所以要處理掉
         obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs = torch.clamp(obs, min=-100.0, max=100.0)  # 限制在合理範圍
+        obs = torch.clamp(obs, min=-100.0, max=100.0)
 
-        return {"policy": obs}
+        self._append_policy_history(obs)
+        history_obs = torch.clamp(self._get_history_observations(), min=-100.0, max=100.0)
+        critic_obs = torch.clamp(self._get_privileged_observations(), min=-100.0, max=100.0)
+        teacher_obs = torch.cat([obs, history_obs, critic_obs], dim=-1)
+        teacher_obs = torch.clamp(torch.nan_to_num(teacher_obs, nan=0.0, posinf=10.0, neginf=-10.0), min=-100.0, max=100.0)
+
+        return {
+            "policy": obs,
+            "history": history_obs,
+            "critic": critic_obs,
+            "teacher": teacher_obs,
+        }
 
     def _update_state(self):
         """更新內部狀態"""
@@ -2571,6 +2667,8 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_dr_friction_scale"] += self._friction_scale
         self.episode_sums["diag_dr_main_strength"] += self._main_strength_scale
         self.episode_sums["diag_dr_abad_strength"] += self._abad_strength_scale
+        self.episode_sums["diag_fault_active"] += self._fault_mask.any(dim=1).float()
+        self.episode_sums["diag_fault_strength"] += self._fault_strength_scale.min(dim=1).values
         self.episode_sums["diag_obs_latency_steps"] += self._obs_latency_steps.float()
         self.episode_sums["diag_push_events"] += self._push_events_step
         self.episode_sums["diag_terrain_level"] += self._terrain_level
@@ -3609,6 +3707,8 @@ class RedrhexEnv(DirectRLEnv):
         self.episode_sums["diag_dr_friction_scale"] += self._friction_scale
         self.episode_sums["diag_dr_main_strength"] += self._main_strength_scale
         self.episode_sums["diag_dr_abad_strength"] += self._abad_strength_scale
+        self.episode_sums["diag_fault_active"] += self._fault_mask.any(dim=1).float()
+        self.episode_sums["diag_fault_strength"] += self._fault_strength_scale.min(dim=1).values
         self.episode_sums["diag_obs_latency_steps"] += self._obs_latency_steps.float()
         self.episode_sums["diag_push_events"] += self._push_events_step
         self.episode_sums["diag_terrain_level"] += self._terrain_level
@@ -3842,7 +3942,13 @@ class RedrhexEnv(DirectRLEnv):
         self._action_warmup_scale[env_ids] = 0.0
         self._push_events[env_ids] = 0.0
         self._push_events_step[env_ids] = 0.0
+        self._current_leg_in_stance[env_ids] = False
         self._obs_history[env_ids] = 0.0
+        self._policy_obs_history[env_ids] = 0.0
+        self._main_strength_scale_per_leg[env_ids] = 1.0
+        self._abad_strength_scale_per_leg[env_ids] = 1.0
+        self._fault_mask[env_ids] = False
+        self._fault_strength_scale[env_ids] = 1.0
 
         # 隨機化步態相位
         self.gait_phase[env_ids] = sample_uniform(0, 2 * math.pi, (num_reset,), device=self.device)

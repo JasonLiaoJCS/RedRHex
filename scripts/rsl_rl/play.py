@@ -53,6 +53,12 @@ parser.add_argument(
     choices=["forward", "backward", "left", "right", "diag_left", "diag_right", "yaw_ccw", "yaw_cw", "stop"],
     help="Initial command when keyboard control is enabled.",
 )
+parser.add_argument(
+    "--export_policy",
+    action="store_true",
+    default=False,
+    help="Export policy (JIT/ONNX) and exit immediately after export.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -527,6 +533,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    print(f"[INFO] Exported JIT policy to: {os.path.join(export_model_dir, 'policy.pt')}")
+    print(f"[INFO] Exported ONNX policy to: {os.path.join(export_model_dir, 'policy.onnx')}")
+
+    if args_cli.export_policy:
+        print("[INFO] --export_policy is set. Exiting after export.")
+        env.close()
+        return
 
     dt = env.unwrapped.step_dt
 
