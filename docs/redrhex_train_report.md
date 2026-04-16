@@ -289,6 +289,83 @@ python scripts/rsl_rl/train.py \
 
 如果這樣就正常很多，通常代表你原本看到的主要是 Stage5 mixed task 的可視化副作用，而不是核心訓練流程壞掉。
 
+### 10.0.3 forward-only baseline -> teacher -> distillation 一條龍流程
+
+如果你要的是正式主 task 的 forward-only 路線，而且想直接照抄完整順序，可以用下面這一套。
+
+**Step 1：進專案並啟動環境**
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+```
+
+**Step 2：train forward-only baseline**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_student \
+  env.stage=1
+```
+
+**Step 3：train forward-only teacher**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_teacher \
+  env.stage=1
+```
+
+**Step 4：抓 teacher checkpoint**
+
+```bash
+TEACHER_RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg_teacher/* | head -1)")
+TEACHER_CKPT=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg_teacher/$TEACHER_RUN/model_*.pt | tail -1)")
+echo "TEACHER_RUN=$TEACHER_RUN"
+echo "TEACHER_CKPT=$TEACHER_CKPT"
+```
+
+**Step 5：建立 distillation 用的 teacher run 連結**
+
+```bash
+mkdir -p logs/rsl_rl/redrhex_wheg_distill
+ln -s ../redrhex_wheg_teacher/$TEACHER_RUN logs/rsl_rl/redrhex_wheg_distill/$TEACHER_RUN
+```
+
+**Step 6：train forward-only distillation student**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --resume \
+  --load_run "$TEACHER_RUN" \
+  --checkpoint "$TEACHER_CKPT" \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 800 \
+  --run_name forward_stage1_distill \
+  env.stage=1
+```
+
+這一條龍的正確順序是：
+
+1. baseline
+2. teacher
+3. distillation
+
+不要先跑 distillation，因為它一定要先有 teacher checkpoint。
+
 ### 10.1 Train（ForwardFast）
 
 ```bash

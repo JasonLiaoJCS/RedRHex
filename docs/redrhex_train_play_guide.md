@@ -1001,6 +1001,92 @@ python scripts/rsl_rl/train.py \
 2. 如果你想要更高上限，再做 forward-only teacher
 3. 最後再做 forward-only student distillation
 
+#### Step 3-B-1：完整照抄版
+
+如果你現在的目標很明確，就是：
+
+- 只做正式 forward-only
+- 保留主 task 的 reward / observation / teacher-student 架構
+- 不走 ForwardFast
+
+那你可以直接照下面這一整段做。
+
+**A. 先進專案並啟動 Isaac Lab 環境**
+
+```bash
+cd ~/RedRhex/RedRhex
+conda activate env_isaaclab
+```
+
+**B. train forward-only baseline student**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_student \
+  env.stage=1
+```
+
+**C. train forward-only privileged teacher**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_teacher_cfg_entry_point \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 2500 \
+  --run_name forward_stage1_teacher \
+  env.stage=1
+```
+
+**D. 找 teacher checkpoint**
+
+```bash
+TEACHER_RUN=$(basename "$(ls -td logs/rsl_rl/redrhex_wheg_teacher/* | head -1)")
+TEACHER_CKPT=$(basename "$(ls -v logs/rsl_rl/redrhex_wheg_teacher/$TEACHER_RUN/model_*.pt | tail -1)")
+echo "TEACHER_RUN=$TEACHER_RUN"
+echo "TEACHER_CKPT=$TEACHER_CKPT"
+```
+
+**E. 讓 distillation 可以讀到 teacher run**
+
+```bash
+mkdir -p logs/rsl_rl/redrhex_wheg_distill
+ln -s ../redrhex_wheg_teacher/$TEACHER_RUN logs/rsl_rl/redrhex_wheg_distill/$TEACHER_RUN
+```
+
+如果你之前已經建過同名連結，`ln -s` 可能會顯示檔案已存在。  
+這時先確認它指向的是正確的 teacher run，再決定要不要手動刪掉舊連結重建。
+
+**F. 啟動 forward-only student distillation**
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --resume \
+  --load_run "$TEACHER_RUN" \
+  --checkpoint "$TEACHER_CKPT" \
+  --headless \
+  --num_envs 2048 \
+  --max_iterations 800 \
+  --run_name forward_stage1_distill \
+  env.stage=1
+```
+
+這整套流程的順序不要顛倒：
+
+1. 先 train baseline
+2. 再 train teacher
+3. 最後才做 distillation
+
+因為 distillation 需要先有 teacher checkpoint 可以模仿。
+
 #### Step 4：如果你要正式完整訓練
 
 不要只停在單段 `train.py`，而是改跑：
