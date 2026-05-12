@@ -520,6 +520,36 @@ python scripts/rsl_rl/play.py \
   --checkpoint "$CKPT"
 ```
 
+這一段只適用於：
+
+- 一般 PPO run
+- 也就是 `logs/rsl_rl/redrhex_wheg/...` 下面的 checkpoint
+- 對應 agent 是 `rsl_rl_cfg_entry_point`
+
+**重要：`play.py` 的 `--agent` 必須和 checkpoint 類型對上。**
+
+- 如果 checkpoint 來自一般 PPO：
+  - 用 `--agent rsl_rl_cfg_entry_point`
+- 如果 checkpoint 來自 teacher PPO：
+  - 用 `--agent rsl_rl_teacher_cfg_entry_point`
+- 如果 checkpoint 來自 distillation：
+  - 用 `--agent rsl_rl_distillation_cfg_entry_point`
+
+如果你拿：
+
+- `redrhex_wheg_distill/.../model_*.pt`
+
+卻配：
+
+- `--agent rsl_rl_cfg_entry_point`
+
+那就會在載入時看到：
+
+- `Missing key(s): actor.* / critic.*`
+- `Unexpected key(s): student.* / teacher.*`
+
+因為一般 PPO runner 期待的是 `actor/critic` 權重，但 distillation checkpoint 裡存的是 `student/teacher` 權重。
+
 ### Terminal 3：只匯出 policy，不播放
 
 ```bash
@@ -1078,6 +1108,42 @@ python scripts/rsl_rl/train.py \
   --run_name forward_stage1_distill \
   env.stage=1
 ```
+
+**G. 為什麼這裡只用 teacher checkpoint，沒有用舊 student checkpoint？**
+
+這是目前這套 distillation 流程的**刻意設計**，不是漏掉。
+
+原因是底層 `DistillationRunner` / `StudentTeacher` 的載入規則本來就是：
+
+- 如果載入的是一般 PPO checkpoint（裡面主要是 `actor.*` / `actor_obs_normalizer.*`）
+  - 這些權重會被轉成 **teacher network**
+  - student 會重新隨機初始化
+  - 這代表「開始一個新的 distillation 訓練」
+- 如果載入的是**舊的 distillation checkpoint**（裡面有 `student.*` / `teacher.*`）
+  - 才會同時載入 student 與 teacher
+  - 這代表「續跑既有 distillation 訓練」
+
+所以：
+
+- 用 `forward_stage1_teacher` 的 checkpoint 來開 `forward_stage1_distill`
+  - 是合理的
+  - 代表「拿 teacher 當 supervision，重新訓一個 student」
+- 你之前訓好的一般 PPO student checkpoint
+  - **不會**在這條流程裡自動當成 student warm-start
+  - 如果你直接把一般 PPO student checkpoint 丟給 distillation loader，它會把那個 `actor` 當成 teacher 來讀，不是你想要的「student 初始化」
+
+實務上要這樣分：
+
+1. 你要**開始新的 distillation**
+- 用 teacher PPO checkpoint
+
+2. 你要**續跑舊的 distillation**
+- 用 distillation run 自己產生的 `model_*.pt`
+
+3. 你要「teacher 來自 teacher PPO，但 student 也想從舊 PPO baseline warm-start」
+- 這是**另外一種雙來源初始化需求**
+- 目前這個專案還沒有內建這個功能
+- 如果要做，必須另外改 loader，把 teacher 權重和 student 初始權重分開指定
 
 這整套流程的順序不要顛倒：
 
@@ -2270,6 +2336,74 @@ python scripts/rsl_rl/train.py \
 - 先用 `Template-Redrhex-Direct-v0 + env.stage=1`。
 - 如果你想要更乾淨的可視化起步，再先用 `ForwardFast`。
 - 等 forward-only 看起來合理後，再回去 mixed task 或五階段 curriculum。
+
+## 12.11 `play.py` 的 `--agent` 和 checkpoint 類型不一致
+
+這也是很常見的坑。
+
+例如你拿：
+
+- `logs/rsl_rl/redrhex_wheg_distill/.../model_799.pt`
+
+去跑：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_cfg_entry_point \
+  --checkpoint /abs/path/to/model_799.pt
+```
+
+這通常會報：
+
+- `Missing key(s): actor.* / critic.*`
+- `Unexpected key(s): student.* / teacher.*`
+
+原因不是 checkpoint 壞掉，而是：
+
+- `rsl_rl_cfg_entry_point` 會建立一般 PPO 的 `ActorCritic`
+- 但 distillation checkpoint 裡面存的是 `student` / `teacher` 權重
+
+正確對應如下：
+
+1. 一般 PPO checkpoint
+- `--agent rsl_rl_cfg_entry_point`
+
+2. teacher PPO checkpoint
+- `--agent rsl_rl_teacher_cfg_entry_point`
+
+3. distillation checkpoint
+- `--agent rsl_rl_distillation_cfg_entry_point`
+
+所以你如果要播放 distillation student，應該改成：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --checkpoint /home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_wheg_distill/2026-04-16_18-58-00_forward_stage1_distill/model_799.pt
+```
+
+如果你已經知道 `load_run` 和 `checkpoint` 檔名，也可以寫成：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --agent rsl_rl_distillation_cfg_entry_point \
+  --num_envs 64 \
+  --initial_command stop \
+  --load_run 2026-04-16_18-58-00_forward_stage1_distill \
+  --checkpoint model_799.pt
+```
+
+另外像你 log 裡前面那串：
+
+- `omni.platforminfo.plugin failed to retrieve CPU information`
+
+通常不是這次失敗的主因。  
+你這次真正的主因是 checkpoint 結構和 `--agent` 類型不一致。
 
 ---
 

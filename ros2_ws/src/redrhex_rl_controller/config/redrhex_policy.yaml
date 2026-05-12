@@ -1,0 +1,53 @@
+redrhex_rl_controller:
+  ros__parameters:
+    policy:
+      onnx_path: "/home/jetson/redrhex_models/policy.onnx"
+      use_cuda: false
+      use_tensorrt: false
+      expected_obs_dim: 56
+      expected_action_dim: 12
+      policy_hz: 0.0  # 0 means use repo-derived 125 Hz: sim.dt(1/250) * decimation(2)
+      allow_history_dim: true
+
+    observation:
+      base_lin_vel_source: "zero"  # TODO: switch to odom/leg estimator before locomotion.
+      odom_twist_in_body_frame: true
+      policy_history_length: 5
+
+    state_machine:
+      enable_policy_on_start: false
+      init_stand_duration_s: 2.0
+      warmup_duration_s: 1.0
+
+    safety:
+      max_abs_roll_rad: 0.7
+      max_abs_pitch_rad: 0.7
+      cmd_timeout_s: 0.25
+      sensor_timeout_s: 0.10
+      motor_feedback_timeout_s: 0.25
+      heartbeat_timeout_s: 0.10
+      require_motor_feedback: false
+      require_lowlevel_heartbeat: false
+      action_clip: 1.0
+      main_drive_vel_limit_rad_s: 30.0
+      abad_pos_limit_rad: 0.7
+      max_motor_temperature_c: 70.0
+      max_motor_current_a: 20.0
+      max_control_loop_dt_s: 0.03
+      main_drive_slew_rate_rad_s2: 120.0
+      abad_slew_rate_rad_s: 6.0
+
+    action:
+      include_damper_command: true
+      # INIT_STAND uses position-style kp/kd for main drive so the robot can
+      # return to the IsaacLab reset pose before velocity-control policy takeover.
+      stand_main_drive_kp: [12.0, 12.0, 12.0, 12.0, 12.0, 12.0]
+      stand_main_drive_kd: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    commands:
+      vx_min: 0.0
+      vx_max: 0.56
+      vy_min: -0.60
+      vy_max: 0.60
+      wz_min: -0.70
+      wz_max: 0.70

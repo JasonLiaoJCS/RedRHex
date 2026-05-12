@@ -358,6 +358,28 @@ python scripts/rsl_rl/train.py \
   env.stage=1
 ```
 
+**補充：為什麼 distillation 只讀 teacher checkpoint？**
+
+這不是漏掉，而是目前底層 loader 的既定行為。
+
+- 一般 PPO checkpoint 內的 `actor.*` 權重，會被 distillation loader 視為 **teacher**
+- student 會重新初始化
+- 這表示「開始新的蒸餾學生」
+
+只有在你載入的是**舊的 distillation checkpoint** 時，因為裡面同時有 `student.*` / `teacher.*`，系統才會真的把 student 和 teacher 一起恢復。
+
+所以要這樣理解：
+
+1. teacher PPO checkpoint
+- 用來開一個新的 distillation student
+
+2. distillation checkpoint
+- 用來續跑既有 distillation
+
+3. 一般 PPO baseline student checkpoint
+- 目前不會自動變成 distillation student 的 warm-start
+- 如果硬拿去給 distillation loader，它會被當成 teacher 讀入
+
 這一條龍的正確順序是：
 
 1. baseline

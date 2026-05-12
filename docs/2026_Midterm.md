@@ -1219,6 +1219,28 @@ python scripts/rsl_rl/train.py \
   env.stage=1
 ```
 
+**補充：為什麼這裡不直接用舊的 baseline student checkpoint？**
+
+因為目前 distillation runner 的 checkpoint 載入語意是：
+
+- 一般 PPO checkpoint 的 `actor.*` 權重會被視為 teacher 權重
+- student 會重新初始化
+- 因此 teacher PPO checkpoint 的用途是「啟動新的 distillation student」
+
+只有在載入的是既有的 distillation checkpoint 時，因為檔案裡同時有 `student.*` 和 `teacher.*`，系統才會恢復舊 student，這才叫真正的續跑。
+
+也就是說：
+
+1. teacher PPO checkpoint
+- 用來開新的蒸餾學生
+
+2. distillation checkpoint
+- 用來續跑既有蒸餾
+
+3. 舊的 PPO baseline student checkpoint
+- 目前不會被自動當成 distillation student warm-start
+- 若要同時指定 teacher 權重與 student 初始權重，需另外改 loader
+
 這套流程的順序不能顛倒，因為：
 
 1. baseline 是第一個可部署基線

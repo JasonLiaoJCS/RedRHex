@@ -1,0 +1,10 @@
+redrhex_lowlevel_bridge:
+  ros__parameters:
+    backend: "mock"  # mock or serial
+    feedback_rate_hz: 50.0
+    mock:
+      print_every_n: 50
+    serial:
+      port: "/dev/ttyUSB0"
+      baudrate: 921600
+      timeout_s: 0.005
