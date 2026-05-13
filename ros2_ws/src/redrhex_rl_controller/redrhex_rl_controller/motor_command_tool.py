@@ -22,12 +22,12 @@ from . import redrhex_contract as C
 def _base_command(enable: bool, mode: int) -> RedRhexMotorCommand:
     msg = RedRhexMotorCommand()
     msg.header.frame_id = "redrhex_base"
-    msg.joint_names = C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES + C.DAMPER_JOINT_NAMES
-    msg.target_position_rad = list(C.INIT_MAIN_DRIVE_POS) + list(C.INIT_ABAD_POS) + list(C.INIT_DAMPER_POS)
-    msg.target_velocity_rad_s = [0.0] * 18
-    msg.kp = [12.0] * 6 + [20.0] * 6 + [50.0] * 6
-    msg.kd = [1.0] * 6 + [1.0] * 6 + [2.0] * 6
-    msg.effort_limit_nm = [20.0] * 6 + [3.0] * 6 + [10.0] * 6
+    msg.joint_names = C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES
+    msg.target_position_rad = list(C.INIT_MAIN_DRIVE_POS) + list(C.INIT_ABAD_POS)
+    msg.target_velocity_rad_s = [0.0] * 12
+    msg.kp = [0.0] * 6 + [20.0] * 6
+    msg.kd = [1.0] * 6 + [1.0] * 6
+    msg.effort_limit_nm = [20.0] * 6 + [3.0] * 6
     msg.enable = bool(enable)
     msg.mode = int(mode)
     return msg
@@ -43,9 +43,9 @@ class MotorCommandTool(Node):
         msg = _base_command(enable=self.args.enable, mode=self.args.mode_id)
         if self.args.mode == "disable":
             msg.enable = False
-            msg.kp = [0.0] * 18
-            msg.kd = [0.0] * 18
-            msg.target_velocity_rad_s = [0.0] * 18
+            msg.kp = [0.0] * 12
+            msg.kd = [0.0] * 12
+            msg.target_velocity_rad_s = [0.0] * 12
         elif self.args.mode == "init-stand":
             pass
         elif self.args.mode == "single-abad":
@@ -160,8 +160,9 @@ def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.mode == "list-joints":
-        for idx, name in enumerate(C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES + C.DAMPER_JOINT_NAMES):
+        for idx, name in enumerate(C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES):
             print(f"{idx:02d}: {name}")
+        print("Damper joints are simulated spring legs only on real hardware; no motor command is sent.")
         return
     if args.enable and not args.confirm_risk:
         raise SystemExit("Refusing --enable without --confirm-risk. Keep E-stop in hand and rerun intentionally.")

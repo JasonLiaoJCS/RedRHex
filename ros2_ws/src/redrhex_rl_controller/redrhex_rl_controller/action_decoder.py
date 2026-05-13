@@ -43,7 +43,8 @@ class ActionDecoder:
         self.main_drive_joint_names = list(self.cfg.get("main_drive_joint_names", C.MAIN_DRIVE_JOINT_NAMES))
         self.abad_joint_names = list(self.cfg.get("abad_joint_names", C.ABAD_JOINT_NAMES))
         self.damper_joint_names = list(self.cfg.get("damper_joint_names", C.DAMPER_JOINT_NAMES))
-        self.include_damper_command = bool(self.cfg.get("include_damper_command", True))
+        self.include_damper_command = bool(self.cfg.get("include_damper_command", False))
+        self.main_drive_init_control_mode = str(self.cfg.get("main_drive_init_control_mode", "velocity_to_pose"))
 
         self.direction_multiplier = np.asarray(
             self.cfg.get("leg_direction_multiplier", C.LEG_DIRECTION_MULTIPLIER), dtype=np.float64
@@ -67,6 +68,10 @@ class ActionDecoder:
         self.main_kd = np.asarray(self.cfg.get("main_drive_kd", [50.0] * 6), dtype=np.float64)
         self.stand_main_kp = np.asarray(self.cfg.get("stand_main_drive_kp", [12.0] * 6), dtype=np.float64)
         self.stand_main_kd = np.asarray(self.cfg.get("stand_main_drive_kd", [1.0] * 6), dtype=np.float64)
+        self.init_stand_main_drive_position_gain = float(
+            self.cfg.get("init_stand_main_drive_position_gain", 3.0)
+        )
+        self.init_stand_max_main_drive_vel = float(self.cfg.get("init_stand_max_main_drive_vel_rad_s", 1.5))
         self.abad_kp = np.asarray(self.cfg.get("abad_kp", [40.0] * 6), dtype=np.float64)
         self.abad_kd = np.asarray(self.cfg.get("abad_kd", [4.0] * 6), dtype=np.float64)
         self.damper_kp = np.asarray(self.cfg.get("damper_kp", [200.0] * 6), dtype=np.float64)
@@ -219,6 +224,10 @@ class ActionDecoder:
             raise ValueError("abad_pos_limit must be positive")
         if self.main_drive_slew_rate <= 0.0 or self.abad_slew_rate <= 0.0:
             raise ValueError("slew-rate limits must be positive")
+        if self.main_drive_init_control_mode not in ("velocity_to_pose", "position"):
+            raise ValueError("main_drive_init_control_mode must be 'velocity_to_pose' or 'position'")
+        if self.init_stand_main_drive_position_gain <= 0.0 or self.init_stand_max_main_drive_vel <= 0.0:
+            raise ValueError("INIT_STAND main-drive velocity-to-pose gains must be positive")
 
     @staticmethod
     def _resolve_command_modes(command: np.ndarray) -> tuple[bool, bool, bool, bool, int]:
@@ -254,22 +263,40 @@ class ActionDecoder:
             return 1.0
         return float(np.clip((self.step_count + 1.0) / float(self.action_warmup_steps), 0.0, 1.0))
 
-    def init_stand_command(self, enable: bool = True) -> DecodedMotorCommand:
-        main_pos = self._apply_position_hooks(self.init_main_drive_pos, self.main_sign, self.main_zero_offset)
+    def init_stand_command(self, current_main_pos: np.ndarray | None = None, enable: bool = True) -> DecodedMotorCommand:
+        target_main_vel = np.zeros(6, dtype=np.float64)
+        if self.main_drive_init_control_mode == "velocity_to_pose" and current_main_pos is not None:
+            current_main_pos = np.asarray(current_main_pos, dtype=np.float64).reshape(6)
+            pos_error = np.arctan2(
+                np.sin(self.init_main_drive_pos - current_main_pos),
+                np.cos(self.init_main_drive_pos - current_main_pos),
+            )
+            target_main_vel = np.clip(
+                self.init_stand_main_drive_position_gain * pos_error,
+                -self.init_stand_max_main_drive_vel,
+                self.init_stand_max_main_drive_vel,
+            )
+            main_pos = self._apply_position_hooks(current_main_pos, self.main_sign, self.main_zero_offset)
+            main_kp = self.main_kp
+            main_kd = self.stand_main_kd
+        else:
+            main_pos = self._apply_position_hooks(self.init_main_drive_pos, self.main_sign, self.main_zero_offset)
+            main_kp = self.stand_main_kp
+            main_kd = self.stand_main_kd
         abad_pos = self._apply_position_hooks(self.init_abad_pos, self.abad_sign, self.abad_zero_offset)
         damper_pos = self._apply_position_hooks(self.init_damper_pos, self.damper_sign, self.damper_zero_offset)
         return self._pack_command(
             main_position=main_pos,
-            main_velocity=np.zeros(6),
+            main_velocity=self._apply_velocity_hooks(target_main_vel, self.main_sign),
             abad_position=abad_pos,
             damper_position=damper_pos,
             enable=enable,
             mode=self.MODE_INIT_STAND,
             safe_action=np.zeros(C.ACTION_DIM, dtype=np.float32),
-            target_main_drive_velocity=np.zeros(6),
+            target_main_drive_velocity=target_main_vel,
             target_abad_position=self.init_abad_pos.copy(),
-            main_kp=self.stand_main_kp,
-            main_kd=self.stand_main_kd,
+            main_kp=main_kp,
+            main_kd=main_kd,
         )
 
     def disabled_command(self) -> DecodedMotorCommand:

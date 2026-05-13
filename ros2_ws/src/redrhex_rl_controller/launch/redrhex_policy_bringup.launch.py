@@ -10,6 +10,8 @@ from launch.substitutions import PathJoinSubstitution
 def generate_launch_description():
     config = LaunchConfiguration("config")
     use_fake_sensors = LaunchConfiguration("use_fake_sensors")
+    fake_publish_abad_joints = LaunchConfiguration("fake_publish_abad_joints")
+    fake_publish_damper_joints = LaunchConfiguration("fake_publish_damper_joints")
     start_bridge = LaunchConfiguration("start_bridge")
     bridge_config = LaunchConfiguration("bridge_config")
 
@@ -28,6 +30,8 @@ def generate_launch_description():
         DeclareLaunchArgument("config", default_value=default_config),
         DeclareLaunchArgument("bridge_config", default_value=default_bridge_config),
         DeclareLaunchArgument("use_fake_sensors", default_value="false"),
+        DeclareLaunchArgument("fake_publish_abad_joints", default_value="false"),
+        DeclareLaunchArgument("fake_publish_damper_joints", default_value="false"),
         DeclareLaunchArgument("start_bridge", default_value="true"),
         Node(
             package="redrhex_rl_controller",
@@ -49,6 +53,10 @@ def generate_launch_description():
             executable="fake_sensor_node",
             name="redrhex_fake_sensor_node",
             output="screen",
+            parameters=[{
+                "publish_abad_joints": fake_publish_abad_joints,
+                "publish_damper_joints": fake_publish_damper_joints,
+            }],
             condition=IfCondition(use_fake_sensors),
         ),
     ])

@@ -7,6 +7,7 @@ import math
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Bool
 
@@ -21,8 +22,12 @@ class RedRhexFakeSensorNode(Node):
         self.declare_parameter("cmd_vx", 0.0)
         self.declare_parameter("cmd_vy", 0.0)
         self.declare_parameter("cmd_wz", 0.0)
+        self.declare_parameter("publish_abad_joints", False)
+        self.declare_parameter("publish_damper_joints", False)
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.publish_cmd_vel = bool(self.get_parameter("publish_cmd_vel").value)
+        self.publish_abad_joints = bool(self.get_parameter("publish_abad_joints").value)
+        self.publish_damper_joints = bool(self.get_parameter("publish_damper_joints").value)
         self.phase = 0.0
 
         self.imu_pub = self.create_publisher(Imu, "/imu/data", 10)
@@ -50,12 +55,18 @@ class RedRhexFakeSensorNode(Node):
 
         js = JointState()
         js.header.stamp = now
-        js.name = C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES + C.DAMPER_JOINT_NAMES
+        js.name = list(C.MAIN_DRIVE_JOINT_NAMES)
         main_pos = [p + 0.05 * math.sin(self.phase) for p in C.INIT_MAIN_DRIVE_POS]
-        abad_pos = list(C.INIT_ABAD_POS)
-        damper_pos = list(C.INIT_DAMPER_POS)
-        js.position = main_pos + abad_pos + damper_pos
-        js.velocity = [0.05 * math.cos(self.phase)] * 6 + [0.0] * 12
+        js.position = list(main_pos)
+        js.velocity = [0.05 * math.cos(self.phase)] * 6
+        if self.publish_abad_joints:
+            js.name += C.ABAD_JOINT_NAMES
+            js.position += list(C.INIT_ABAD_POS)
+            js.velocity += [0.0] * 6
+        if self.publish_damper_joints:
+            js.name += C.DAMPER_JOINT_NAMES
+            js.position += list(C.INIT_DAMPER_POS)
+            js.velocity += [0.0] * 6
         self.joint_pub.publish(js)
 
         if self.publish_cmd_vel:
@@ -75,6 +86,9 @@ def main(args=None) -> None:
     node = RedRhexFakeSensorNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

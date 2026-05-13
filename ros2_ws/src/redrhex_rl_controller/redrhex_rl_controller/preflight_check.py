@@ -82,6 +82,10 @@ def _validate_deployment_config(params: dict, policy_input_dim: int, result: dic
                 "odom_twist_in_body_frame": bool(
                     _nested(params, "observation", "odom_twist_in_body_frame", default=True)
                 ),
+                "abad_feedback_source": str(_nested(params, "observation", "abad_feedback_source", default="commanded")),
+                "estimate_missing_joint_velocity": bool(
+                    _nested(params, "observation", "estimate_missing_joint_velocity", default=True)
+                ),
                 "command_limits": command_limits,
             }
         )
@@ -101,6 +105,16 @@ def _validate_deployment_config(params: dict, policy_input_dim: int, result: dic
                     _nested(params, "safety", "main_drive_slew_rate_rad_s2", default=120.0)
                 ),
                 "abad_slew_rate_rad_s": float(_nested(params, "safety", "abad_slew_rate_rad_s", default=6.0)),
+                "include_damper_command": bool(_nested(params, "action", "include_damper_command", default=False)),
+                "main_drive_init_control_mode": str(
+                    _nested(params, "action", "main_drive_init_control_mode", default="velocity_to_pose")
+                ),
+                "init_stand_main_drive_position_gain": float(
+                    _nested(params, "action", "init_stand_main_drive_position_gain", default=3.0)
+                ),
+                "init_stand_max_main_drive_vel_rad_s": float(
+                    _nested(params, "action", "init_stand_max_main_drive_vel_rad_s", default=1.5)
+                ),
                 "main_drive_sign": list(_nested(params, "action", "main_drive_sign", default=[1.0] * 6)),
                 "abad_sign": list(_nested(params, "action", "abad_sign", default=[1.0] * 6)),
                 "damper_sign": list(_nested(params, "action", "damper_sign", default=[1.0] * 6)),
@@ -157,6 +171,10 @@ def _validate_deployment_config(params: dict, policy_input_dim: int, result: dic
         result["warnings"].append("enable_policy_on_start is true; keep it false for real-robot bringup.")
     if bool(_nested(params, "state_machine", "enable_motor_output_on_start", default=False)):
         result["warnings"].append("enable_motor_output_on_start is true; keep it false for real-robot bringup.")
+    if bool(_nested(params, "action", "include_damper_command", default=False)):
+        result["warnings"].append("include_damper_command is true, but real RedRhex dampers are not motors.")
+    if str(_nested(params, "observation", "abad_feedback_source", default="commanded")) != "commanded":
+        result["warnings"].append("ABAD feedback source is not commanded; use commanded unless ABAD encoders are added.")
     if str(_nested(params, "observation", "base_lin_vel_source", default="zero")) == "zero":
         result["warnings"].append(
             "base_lin_vel_source is zero. This is only safe for bench tests; use odom/leg odometry before serious locomotion."

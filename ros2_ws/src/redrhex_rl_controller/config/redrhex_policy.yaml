@@ -12,6 +12,11 @@ redrhex_rl_controller:
     observation:
       base_lin_vel_source: "zero"  # TODO: switch to odom/leg estimator before locomotion.
       odom_twist_in_body_frame: true
+      # Real RedRhex hardware currently has main-drive encoder feedback only.
+      # ABAD has position command but no position feedback, so deployment uses
+      # the last commanded ABAD target as the ABAD observation estimate.
+      abad_feedback_source: "commanded"  # commanded or joint_states
+      estimate_missing_joint_velocity: true
       policy_history_length: 5
 
     state_machine:
@@ -39,7 +44,14 @@ redrhex_rl_controller:
       abad_slew_rate_rad_s: 6.0
 
     action:
-      include_damper_command: true
+      # Real robot has 12 actuated motors: 6 main drive + 6 ABAD. Damper joints
+      # are simulated spring legs only and are not motor commands.
+      include_damper_command: false
+      # Main drive is PWM/speed controlled on hardware. INIT_STAND therefore
+      # uses a slow encoder-position-to-velocity servo instead of main position control.
+      main_drive_init_control_mode: "velocity_to_pose"
+      init_stand_main_drive_position_gain: 3.0
+      init_stand_max_main_drive_vel_rad_s: 1.5
       # True robot calibration hooks. Change signs/offsets only after
       # single-joint tests prove a motor axis or encoder zero is reversed.
       main_drive_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]

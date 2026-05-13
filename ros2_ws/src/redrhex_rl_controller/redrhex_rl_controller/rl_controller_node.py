@@ -9,6 +9,7 @@ import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState, Imu, JointState
 from std_msgs.msg import Bool, Float32MultiArray, String
@@ -66,6 +67,8 @@ class RedRhexRLControllerNode(Node):
             "policy_history_length": int(_declare_get(self, "observation.policy_history_length", C.POLICY_HISTORY_LENGTH)),
             "base_lin_vel_source": str(_declare_get(self, "observation.base_lin_vel_source", "zero")),
             "odom_twist_in_body_frame": bool(_declare_get(self, "observation.odom_twist_in_body_frame", True)),
+            "abad_feedback_source": str(_declare_get(self, "observation.abad_feedback_source", "commanded")),
+            "estimate_missing_joint_velocity": bool(_declare_get(self, "observation.estimate_missing_joint_velocity", True)),
             "command_limits": command_limits,
         }
         decoder_cfg = {
@@ -74,7 +77,16 @@ class RedRhexRLControllerNode(Node):
             "abad_pos_limit": float(_declare_get(self, "safety.abad_pos_limit_rad", C.STAGE_ABAD_POS_LIMIT)),
             "main_drive_slew_rate_rad_s2": float(_declare_get(self, "safety.main_drive_slew_rate_rad_s2", 120.0)),
             "abad_slew_rate_rad_s": float(_declare_get(self, "safety.abad_slew_rate_rad_s", 6.0)),
-            "include_damper_command": bool(_declare_get(self, "action.include_damper_command", True)),
+            "include_damper_command": bool(_declare_get(self, "action.include_damper_command", False)),
+            "main_drive_init_control_mode": str(
+                _declare_get(self, "action.main_drive_init_control_mode", "velocity_to_pose")
+            ),
+            "init_stand_main_drive_position_gain": float(
+                _declare_get(self, "action.init_stand_main_drive_position_gain", 3.0)
+            ),
+            "init_stand_max_main_drive_vel_rad_s": float(
+                _declare_get(self, "action.init_stand_max_main_drive_vel_rad_s", 1.5)
+            ),
             "stand_main_drive_kp": list(_declare_get(self, "action.stand_main_drive_kp", [12.0] * 6)),
             "stand_main_drive_kd": list(_declare_get(self, "action.stand_main_drive_kd", [1.0] * 6)),
             "main_drive_sign": list(_declare_get(self, "action.main_drive_sign", [1.0] * 6)),
@@ -109,6 +121,9 @@ class RedRhexRLControllerNode(Node):
         self.observation_builder = ObservationBuilder(builder_cfg)
         self.action_decoder = ActionDecoder(decoder_cfg)
         self.safety_filter = SafetyFilter(safety_cfg)
+        self.abad_feedback_source = self.observation_builder.abad_feedback_source
+        self.required_joint_names = list(self.observation_builder.required_joint_names)
+        self.include_damper_command = self.action_decoder.include_damper_command
         self.state_machine = RedRhexStateMachine(
             require_motor_feedback=self.require_motor_feedback,
             require_lowlevel_heartbeat=self.require_lowlevel_heartbeat,
@@ -331,7 +346,10 @@ class RedRhexRLControllerNode(Node):
             if state in (RedRhexState.BOOT, RedRhexState.SENSOR_CHECK, RedRhexState.MOTOR_IDLE):
                 decoded = self.action_decoder.disabled_command()
             elif state in (RedRhexState.INIT_STAND, RedRhexState.WARMUP, RedRhexState.POLICY_READY):
-                decoded = self.action_decoder.init_stand_command(enable=True)
+                decoded = self.action_decoder.init_stand_command(
+                    current_main_pos=self.observation_builder.get_main_drive_positions(),
+                    enable=True,
+                )
             elif state == RedRhexState.POLICY_RUN:
                 if self.policy_runner is None:
                     raise RuntimeError("policy runner is not loaded")
@@ -377,11 +395,13 @@ class RedRhexRLControllerNode(Node):
                 self.observation_builder.get_abad_positions(),
             )
 
-        self._publish_motor_command(decoded)
+        actual_motor_enable = self._publish_motor_command(decoded)
+        if actual_motor_enable:
+            self.observation_builder.update_commanded_abad_position(decoded.target_abad_position, now_s)
         self._publish_state_and_diagnostics(reasons, safety_result.ok and obs_status.ok)
         self.recover_requested = False
 
-    def _publish_motor_command(self, decoded: DecodedMotorCommand) -> None:
+    def _publish_motor_command(self, decoded: DecodedMotorCommand) -> bool:
         msg = RedRhexMotorCommand()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "redrhex_base"
@@ -394,6 +414,7 @@ class RedRhexRLControllerNode(Node):
         msg.enable = bool(decoded.enable and self.enable_motor_output and not self.estop)
         msg.mode = decoded.mode
         self.motor_cmd_pub.publish(msg)
+        return bool(msg.enable)
 
     @staticmethod
     def _fmt_optional(value: float | None) -> str:
@@ -418,6 +439,9 @@ class RedRhexRLControllerNode(Node):
             KeyValue(key="policy_enabled", value=str(self.enable_policy)),
             KeyValue(key="motor_output_enabled", value=str(self.enable_motor_output and not self.estop)),
             KeyValue(key="estop", value=str(self.estop)),
+            KeyValue(key="abad_feedback_source", value=self.abad_feedback_source),
+            KeyValue(key="required_joint_names", value=",".join(self.required_joint_names)),
+            KeyValue(key="damper_command_enabled", value=str(self.include_damper_command)),
             KeyValue(key="onnx_path", value=self.onnx_path),
         ]
         status.values.extend(KeyValue(key=key, value=value) for key, value in self.last_diag_values.items())
@@ -432,6 +456,9 @@ def main(args=None) -> None:
     node = RedRhexRLControllerNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

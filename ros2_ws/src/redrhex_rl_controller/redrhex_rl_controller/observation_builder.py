@@ -71,6 +71,10 @@ def _quat_to_roll_pitch_yaw(q_xyzw: np.ndarray) -> tuple[float, float, float]:
     return roll, pitch, yaw
 
 
+def _wrap_angle_diff(new: float, old: float) -> float:
+    return math.atan2(math.sin(new - old), math.cos(new - old))
+
+
 class ObservationBuilder:
     """Stateful observation builder.
 
@@ -90,12 +94,16 @@ class ObservationBuilder:
         self.base_gait_frequency_hz = float(self.cfg.get("base_gait_frequency_hz", C.BASE_GAIT_FREQUENCY_HZ))
         self.base_lin_vel_source = str(self.cfg.get("base_lin_vel_source", "zero"))
         self.odom_twist_in_body_frame = bool(self.cfg.get("odom_twist_in_body_frame", True))
+        self.abad_feedback_source = str(self.cfg.get("abad_feedback_source", "commanded"))
+        self.estimate_missing_joint_velocity = bool(self.cfg.get("estimate_missing_joint_velocity", True))
         self.command_limits = dict(C.COMMAND_LIMITS)
         self.command_limits.update(self.cfg.get("command_limits", {}))
 
         self.main_drive_joint_names = list(self.cfg.get("main_drive_joint_names", C.MAIN_DRIVE_JOINT_NAMES))
         self.abad_joint_names = list(self.cfg.get("abad_joint_names", C.ABAD_JOINT_NAMES))
-        self.required_joint_names = self.main_drive_joint_names + self.abad_joint_names
+        self.required_joint_names = list(self.main_drive_joint_names)
+        if self.abad_feedback_source == "joint_states":
+            self.required_joint_names += self.abad_joint_names
         self._validate_config()
 
         self.last_actions = np.zeros(C.ACTION_DIM, dtype=np.float32)
@@ -113,6 +121,9 @@ class ObservationBuilder:
         self.cmd_time: float | None = None
         self.odom_lin_vel = np.zeros(3, dtype=np.float64)
         self.odom_time: float | None = None
+        self.commanded_abad_pos = np.asarray(C.INIT_ABAD_POS, dtype=np.float64)
+        self.commanded_abad_vel = np.zeros(6, dtype=np.float64)
+        self.commanded_abad_time: float | None = None
 
     def _validate_config(self) -> None:
         if self.expected_obs_dim != C.OBS_DIM_SINGLE:
@@ -126,6 +137,8 @@ class ObservationBuilder:
             )
         if self.base_lin_vel_source not in ("zero", "odom"):
             raise ValueError("base_lin_vel_source must be 'zero' or 'odom'")
+        if self.abad_feedback_source not in ("commanded", "joint_states"):
+            raise ValueError("abad_feedback_source must be 'commanded' or 'joint_states'")
 
         for name, joint_names in (
             ("main_drive_joint_names", self.main_drive_joint_names),
@@ -147,6 +160,9 @@ class ObservationBuilder:
     def reset(self, gait_phase: float = 0.0) -> None:
         self.gait_phase = float(gait_phase) % (2.0 * math.pi)
         self.last_actions[:] = 0.0
+        self.commanded_abad_pos = np.asarray(C.INIT_ABAD_POS, dtype=np.float64)
+        self.commanded_abad_vel[:] = 0.0
+        self.commanded_abad_time = None
         self._history.clear()
         self._last_build_time = None
 
@@ -163,12 +179,27 @@ class ObservationBuilder:
         names: Iterable[str] = getattr(msg, "name", [])
         positions = list(getattr(msg, "position", []))
         velocities = list(getattr(msg, "velocity", []))
+        stamp_s = now_s if now_s is not None else _stamp_to_float(msg)
+        prev_time = self.joint_time
+        dt = None if prev_time is None else max(0.0, stamp_s - prev_time)
         for idx, name in enumerate(names):
+            name = str(name)
             if idx < len(positions):
-                self.joint_pos[str(name)] = float(positions[idx])
+                old_pos = self.joint_pos.get(name)
+                new_pos = float(positions[idx])
+                self.joint_pos[name] = new_pos
+                if (
+                    idx >= len(velocities)
+                    and self.estimate_missing_joint_velocity
+                    and name in self.main_drive_joint_names
+                    and old_pos is not None
+                    and dt is not None
+                    and dt > 1.0e-6
+                ):
+                    self.joint_vel[name] = _wrap_angle_diff(new_pos, old_pos) / dt
             if idx < len(velocities):
-                self.joint_vel[str(name)] = float(velocities[idx])
-        self.joint_time = now_s if now_s is not None else _stamp_to_float(msg)
+                self.joint_vel[name] = float(velocities[idx])
+        self.joint_time = stamp_s
 
     def update_cmd_vel(self, msg: object, now_s: float | None = None) -> None:
         linear = getattr(msg, "linear")
@@ -193,6 +224,19 @@ class ObservationBuilder:
         if action.shape != (C.ACTION_DIM,):
             raise ValueError(f"last action shape must be ({C.ACTION_DIM},), got {action.shape}")
         self.last_actions = action.copy()
+
+    def update_commanded_abad_position(self, target_position: np.ndarray, now_s: float) -> None:
+        target = np.asarray(target_position, dtype=np.float64).reshape(-1)
+        if target.shape != (6,):
+            raise ValueError(f"commanded ABAD position must have shape (6,), got {target.shape}")
+        if not np.isfinite(target).all():
+            raise ValueError("commanded ABAD position contains NaN or Inf")
+        if self.commanded_abad_time is not None:
+            dt = max(0.0, now_s - self.commanded_abad_time)
+            if dt > 1.0e-6:
+                self.commanded_abad_vel = (target - self.commanded_abad_pos) / dt
+        self.commanded_abad_pos = target.copy()
+        self.commanded_abad_time = now_s
 
     def status(self, now_s: float, sensor_timeout_s: float, cmd_timeout_s: float) -> ObservationStatus:
         reasons: list[str] = []
@@ -234,8 +278,12 @@ class ObservationBuilder:
         projected_gravity = _quat_inverse_rotate_xyzw(self.imu_quat_xyzw, np.array([0.0, 0.0, -1.0]))
         main_pos = np.array([self.joint_pos[name] for name in self.main_drive_joint_names], dtype=np.float64)
         main_vel = np.array([self.joint_vel.get(name, 0.0) for name in self.main_drive_joint_names], dtype=np.float64)
-        abad_pos = np.array([self.joint_pos[name] for name in self.abad_joint_names], dtype=np.float64)
-        abad_vel = np.array([self.joint_vel.get(name, 0.0) for name in self.abad_joint_names], dtype=np.float64)
+        if self.abad_feedback_source == "joint_states":
+            abad_pos = np.array([self.joint_pos[name] for name in self.abad_joint_names], dtype=np.float64)
+            abad_vel = np.array([self.joint_vel.get(name, 0.0) for name in self.abad_joint_names], dtype=np.float64)
+        else:
+            abad_pos = self.commanded_abad_pos.copy()
+            abad_vel = self.commanded_abad_vel.copy()
 
         obs = np.concatenate(
             [
@@ -286,4 +334,6 @@ class ObservationBuilder:
         return np.array([self.joint_pos.get(name, 0.0) for name in self.main_drive_joint_names], dtype=np.float64)
 
     def get_abad_positions(self) -> np.ndarray:
+        if self.abad_feedback_source == "commanded":
+            return self.commanded_abad_pos.copy()
         return np.array([self.joint_pos.get(name, 0.0) for name in self.abad_joint_names], dtype=np.float64)
