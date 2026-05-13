@@ -19,6 +19,20 @@ Sensor Input
 
 MVP 先用自訂 `RedRhexMotorCommand` bridge。`ros2_control` 的優點是長期可接 `hardware_interface`、controller_manager、標準 controller；缺點是現在低階板 protocol 未定，直接上 ros2_control 會先把未知硬體介面寫死。建議先跑通本 MVP，等 MCU/CAN/micro-ROS protocol 穩定後再包成 ros2_control hardware plugin。
 
+## Lite3_rl_deploy 參考點
+
+DeepRobotics `Lite3_rl_deploy` 的有用設計是分層，而不是它的 Lite3 關節定義或 UDP protocol：
+
+```text
+Lite3 interface      -> RedRhex LowLevelBridge abstraction
+Lite3 state_machine -> RedRhexStateMachine
+Lite3 run_policy    -> PolicyONNXRunner + ObservationBuilder + ActionDecoder
+Lite3 sim-to-sim    -> RedRhex mock/fake sensor test
+Lite3 sim-to-real   -> RedRhex heartbeat、單顆馬達、架空、落地分階段測試
+```
+
+它的 README 也強調 ONNX 轉換後要檢查模型輸出一致性，所以這裡提供 `check_onnx_io.py` 和 `compare_onnx_with_torch.py`。但 RedRhex 的 observation order、action scaling、gait phase、ABAD gating 都不能照 Lite3 猜，必須以本 repo 的 IsaacLab `RedrhexEnv` 為準。
+
 ## 明天一步一步操作手冊
 
 這一段是給「我現在只有 `policy.onnx`，不知道怎麼讓真機動起來」的完整流程。不要跳步。RedRhex 是 18 個關節的真機，policy 只輸出 12 維 action；真正安全讓它動起來靠的是 observation、action decoder、state machine、low-level bridge 和 E-stop。
@@ -49,6 +63,70 @@ joint encoder feedback
 先 mock，再 heartbeat，再單顆馬達，再架空全機，最後才落地。
 ```
 
+明天的成功標準不是「馬上走起來」，而是安全通過這條最短路線：
+
+```text
+ONNX I/O 正確
+ROS2 mock graph 正常
+low-level heartbeat 正常
+manual disable / dry-run 正常
+單顆 ABAD 小角度正常
+單顆 main drive 低速正常
+架空 INIT_STAND 正常
+架空 policy dry-run 正常
+最後才做落地 2 秒低速測試
+```
+
+controller 有兩個開關，請分清楚：
+
+```text
+/redrhex/enable_policy：只允許 ONNX policy 進入閉環計算。
+/redrhex/enable_motors：才允許 /redrhex/motor_commands 的 enable 變成 true。
+```
+
+也就是說，就算你打開 `/redrhex/enable_policy`，只要 `/redrhex/enable_motors` 還是 false，馬達仍不應出力。這是故意加上的第二道保險。
+
+開關允許表：
+
+```text
+BOOT / SENSOR_CHECK / MOTOR_IDLE：兩個開關都會被拒絕。
+INIT_STAND / WARMUP：只允許 enable_motors，讓機器人回站姿，不允許 policy。
+POLICY_READY：允許 enable_policy，也允許 enable_motors。
+POLICY_RUN：允許兩者維持開啟。
+PROTECTIVE_STOP / FALL_DETECTED / RECOVER：兩個 latch 會自動關掉。
+```
+
+如果你 publish 了 enable 但沒生效，先看：
+
+```bash
+ros2 topic echo /redrhex/state_machine_state
+ros2 topic echo /redrhex/diagnostics
+ros2 topic echo /redrhex/motor_commands
+```
+
+不要一直重送 enable。先把 state 和 diagnostics 看懂。
+
+`/redrhex/diagnostics` 會帶這些現場最常用欄位：
+
+```text
+state
+last_transition_reason
+policy_loaded
+policy_enabled
+motor_output_enabled
+estop
+imu_age_s
+joint_state_age_s
+motor_feedback_age_s
+heartbeat_age_s
+control_loop_dt_s
+roll_rad
+pitch_rad
+cmd_vel
+```
+
+如果 `imu_age_s` 或 `joint_state_age_s` 一直變大，表示 sensor topic 斷了；如果 `control_loop_dt_s` 大於 YAML 的 `max_control_loop_dt_s`，表示 Jetson 控制迴圈已經 miss deadline，不要落地。
+
 ### 1. 在 Jetson 安裝基本環境
 
 先確認 ROS2。以 Humble 為例：
@@ -63,8 +141,18 @@ ros2 --version
 ```bash
 sudo apt update
 sudo apt install -y python3-colcon-common-extensions python3-pip
-python3 -m pip install "numpy<2" onnx onnxruntime pyserial
+python3 -m pip install "numpy<2" onnx onnxruntime pyserial pyyaml
 ```
+
+如果跑 script 出現 `ModuleNotFoundError: No module named 'numpy'`，代表你目前 terminal 用的 Python 環境沒有裝到套件。先確認：
+
+```bash
+which python3
+python3 -m pip show numpy
+/usr/bin/python3 -m pip show numpy
+```
+
+初學階段建議讓 ROS2 和測試 script 都用同一個系統 Python，少碰 conda。
 
 如果你用 conda，ROS2 message generation 可能找不到 `em` / `empy`。初學階段建議不要用 conda build ROS2。若真的遇到 `ModuleNotFoundError: No module named 'em'`，先用系統 Python：
 
@@ -96,7 +184,7 @@ policy:
 
 ### 3. 檢查 ONNX，不接任何硬體
 
-這一步只是在 Jetson CPU 上跑一次 zero observation。
+這一步只是在 Jetson CPU 上跑一次 zero observation。這個 script 不需要先 `colcon build`，所以它是最早可以做的檢查。
 
 ```bash
 cd /home/jetson/RedRhex
@@ -138,6 +226,30 @@ redrhex_rl_controller
 redrhex_lowlevel_bridge
 ```
 
+Build 後再跑整合版 preflight。它會檢查 ONNX 是否存在、I/O shape、zero observation 推論、repo 推導出的 policy Hz，並提醒你目前是不是只能做 bench test：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/jetson/RedRhex/ros2_ws/install/setup.bash
+ros2 run redrhex_rl_controller preflight_check \
+  --onnx /home/jetson/redrhex_models/policy.onnx \
+  --config /home/jetson/RedRhex/ros2_ws/src/redrhex_rl_controller/config/redrhex_policy.yaml
+```
+
+看到 JSON 裡所有 `checks.ok` 都是 `true`，才進下一步。這個 preflight 會檢查：
+
+```text
+policy.onnx 是否存在
+ONNX input/output shape
+zero observation 能否推論
+joint name 常數是否是 6+6+6 且不重複
+YAML 裡 observation/action/safety 參數是否合法
+enable_policy_on_start / enable_motor_output_on_start 是否誤開
+base_lin_vel_source 是否仍是 zero
+```
+
+若 `warnings` 提到 `base_lin_vel`，這不是 build 失敗，而是提醒你還沒有真機線速度估測；這時只能做 mock、架空、低速 bench test，不應直接落地跑 policy。
+
 ### 5. 第一次跑 ROS2 graph，只用 mock，不插馬達電源
 
 Terminal A：
@@ -166,6 +278,8 @@ ros2 topic list
 /redrhex/state_machine_state
 /redrhex/diagnostics
 /redrhex/lowlevel_heartbeat
+/redrhex/enable_policy
+/redrhex/enable_motors
 ```
 
 再看狀態：
@@ -182,9 +296,9 @@ BOOT -> SENSOR_CHECK -> MOTOR_IDLE -> INIT_STAND -> WARMUP -> POLICY_READY
 
 如果卡在 `SENSOR_CHECK`，代表 IMU / joint_states / heartbeat 沒進來。mock mode 下通常不該卡住。
 
-### 6. 確認 policy 不會自動接管
+### 6. 確認 policy 和馬達輸出都不會自動接管
 
-預設 controller 會停在 `POLICY_READY`，不會進 `POLICY_RUN`。這是故意的。要測 ONNX 閉環時才手動打開：
+預設 controller 會停在 `POLICY_READY`，不會進 `POLICY_RUN`，而且 `enable_motors=false`。這是故意的。要測 ONNX 閉環計算時才手動打開 policy。注意：如果 state 還不是 `POLICY_READY` 或 `POLICY_RUN`，controller 會拒絕這個 request。
 
 ```bash
 ros2 topic pub --once /redrhex/enable_policy std_msgs/msg/Bool "{data: true}"
@@ -197,7 +311,9 @@ ros2 topic echo /redrhex/policy_action_raw
 ros2 topic echo /redrhex/motor_commands
 ```
 
-在 mock mode 看到 action 和 motor command 就夠了。這一步仍然不要接馬達。
+在 mock mode 看到 action 和 motor command 就夠了。這一步仍然不要接馬達，而且 `/redrhex/motor_commands.enable` 預期仍是 `false`，除非你另外明確打開 `/redrhex/enable_motors`。
+
+若看到 log 顯示 `Rejecting policy enable`，代表你太早 enable。等 state 進 `POLICY_READY` 後再送一次。
 
 ### 7. 接低階板 heartbeat，但仍不要插馬達主電源
 
@@ -221,7 +337,10 @@ serial:
   port: "/dev/ttyUSB0"
   baudrate: 921600
   timeout_s: 0.005
+  allow_enable: false
 ```
+
+`allow_enable` 預設一定要保持 `false`。這代表 serial skeleton 只允許你測封包與 heartbeat，不允許透過尚未確認的 provisional protocol 讓馬達真的出力。等 MCU 端已經完成 watchdog、CRC 驗證、急停路徑、單顆馬達測試後，才可以把它改成 `true`。
 
 查 USB port：
 
@@ -262,6 +381,26 @@ ros2 run redrhex_rl_controller motor_command_tool disable --duration 2.0
 
 你應該在 bridge terminal 看到 mock 或 serial 正在收到 command。這個 command `enable=false`，是最安全的第一包。
 
+先確認 joint order：
+
+```bash
+ros2 run redrhex_rl_controller motor_command_tool list-joints
+```
+
+你也可以先 dry-run 看即將送出的 JSON，不 publish：
+
+```bash
+ros2 run redrhex_rl_controller motor_command_tool init-stand --dry-run
+```
+
+任何會讓馬達真的出力的手動指令都需要同時加：
+
+```text
+--enable --confirm-risk
+```
+
+這是故意設計的，避免你複製指令時誤觸真機。
+
 ### 9. 低功率 INIT_STAND，先架空或不插主電源
 
 先測 command 是否合理：
@@ -279,7 +418,10 @@ ros2 topic echo /redrhex/motor_commands
 確認 joint order 正確後，才允許低功率：
 
 ```bash
-ros2 run redrhex_rl_controller motor_command_tool init-stand --enable --duration 2.0
+ros2 run redrhex_rl_controller motor_command_tool init-stand \
+  --enable \
+  --confirm-risk \
+  --duration 2.0
 ```
 
 此時你要用非常低的電源/限流，手放在急停旁邊。期待現象：
@@ -300,6 +442,7 @@ damper 保持初始角度
 ```bash
 ros2 run redrhex_rl_controller motor_command_tool single-abad \
   --enable \
+  --confirm-risk \
   --index 0 \
   --position 0.10 \
   --kp 4.0 \
@@ -313,6 +456,7 @@ ros2 run redrhex_rl_controller motor_command_tool single-abad \
 ```bash
 ros2 run redrhex_rl_controller motor_command_tool single-abad \
   --enable \
+  --confirm-risk \
   --index 0 \
   --position 0.0 \
   --kp 4.0 \
@@ -339,6 +483,7 @@ fault flag 是 false
 ```bash
 ros2 run redrhex_rl_controller motor_command_tool all-abad \
   --enable \
+  --confirm-risk \
   --position 0.08 \
   --kp 4.0 \
   --kd 0.3 \
@@ -351,6 +496,7 @@ ros2 run redrhex_rl_controller motor_command_tool all-abad \
 ```bash
 ros2 run redrhex_rl_controller motor_command_tool all-abad \
   --enable \
+  --confirm-risk \
   --position 0.0 \
   --kp 4.0 \
   --kd 0.3 \
@@ -365,6 +511,7 @@ main drive 是旋轉腿，危險性比 ABAD 高。一定要架空，速度先低
 ```bash
 ros2 run redrhex_rl_controller motor_command_tool single-main-velocity \
   --enable \
+  --confirm-risk \
   --index 0 \
   --velocity 0.3 \
   --kd 0.5 \
@@ -389,7 +536,7 @@ encoder velocity 正負號是否符合 command
 
 ### 13. 架空整機，先只跑 controller 的 INIT_STAND
 
-此時還不要 enable policy。啟動完整 bringup：
+此時還不要 enable policy。先確認機器人已經架空、低階板限流、急停在手邊，再啟動完整 bringup：
 
 ```bash
 ros2 launch redrhex_rl_controller redrhex_policy_bringup.launch.py use_fake_sensors:=false
@@ -415,6 +562,54 @@ POLICY_READY
 ros2 topic echo /redrhex/diagnostics
 ```
 
+預設馬達輸出仍然是關的。你應該先看 command 內容：
+
+```bash
+ros2 topic echo /redrhex/motor_commands
+```
+
+確認 joint order、position target、kp/kd 都合理後，才打開馬達輸出，讓 controller 持續送 INIT_STAND / POLICY_READY 的站姿命令：
+
+```bash
+ros2 topic pub --once /redrhex/enable_motors std_msgs/msg/Bool "{data: true}"
+```
+
+如果這個 request 被拒絕，通常是 state 還在 `SENSOR_CHECK`、`MOTOR_IDLE`、`PROTECTIVE_STOP`，或 `/estop=true`。不要硬重送，先修 sensor / heartbeat / diagnostics。
+
+如果任何一顆馬達抖動、方向錯、電流暴增，立刻：
+
+```bash
+ros2 topic pub --once /redrhex/enable_motors std_msgs/msg/Bool "{data: false}"
+ros2 topic pub --once /estop std_msgs/msg/Bool "{data: true}"
+```
+
+### 13.5 如果馬達方向或 encoder zero 錯了
+
+不要用 policy 硬跑。先回 YAML 改 calibration hook：
+
+```bash
+nano /home/jetson/RedRhex/ros2_ws/src/redrhex_rl_controller/config/redrhex_policy.yaml
+```
+
+可調欄位：
+
+```yaml
+action:
+  main_drive_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  abad_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  main_drive_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  abad_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+```
+
+例子：
+
+```text
+第 0 顆 ABAD 正方向相反：把 abad_sign 第一個改成 -1.0
+第 2 顆 main drive encoder zero 差 +0.12 rad：把 main_drive_zero_offset_rad 第三個改成 0.12
+```
+
+改完要重新 launch controller。不要在 controller 正在跑時改 YAML 期待它自動生效。
+
 ### 14. 架空整機，低風險 policy run
 
 先讓 command 是 0：
@@ -439,6 +634,18 @@ ros2 topic echo /redrhex/motor_commands
 ```
 
 如果 action 有 NaN、motor command 突然很大、或任何馬達暴衝，急停。
+
+如果你只是要看 policy 計算，不想讓馬達出力，先關掉 motor output：
+
+```bash
+ros2 topic pub --once /redrhex/enable_motors std_msgs/msg/Bool "{data: false}"
+```
+
+等 `/redrhex/policy_action_safe` 和 `/redrhex/motor_commands` 都看起來合理，架空且限流後，再打開：
+
+```bash
+ros2 topic pub --once /redrhex/enable_motors std_msgs/msg/Bool "{data: true}"
+```
 
 ### 15. 架空整機，給很小的 forward command
 
@@ -511,6 +718,8 @@ ros2 run redrhex_rl_controller motor_command_tool disable --duration 1.0
 
 然後切馬達主電源。不要在問題狀態下繼續 publish cmd_vel。
 
+收到 `/estop=true` 後，controller 會自動把 policy enable 和 motor output latch 都關掉。排除問題後，不要直接落地重試；先回到架空 INIT_STAND，再重新逐步 enable。
+
 常見問題：
 
 ```text
@@ -519,6 +728,26 @@ ros2 run redrhex_rl_controller motor_command_tool disable --duration 1.0
 ONNX input 是 280：需要 history，controller 已支援，但你要確認 observation order。
 落地完全不會走：base_lin_vel=0 造成 sim2real mismatch，需 odom/leg odometry。
 側移很怪：ABAD sign 或 zero offset 很可能錯。
+```
+
+快速判斷表：
+
+```text
+/redrhex/motor_commands.enable 一直是 false：
+  正常情況：你還沒開 /redrhex/enable_motors。
+  異常情況：state 不允許、E-stop active、或 controller 剛進 protective stop。
+
+policy_action_raw 沒資料：
+  代表還沒進 POLICY_RUN。檢查 /redrhex/enable_policy 和 state_machine_state。
+
+policy_action_raw 有資料但 safe action / motor command 很怪：
+  先關 /redrhex/enable_motors，不要讓馬達出力，再檢查 observation order 和 joint sign。
+
+diagnostics 有 control loop deadline miss：
+  降低 policy_hz 或檢查 Jetson CPU 負載，不要在 deadline miss 狀態落地。
+
+motor_feedback 有 NaN / Inf：
+  低階板 feedback parser 錯或 sensor 資料壞掉，controller 會進保護停止。
 ```
 
 ## 已確認
@@ -533,8 +762,8 @@ ONNX input 是 280：需要 history，controller 已支援，但你要確認 obs
 - policy frequency：`125 Hz`
 - repo 註解有些地方寫 120 Hz / 60 Hz，但實際程式參數是 250 Hz sim、decimation 2、policy 125 Hz
 - exported ONNX 字串可見 `normalizer._mean` 時代表 normalizer 已在圖內
-- repo 目前沒有 ROS2 package
-- repo 目前沒有 MCU/low-level communication protocol
+- 原始訓練 repo 先前沒有 ROS2 deployment package；本 MVP 已新增 `redrhex_msgs`、`redrhex_rl_controller`、`redrhex_lowlevel_bridge`
+- 原始 repo 目前沒有已確定 MCU/low-level communication protocol；本 MVP 只提供 mock backend 和 provisional serial skeleton
 
 ## 仍未知 / TODO
 
@@ -554,7 +783,7 @@ ONNX input 是 280：需要 history，controller 已支援，但你要確認 obs
 ```bash
 sudo apt update
 sudo apt install -y python3-colcon-common-extensions python3-pip ros-humble-desktop
-python3 -m pip install "numpy<2" onnx onnxruntime pyserial
+python3 -m pip install "numpy<2" onnx onnxruntime pyserial pyyaml
 ```
 
 若使用 GPU，依 JetPack / CUDA 相容性安裝 `onnxruntime-gpu`，再在 YAML 啟用：
@@ -628,10 +857,16 @@ ros2 topic echo /redrhex/motor_commands
 ros2 topic echo /redrhex/diagnostics
 ```
 
-預設不會進 `POLICY_RUN`。要明確允許：
+預設不會進 `POLICY_RUN`，而且 motor output 是關的。要明確允許 policy 計算：
 
 ```bash
 ros2 topic pub --once /redrhex/enable_policy std_msgs/msg/Bool "{data: true}"
+```
+
+mock mode 下通常不需要打開馬達輸出；你可以確認 `/redrhex/motor_commands.enable` 仍是 `false`。只有在架空真機、限流、急停就緒後，才使用：
+
+```bash
+ros2 topic pub --once /redrhex/enable_motors std_msgs/msg/Bool "{data: true}"
 ```
 
 ## 切換 low-level bridge
@@ -654,9 +889,10 @@ redrhex_lowlevel_bridge:
       port: "/dev/ttyUSB0"
       baudrate: 921600
       timeout_s: 0.005
+      allow_enable: false
 ```
 
-Serial 封包目前是 provisional，包含 magic header、version、sequence、timestamp、joint count、target arrays、enable、CRC。MCU protocol 確定後請替換 `serial_bridge.py`。
+Serial 封包目前是 provisional，包含 magic header、version、sequence、timestamp、joint count、target arrays、enable、CRC。`allow_enable=false` 時，serial backend 會拒絕 enabled motor command；MCU protocol 確定後請替換 `serial_bridge.py`，再有意識地打開 `allow_enable`。
 
 ## Observation order
 

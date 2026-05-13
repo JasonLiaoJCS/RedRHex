@@ -155,6 +155,7 @@ class ActionDecoder:
         self.lateral_timeout_cooldown = 0
         self.prev_target_drive_vel = np.zeros(6, dtype=np.float64)
         self.prev_target_abad_pos = np.zeros(6, dtype=np.float64)
+        self._validate_config()
 
     def reset(self, gait_phase: float = 0.0) -> None:
         self.step_count = 0
@@ -165,6 +166,59 @@ class ActionDecoder:
         self.lateral_timeout_cooldown = 0
         self.prev_target_drive_vel[:] = 0.0
         self.prev_target_abad_pos[:] = 0.0
+
+    def _validate_config(self) -> None:
+        for name, joint_names in (
+            ("main_drive_joint_names", self.main_drive_joint_names),
+            ("abad_joint_names", self.abad_joint_names),
+            ("damper_joint_names", self.damper_joint_names),
+        ):
+            if len(joint_names) != 6:
+                raise ValueError(f"{name} must contain 6 joints, got {len(joint_names)}")
+            if len(set(joint_names)) != len(joint_names):
+                raise ValueError(f"{name} contains duplicate names: {joint_names}")
+
+        vectors = {
+            "leg_direction_multiplier": self.direction_multiplier,
+            "main_drive_sign": self.main_sign,
+            "abad_sign": self.abad_sign,
+            "damper_sign": self.damper_sign,
+            "main_drive_zero_offset_rad": self.main_zero_offset,
+            "abad_zero_offset_rad": self.abad_zero_offset,
+            "damper_zero_offset_rad": self.damper_zero_offset,
+            "init_main_drive_pos": self.init_main_drive_pos,
+            "init_abad_pos": self.init_abad_pos,
+            "init_damper_pos": self.init_damper_pos,
+            "main_drive_kp": self.main_kp,
+            "main_drive_kd": self.main_kd,
+            "stand_main_drive_kp": self.stand_main_kp,
+            "stand_main_drive_kd": self.stand_main_kd,
+            "abad_kp": self.abad_kp,
+            "abad_kd": self.abad_kd,
+            "damper_kp": self.damper_kp,
+            "damper_kd": self.damper_kd,
+            "main_drive_effort_limit_nm": self.main_effort_limit,
+            "abad_effort_limit_nm": self.abad_effort_limit,
+            "damper_effort_limit_nm": self.damper_effort_limit,
+        }
+        for name, values in vectors.items():
+            if values.shape != (6,):
+                raise ValueError(f"{name} must have length 6, got shape {values.shape}")
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} contains NaN or Inf")
+
+        for name, values in (("main_drive_sign", self.main_sign), ("abad_sign", self.abad_sign), ("damper_sign", self.damper_sign)):
+            if not np.all(np.isin(values, [-1.0, 1.0])):
+                raise ValueError(f"{name} must contain only -1.0 or 1.0")
+
+        if self.action_clip <= 0.0:
+            raise ValueError("action_clip must be positive")
+        if self.main_drive_vel_limit <= 0.0:
+            raise ValueError("main_drive_vel_limit_rad_s must be positive")
+        if self.abad_pos_limit <= 0.0:
+            raise ValueError("abad_pos_limit must be positive")
+        if self.main_drive_slew_rate <= 0.0 or self.abad_slew_rate <= 0.0:
+            raise ValueError("slew-rate limits must be positive")
 
     @staticmethod
     def _resolve_command_modes(command: np.ndarray) -> tuple[bool, bool, bool, bool, int]:

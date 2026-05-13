@@ -51,6 +51,31 @@ class SafetyFilter:
         self.require_lowlevel_heartbeat = bool(self.cfg.get("require_lowlevel_heartbeat", False))
         self.command_limits = dict(C.COMMAND_LIMITS)
         self.command_limits.update(self.cfg.get("command_limits", {}))
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        positive_fields = {
+            "sensor_timeout_s": self.sensor_timeout_s,
+            "cmd_timeout_s": self.cmd_timeout_s,
+            "motor_feedback_timeout_s": self.motor_feedback_timeout_s,
+            "heartbeat_timeout_s": self.heartbeat_timeout_s,
+            "max_abs_roll_rad": self.max_abs_roll_rad,
+            "max_abs_pitch_rad": self.max_abs_pitch_rad,
+            "action_clip": self.action_clip,
+            "main_drive_vel_limit_rad_s": self.main_drive_vel_limit_rad_s,
+            "abad_pos_limit_rad": self.abad_pos_limit_rad,
+            "max_motor_temperature_c": self.max_motor_temperature_c,
+            "max_motor_current_a": self.max_motor_current_a,
+            "max_control_loop_dt_s": self.max_control_loop_dt_s,
+        }
+        for name, value in positive_fields.items():
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite, got {value}")
+        for key in ("vx", "vy", "wz"):
+            lo = self.command_limits[f"{key}_min"]
+            hi = self.command_limits[f"{key}_max"]
+            if not np.isfinite([lo, hi]).all() or lo > hi:
+                raise ValueError(f"invalid command limit for {key}: min={lo}, max={hi}")
 
     def check(
         self,
@@ -83,6 +108,8 @@ class SafetyFilter:
             reasons.append(f"control loop deadline miss: {state.control_loop_dt_s:.4f} s")
 
         cmd = np.asarray(state.command, dtype=np.float64).reshape(3)
+        if not np.isfinite(cmd).all():
+            reasons.append("velocity command NaN/Inf")
         if (
             cmd[0] < self.command_limits["vx_min"]
             or cmd[0] > self.command_limits["vx_max"]
@@ -112,10 +139,18 @@ class SafetyFilter:
             if np.max(np.abs(abad_pos)) > self.abad_pos_limit_rad + 1.0e-6:
                 reasons.append("ABAD position target exceeds limit")
 
-        if state.motor_temperatures_c and max(state.motor_temperatures_c) > self.max_motor_temperature_c:
-            reasons.append("motor temperature too high")
-        if state.motor_currents_a and max(abs(x) for x in state.motor_currents_a) > self.max_motor_current_a:
-            reasons.append("motor current too high")
+        if state.motor_temperatures_c:
+            temperatures = np.asarray(state.motor_temperatures_c, dtype=np.float64)
+            if not np.isfinite(temperatures).all():
+                reasons.append("motor temperature NaN/Inf")
+            elif float(np.max(temperatures)) > self.max_motor_temperature_c:
+                reasons.append("motor temperature too high")
+        if state.motor_currents_a:
+            currents = np.asarray(state.motor_currents_a, dtype=np.float64)
+            if not np.isfinite(currents).all():
+                reasons.append("motor current NaN/Inf")
+            elif float(np.max(np.abs(currents))) > self.max_motor_current_a:
+                reasons.append("motor current too high")
         if any(state.motor_faults):
             reasons.append("motor fault flag")
 

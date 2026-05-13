@@ -16,6 +16,7 @@ redrhex_rl_controller:
 
     state_machine:
       enable_policy_on_start: false
+      enable_motor_output_on_start: false
       init_stand_duration_s: 2.0
       warmup_duration_s: 1.0
 
@@ -39,6 +40,18 @@ redrhex_rl_controller:
 
     action:
       include_damper_command: true
+      # True robot calibration hooks. Change signs/offsets only after
+      # single-joint tests prove a motor axis or encoder zero is reversed.
+      main_drive_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      abad_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      damper_sign: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      main_drive_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      abad_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      damper_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      main_drive_kp: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      main_drive_kd: [50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
+      abad_kp: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+      abad_kd: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
       # INIT_STAND uses position-style kp/kd for main drive so the robot can
       # return to the IsaacLab reset pose before velocity-control policy takeover.
       stand_main_drive_kp: [12.0, 12.0, 12.0, 12.0, 12.0, 12.0]

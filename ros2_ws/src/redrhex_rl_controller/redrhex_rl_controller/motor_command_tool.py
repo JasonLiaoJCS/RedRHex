@@ -8,7 +8,7 @@ allowing policy takeover.
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import time
 
 import rclpy
@@ -82,8 +82,34 @@ class MotorCommandTool(Node):
             raise ValueError(f"Unsupported mode {self.args.mode}")
         return msg
 
+    @staticmethod
+    def summarize_command(msg: RedRhexMotorCommand) -> dict:
+        rows = []
+        for idx, name in enumerate(msg.joint_names):
+            rows.append(
+                {
+                    "index": idx,
+                    "joint": name,
+                    "pos_rad": round(float(msg.target_position_rad[idx]), 5),
+                    "vel_rad_s": round(float(msg.target_velocity_rad_s[idx]), 5),
+                    "kp": round(float(msg.kp[idx]), 5),
+                    "kd": round(float(msg.kd[idx]), 5),
+                    "effort_nm": round(float(msg.effort_limit_nm[idx]), 5),
+                }
+            )
+        return {
+            "enable": bool(msg.enable),
+            "mode": int(msg.mode),
+            "joint_count": len(msg.joint_names),
+            "joints": rows,
+        }
+
     def run(self) -> None:
         msg = self.build_command()
+        if self.args.dry_run:
+            print(json.dumps(self.summarize_command(msg), indent=2))
+            return
+
         period = 1.0 / max(float(self.args.rate_hz), 1.0)
         end_time = time.monotonic() + max(float(self.args.duration), period)
         self.get_logger().warn(
@@ -101,9 +127,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
-        choices=["disable", "init-stand", "single-abad", "single-main-velocity", "all-abad", "all-main-velocity"],
+        choices=[
+            "list-joints",
+            "disable",
+            "init-stand",
+            "single-abad",
+            "single-main-velocity",
+            "all-abad",
+            "all-main-velocity",
+        ],
     )
     parser.add_argument("--enable", action="store_true", help="Actually enable motor output.")
+    parser.add_argument(
+        "--confirm-risk",
+        action="store_true",
+        help="Required together with --enable. Confirms you have E-stop and the robot is safe to move.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print the command JSON and do not publish.")
     parser.add_argument("--index", type=int, default=0, help="Leg/joint index 0..5 in policy order.")
     parser.add_argument("--position", type=float, default=0.0, help="Target ABAD position in rad.")
     parser.add_argument("--velocity", type=float, default=0.3, help="Target main-drive velocity in rad/s.")
@@ -119,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.mode == "list-joints":
+        for idx, name in enumerate(C.MAIN_DRIVE_JOINT_NAMES + C.ABAD_JOINT_NAMES + C.DAMPER_JOINT_NAMES):
+            print(f"{idx:02d}: {name}")
+        return
+    if args.enable and not args.confirm_risk:
+        raise SystemExit("Refusing --enable without --confirm-risk. Keep E-stop in hand and rerun intentionally.")
     if args.enable and args.mode in ("all-main-velocity", "single-main-velocity") and abs(args.velocity) > 1.0:
         raise SystemExit("Refusing velocity > 1.0 rad/s in manual tool. Increase only after editing the code intentionally.")
     if args.enable and args.mode in ("single-abad", "all-abad") and abs(args.position) > 0.25:

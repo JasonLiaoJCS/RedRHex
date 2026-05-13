@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 import time
 import zlib
+from math import isfinite
 
 from .bridge_base import LowLevelBridgeBase
 
@@ -18,10 +19,11 @@ class SerialLowLevelBridge(LowLevelBridgeBase):
     MAGIC = b"RRHX"
     VERSION = 1
 
-    def __init__(self, port: str, baudrate: int = 921600, timeout_s: float = 0.005) -> None:
+    def __init__(self, port: str, baudrate: int = 921600, timeout_s: float = 0.005, allow_enable: bool = False) -> None:
         self.port = port
         self.baudrate = int(baudrate)
         self.timeout_s = float(timeout_s)
+        self.allow_enable = bool(allow_enable)
         self.serial = None
         self.sequence = 0
         self.last_tx_time = 0.0
@@ -54,8 +56,12 @@ class SerialLowLevelBridge(LowLevelBridgeBase):
             self.serial = None
 
     def _encode_command(self, cmd) -> bytes:
+        if bool(cmd.enable) and not self.allow_enable:
+            raise RuntimeError("serial.allow_enable is false; refusing enabled motor command over provisional serial protocol")
         self.sequence = (self.sequence + 1) & 0xFFFFFFFF
         n = len(cmd.joint_names)
+        if n <= 0 or n > 255:
+            raise ValueError(f"joint count must be 1..255, got {n}")
         arrays = [
             list(cmd.target_position_rad),
             list(cmd.target_velocity_rad_s),
@@ -66,6 +72,8 @@ class SerialLowLevelBridge(LowLevelBridgeBase):
         for arr in arrays:
             if len(arr) != n:
                 raise ValueError("All command arrays must match joint_names length")
+            if not all(isfinite(float(x)) for x in arr):
+                raise ValueError("Command arrays contain NaN or Inf")
 
         payload = struct.pack(
             "<BBIdHB",

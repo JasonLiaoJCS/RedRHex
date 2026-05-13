@@ -21,6 +21,7 @@ class LowLevelBridgeNode(Node):
         self.declare_parameter("serial.port", "/dev/ttyUSB0")
         self.declare_parameter("serial.baudrate", 921600)
         self.declare_parameter("serial.timeout_s", 0.005)
+        self.declare_parameter("serial.allow_enable", False)
         self.declare_parameter("feedback_rate_hz", 50.0)
 
         backend = str(self.get_parameter("backend").value)
@@ -31,6 +32,7 @@ class LowLevelBridgeNode(Node):
                 str(self.get_parameter("serial.port").value),
                 int(self.get_parameter("serial.baudrate").value),
                 float(self.get_parameter("serial.timeout_s").value),
+                bool(self.get_parameter("serial.allow_enable").value),
             )
         else:
             raise ValueError(f"Unknown low-level backend '{backend}'. Expected mock or serial.")

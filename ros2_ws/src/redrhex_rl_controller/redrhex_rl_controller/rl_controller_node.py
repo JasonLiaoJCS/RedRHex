@@ -42,6 +42,7 @@ class RedRhexRLControllerNode(Node):
         self.allow_history_dim = bool(_declare_get(self, "policy.allow_history_dim", True))
 
         self.enable_policy_param = bool(_declare_get(self, "state_machine.enable_policy_on_start", False))
+        self.enable_motor_output_param = bool(_declare_get(self, "state_machine.enable_motor_output_on_start", False))
         self.init_stand_duration_s = float(_declare_get(self, "state_machine.init_stand_duration_s", 2.0))
         self.warmup_duration_s = float(_declare_get(self, "state_machine.warmup_duration_s", 1.0))
 
@@ -76,6 +77,16 @@ class RedRhexRLControllerNode(Node):
             "include_damper_command": bool(_declare_get(self, "action.include_damper_command", True)),
             "stand_main_drive_kp": list(_declare_get(self, "action.stand_main_drive_kp", [12.0] * 6)),
             "stand_main_drive_kd": list(_declare_get(self, "action.stand_main_drive_kd", [1.0] * 6)),
+            "main_drive_sign": list(_declare_get(self, "action.main_drive_sign", [1.0] * 6)),
+            "abad_sign": list(_declare_get(self, "action.abad_sign", [1.0] * 6)),
+            "damper_sign": list(_declare_get(self, "action.damper_sign", [1.0] * 6)),
+            "main_drive_zero_offset_rad": list(_declare_get(self, "action.main_drive_zero_offset_rad", [0.0] * 6)),
+            "abad_zero_offset_rad": list(_declare_get(self, "action.abad_zero_offset_rad", [0.0] * 6)),
+            "damper_zero_offset_rad": list(_declare_get(self, "action.damper_zero_offset_rad", [0.0] * 6)),
+            "main_drive_kp": list(_declare_get(self, "action.main_drive_kp", [0.0] * 6)),
+            "main_drive_kd": list(_declare_get(self, "action.main_drive_kd", [50.0] * 6)),
+            "abad_kp": list(_declare_get(self, "action.abad_kp", [40.0] * 6)),
+            "abad_kd": list(_declare_get(self, "action.abad_kd", [4.0] * 6)),
         }
         safety_cfg = {
             "sensor_timeout_s": self.sensor_timeout_s,
@@ -123,6 +134,7 @@ class RedRhexRLControllerNode(Node):
 
         self.estop = False
         self.enable_policy = self.enable_policy_param
+        self.enable_motor_output = self.enable_motor_output_param
         self.recover_requested = False
         self.last_motor_feedback_time: float | None = None
         self.last_lowlevel_heartbeat_time: float | None = None
@@ -131,6 +143,7 @@ class RedRhexRLControllerNode(Node):
         self.motor_faults: list[bool] = []
         self.battery_state: BatteryState | None = None
         self.last_loop_time: float | None = None
+        self.last_diag_values: dict[str, str] = {}
         self.state_enter_time = self._now_s()
 
         self.create_subscription(Imu, "/imu/data", self._on_imu, 10)
@@ -138,6 +151,7 @@ class RedRhexRLControllerNode(Node):
         self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
         self.create_subscription(Bool, "/estop", self._on_estop, 10)
         self.create_subscription(Bool, "/redrhex/enable_policy", self._on_enable_policy, 10)
+        self.create_subscription(Bool, "/redrhex/enable_motors", self._on_enable_motors, 10)
         self.create_subscription(Bool, "/redrhex/recover", self._on_recover, 10)
         self.create_subscription(Bool, "/redrhex/lowlevel_heartbeat", self._on_lowlevel_heartbeat, 10)
         self.create_subscription(RedRhexMotorState, "/motor_feedback", self._on_motor_feedback, 10)
@@ -169,11 +183,56 @@ class RedRhexRLControllerNode(Node):
     def _on_odom(self, msg: Odometry) -> None:
         self.observation_builder.update_odom(msg, self._now_s())
 
+    def _drop_enable_latches(self, reason: str) -> None:
+        if self.enable_policy or self.enable_motor_output:
+            self.get_logger().warn(f"Dropping enable latches: {reason}")
+        self.enable_policy = False
+        self.enable_motor_output = False
+
+    def _policy_enable_allowed(self) -> bool:
+        return (not self.estop) and self.state_machine.state in (
+            RedRhexState.POLICY_READY,
+            RedRhexState.POLICY_RUN,
+        )
+
+    def _motor_output_enable_allowed(self) -> bool:
+        return (not self.estop) and self.state_machine.state in (
+            RedRhexState.INIT_STAND,
+            RedRhexState.WARMUP,
+            RedRhexState.POLICY_READY,
+            RedRhexState.POLICY_RUN,
+        )
+
     def _on_estop(self, msg: Bool) -> None:
         self.estop = bool(msg.data)
+        if self.estop:
+            self._drop_enable_latches("E-stop asserted")
 
     def _on_enable_policy(self, msg: Bool) -> None:
-        self.enable_policy = bool(msg.data)
+        requested = bool(msg.data)
+        if not requested:
+            self.enable_policy = False
+            return
+        if not self._policy_enable_allowed():
+            self.enable_policy = False
+            self.get_logger().warn(
+                f"Rejecting policy enable while state={self.state_machine.state.value}, estop={self.estop}"
+            )
+            return
+        self.enable_policy = True
+
+    def _on_enable_motors(self, msg: Bool) -> None:
+        requested = bool(msg.data)
+        if not requested:
+            self.enable_motor_output = False
+            return
+        if not self._motor_output_enable_allowed():
+            self.enable_motor_output = False
+            self.get_logger().warn(
+                f"Rejecting motor output enable while state={self.state_machine.state.value}, estop={self.estop}"
+            )
+            return
+        self.enable_motor_output = True
 
     def _on_recover(self, msg: Bool) -> None:
         self.recover_requested = bool(msg.data)
@@ -202,6 +261,16 @@ class RedRhexRLControllerNode(Node):
         joint_age = None if self.observation_builder.joint_time is None else now_s - self.observation_builder.joint_time
         motor_age = None if self.last_motor_feedback_time is None else now_s - self.last_motor_feedback_time
         heartbeat_age = None if self.last_lowlevel_heartbeat_time is None else now_s - self.last_lowlevel_heartbeat_time
+        self.last_diag_values = {
+            "imu_age_s": self._fmt_optional(imu_age),
+            "joint_state_age_s": self._fmt_optional(joint_age),
+            "motor_feedback_age_s": self._fmt_optional(motor_age),
+            "heartbeat_age_s": self._fmt_optional(heartbeat_age),
+            "control_loop_dt_s": f"{dt:.4f}",
+            "roll_rad": f"{roll:.4f}",
+            "pitch_rad": f"{pitch:.4f}",
+            "cmd_vel": ",".join(f"{x:.3f}" for x in self.observation_builder.cmd_vel),
+        }
 
         pre_safety = SafetyState(
             estop=self.estop,
@@ -219,6 +288,8 @@ class RedRhexRLControllerNode(Node):
         )
         safety_result = self.safety_filter.check(pre_safety)
         ignore_waiting_timeouts = self.state_machine.state in (RedRhexState.BOOT, RedRhexState.SENSOR_CHECK)
+        if not safety_result.ok and not ignore_waiting_timeouts:
+            self._drop_enable_latches("; ".join(safety_result.reasons[:3]))
         sm_safety_ok = safety_result.ok or ignore_waiting_timeouts
         if self.estop:
             sm_safety_ok = False
@@ -248,6 +319,8 @@ class RedRhexRLControllerNode(Node):
             if state == RedRhexState.INIT_STAND:
                 self.observation_builder.reset(gait_phase=0.0)
                 self.action_decoder.reset(gait_phase=0.0)
+            if state in (RedRhexState.PROTECTIVE_STOP, RedRhexState.FALL_DETECTED, RedRhexState.RECOVER):
+                self._drop_enable_latches(self.state_machine.last_transition_reason)
 
         decoded: DecodedMotorCommand | None = None
         observation_for_pub: np.ndarray | None = None
@@ -278,6 +351,7 @@ class RedRhexRLControllerNode(Node):
                 post_safety = self.safety_filter.check(pre_safety, single_obs, raw_action, decoded)
                 if not post_safety.ok:
                     reasons.extend(post_safety.reasons)
+                    self._drop_enable_latches("; ".join(post_safety.reasons[:3]))
                     self.state_machine.transition(RedRhexState.PROTECTIVE_STOP, "; ".join(post_safety.reasons))
                     decoded = self.action_decoder.protective_stop_command(
                         self.observation_builder.get_main_drive_positions(),
@@ -296,6 +370,7 @@ class RedRhexRLControllerNode(Node):
         except Exception as exc:
             reasons.append(str(exc))
             self.get_logger().error(f"Control tick failed: {exc}\n{traceback.format_exc()}")
+            self._drop_enable_latches(str(exc))
             self.state_machine.transition(RedRhexState.PROTECTIVE_STOP, str(exc))
             decoded = self.action_decoder.protective_stop_command(
                 self.observation_builder.get_main_drive_positions(),
@@ -316,9 +391,13 @@ class RedRhexRLControllerNode(Node):
         msg.kp = decoded.kp
         msg.kd = decoded.kd
         msg.effort_limit_nm = decoded.effort_limit_nm
-        msg.enable = decoded.enable
+        msg.enable = bool(decoded.enable and self.enable_motor_output and not self.estop)
         msg.mode = decoded.mode
         self.motor_cmd_pub.publish(msg)
+
+    @staticmethod
+    def _fmt_optional(value: float | None) -> str:
+        return "none" if value is None else f"{value:.4f}"
 
     def _publish_state_and_diagnostics(self, reasons: list[str], ok: bool) -> None:
         state_msg = String()
@@ -337,8 +416,11 @@ class RedRhexRLControllerNode(Node):
             KeyValue(key="last_transition_reason", value=self.state_machine.last_transition_reason),
             KeyValue(key="policy_loaded", value=str(self.policy_loaded)),
             KeyValue(key="policy_enabled", value=str(self.enable_policy)),
+            KeyValue(key="motor_output_enabled", value=str(self.enable_motor_output and not self.estop)),
+            KeyValue(key="estop", value=str(self.estop)),
             KeyValue(key="onnx_path", value=self.onnx_path),
         ]
+        status.values.extend(KeyValue(key=key, value=value) for key, value in self.last_diag_values.items())
         arr = DiagnosticArray()
         arr.header.stamp = self.get_clock().now().to_msg()
         arr.status = [status]

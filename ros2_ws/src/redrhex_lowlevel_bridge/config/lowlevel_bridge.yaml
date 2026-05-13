@@ -8,3 +8,6 @@ redrhex_lowlevel_bridge:
       port: "/dev/ttyUSB0"
       baudrate: 921600
       timeout_s: 0.005
+      # Keep false while the MCU packet format is provisional. Set true only
+      # after the low-level board has its own watchdog, CRC validation, and E-stop path.
+      allow_enable: false

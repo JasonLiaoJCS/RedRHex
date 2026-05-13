@@ -96,6 +96,7 @@ class ObservationBuilder:
         self.main_drive_joint_names = list(self.cfg.get("main_drive_joint_names", C.MAIN_DRIVE_JOINT_NAMES))
         self.abad_joint_names = list(self.cfg.get("abad_joint_names", C.ABAD_JOINT_NAMES))
         self.required_joint_names = self.main_drive_joint_names + self.abad_joint_names
+        self._validate_config()
 
         self.last_actions = np.zeros(C.ACTION_DIM, dtype=np.float32)
         self.gait_phase = 0.0
@@ -112,6 +113,36 @@ class ObservationBuilder:
         self.cmd_time: float | None = None
         self.odom_lin_vel = np.zeros(3, dtype=np.float64)
         self.odom_time: float | None = None
+
+    def _validate_config(self) -> None:
+        if self.expected_obs_dim != C.OBS_DIM_SINGLE:
+            raise ValueError(f"expected_obs_dim must be {C.OBS_DIM_SINGLE}, got {self.expected_obs_dim}")
+        if self.history_length <= 0:
+            raise ValueError("policy_history_length must be positive")
+        if self.policy_input_dim not in (C.OBS_DIM_SINGLE, C.OBS_DIM_SINGLE * self.history_length):
+            raise ValueError(
+                f"policy_input_dim must be {C.OBS_DIM_SINGLE} or {C.OBS_DIM_SINGLE * self.history_length}, "
+                f"got {self.policy_input_dim}"
+            )
+        if self.base_lin_vel_source not in ("zero", "odom"):
+            raise ValueError("base_lin_vel_source must be 'zero' or 'odom'")
+
+        for name, joint_names in (
+            ("main_drive_joint_names", self.main_drive_joint_names),
+            ("abad_joint_names", self.abad_joint_names),
+        ):
+            if len(joint_names) != 6:
+                raise ValueError(f"{name} must contain 6 joints, got {len(joint_names)}")
+            if len(set(joint_names)) != len(joint_names):
+                raise ValueError(f"{name} contains duplicate names: {joint_names}")
+        if set(self.main_drive_joint_names).intersection(self.abad_joint_names):
+            raise ValueError("main_drive_joint_names and abad_joint_names overlap")
+
+        for key in ("vx", "vy", "wz"):
+            lo = self.command_limits[f"{key}_min"]
+            hi = self.command_limits[f"{key}_max"]
+            if not np.isfinite([lo, hi]).all() or lo > hi:
+                raise ValueError(f"invalid command limit for {key}: min={lo}, max={hi}")
 
     def reset(self, gait_phase: float = 0.0) -> None:
         self.gait_phase = float(gait_phase) % (2.0 * math.pi)
@@ -226,7 +257,6 @@ class ObservationBuilder:
             raise RuntimeError(f"Observation dim {obs.shape[0]} != {C.OBS_DIM_SINGLE}.")
         if not np.isfinite(obs).all():
             raise RuntimeError("Observation contains NaN or Inf.")
-        obs = np.clip(np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0), -100.0, 100.0)
         return obs
 
     def build_policy_input(self, now_s: float) -> np.ndarray:

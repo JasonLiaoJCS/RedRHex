@@ -78,6 +78,7 @@ class PolicyONNXRunner:
         allowed_obs_dims = {self.expected_obs_dim}
         if self.allow_history_dim:
             allowed_obs_dims.add(self.expected_obs_dim * 5)
+        self.allowed_obs_dims = allowed_obs_dims
         if self.obs_dim is not None and self.obs_dim not in allowed_obs_dims:
             raise ValueError(
                 f"ONNX input dim {self.obs_dim} is not compatible with expected "
@@ -119,6 +120,10 @@ class PolicyONNXRunner:
             raise ValueError(f"Observation must have shape [1, N] or [N], got {obs.shape}.")
         if self.obs_dim is not None and obs.shape[1] != self.obs_dim:
             raise ValueError(f"Observation dim {obs.shape[1]} does not match ONNX input dim {self.obs_dim}.")
+        if self.obs_dim is None and obs.shape[1] not in self.allowed_obs_dims:
+            raise ValueError(
+                f"Observation dim {obs.shape[1]} is not one of allowed dims {sorted(self.allowed_obs_dims)}."
+            )
         if not np.isfinite(obs).all():
             raise ValueError("Observation contains NaN or Inf.")
 

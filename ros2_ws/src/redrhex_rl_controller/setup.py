@@ -25,6 +25,7 @@ setup(
             "rl_controller_node = redrhex_rl_controller.rl_controller_node:main",
             "fake_sensor_node = redrhex_rl_controller.fake_sensor_node:main",
             "motor_command_tool = redrhex_rl_controller.motor_command_tool:main",
+            "preflight_check = redrhex_rl_controller.preflight_check:main",
         ],
     },
 )
