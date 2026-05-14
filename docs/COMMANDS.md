@@ -266,7 +266,7 @@ http://localhost:6006
 
 ## 8.1 Training Panel
 
-這個 branch 有一個本機 training panel，可以用表單啟動 train、查看 reward/tweakable files、整理 training history notes，並一鍵啟動 TensorBoard / play checkpoint。
+這個 branch 有一個本機 training panel，可以用表單啟動 train、查看 reward/tweakable files、整理 training history notes，並從每個 history run 一鍵啟動 TensorBoard / play checkpoint / resume。
 
 本機使用：
 
@@ -296,6 +296,14 @@ ssh -L 8080:127.0.0.1:8080 user@host
 ```
 
 V1 是 read-only reward/config browser：只顯示檔案、說明、reward scale index，不直接改 source code。
+
+History 頁面功能：
+
+- Rename：替 training run 加上好讀名稱。
+- TensorBoard：針對該 run 的 log directory 啟動 TensorBoard。
+- Play：用該 run 的 latest checkpoint 啟動 `scripts/rsl_rl/play.py`。
+- Resume：把該 run 的 latest checkpoint 帶回 Train 表單，再由你選擇新的 env / iteration 後繼續 train。
+- Debug：顯示 panel 執行的完整 command 和 captured terminal log，方便失敗時看錯誤。TensorBoard / Play 如果啟動後馬上失敗，也會把 log tail 回傳到 panel。
 
 ## 9. 目前這台機器已驗證到哪裡
 

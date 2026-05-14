@@ -5,13 +5,26 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || response.statusText);
+  if (!response.ok) {
+    const error = new Error(data.error || response.statusText);
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -35,7 +48,7 @@ function setView(name) {
 function formData(form) {
   const data = Object.fromEntries(new FormData(form).entries());
   data.headless = form.elements.headless.checked;
-  data.resume = form.elements.resume.checked;
+  data.resume = Boolean(data.checkpoint);
   data.num_envs = Number(data.num_envs);
   data.max_iterations = Number(data.max_iterations);
   return data;
@@ -80,31 +93,55 @@ async function loadRuns() {
     .map((run) => {
       const active = state.selectedRun && state.selectedRun.id === run.id ? "active" : "";
       const checkpoint = run.latest_checkpoint ? "checkpoint" : "no checkpoint";
+      const title = run.display_name || run.id;
       return `
-        <article class="run-card ${active}" data-run-id="${run.id}">
+        <article class="run-card ${active}" data-run-id="${escapeHtml(run.id)}">
           <div class="run-top">
-            <strong>${run.id}</strong>
-            <span class="pill">${run.status || "unknown"}</span>
+            <strong>${escapeHtml(title)}</strong>
+            <span class="pill">${escapeHtml(run.status || "unknown")}</span>
           </div>
-          <small>${run.created_at || ""}</small>
-          <small>${run.log_dir || "No RSL-RL log linked yet"}</small>
-          <small>${checkpoint}${run.has_notes ? " · notes" : ""}</small>
+          <small>${escapeHtml(run.id)}</small>
+          <small>${escapeHtml(run.created_at || "")}</small>
+          <small>${escapeHtml(run.log_dir || "No RSL-RL log linked yet")}</small>
+          <small>${escapeHtml(checkpoint)}${run.has_notes ? " · notes" : ""}</small>
+          <div class="run-actions">
+            <button data-action="tensorboard" data-run-id="${escapeHtml(run.id)}">TensorBoard</button>
+            <button data-action="play" data-run-id="${escapeHtml(run.id)}">Play</button>
+            <button data-action="resume" data-run-id="${escapeHtml(run.id)}">Resume</button>
+            <button data-action="debug" data-run-id="${escapeHtml(run.id)}">Debug</button>
+          </div>
         </article>
       `;
     })
     .join("");
   document.querySelectorAll(".run-card").forEach((card) => {
-    card.addEventListener("click", () => selectRun(card.dataset.runId));
+    card.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (button) {
+        event.stopPropagation();
+        handleRunAction(button.dataset.action, button.dataset.runId);
+        return;
+      }
+      selectRun(card.dataset.runId);
+    });
   });
 }
 
 async function selectRun(runId) {
   state.selectedRun = state.runs.find((run) => run.id === runId);
-  $("#notes-title").textContent = `Notes: ${runId}`;
+  $("#details-title").textContent = state.selectedRun.display_name || runId;
+  $("#run-name").value = state.selectedRun.display_name || "";
   const data = await api(`/api/runs/${encodeURIComponent(runId)}/notes`);
   $("#notes-editor").value = data.notes;
   $("#notes-status").textContent = state.selectedRun.latest_checkpoint || "No checkpoint available yet.";
+  await loadDebug(runId);
   await loadRuns();
+}
+
+async function loadDebug(runId) {
+  const debug = await api(`/api/runs/${encodeURIComponent(runId)}/debug`);
+  $("#debug-command").textContent = debug.command || debug.debug_hint || "";
+  $("#debug-log").textContent = debug.process_log_tail || debug.debug_hint || "";
 }
 
 async function startTraining(event) {
@@ -135,25 +172,78 @@ async function saveNotes() {
   await loadRuns();
 }
 
-async function startTensorBoard(host) {
-  const data = await api("/api/tensorboard/start", {
-    method: "POST",
-    body: JSON.stringify({ host, port: 6006 }),
-  });
-  const url = host === "0.0.0.0" ? `http://${location.hostname}:6006` : data.url;
-  window.open(url, "_blank", "noopener");
-}
-
-async function playSelectedRun() {
+async function saveName() {
   if (!state.selectedRun) {
     $("#notes-status").textContent = "Select a run first.";
     return;
   }
-  const data = await api(`/api/runs/${encodeURIComponent(state.selectedRun.id)}/play`, {
+  await api(`/api/runs/${encodeURIComponent(state.selectedRun.id)}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ display_name: $("#run-name").value }),
+  });
+  $("#notes-status").textContent = "Name saved.";
+  await loadRuns();
+}
+
+function tensorboardHost() {
+  return location.hostname === "127.0.0.1" || location.hostname === "localhost" ? "127.0.0.1" : "0.0.0.0";
+}
+
+function displayTensorboardUrl(data, host) {
+  return host === "0.0.0.0" ? `http://${location.hostname}:${data.port}` : data.url;
+}
+
+async function startTensorBoardForRun(runId) {
+  const host = tensorboardHost();
+  const data = await api(`/api/runs/${encodeURIComponent(runId)}/tensorboard`, {
+    method: "POST",
+    body: JSON.stringify({ host }),
+  });
+  $("#notes-status").textContent = data.already_running
+    ? `TensorBoard is already running on port ${data.port}.`
+    : `Started TensorBoard on port ${data.port}.`;
+  window.open(displayTensorboardUrl(data, host), "_blank", "noopener");
+}
+
+async function playRun(runId) {
+  const data = await api(`/api/runs/${encodeURIComponent(runId)}/play`, {
     method: "POST",
     body: JSON.stringify({ device: "cuda:0" }),
   });
   $("#notes-status").textContent = `Started play process ${data.pid}.`;
+}
+
+function resumeRun(runId) {
+  const run = state.runs.find((item) => item.id === runId);
+  if (!run || !run.latest_checkpoint) {
+    $("#notes-status").textContent = "No checkpoint available for this run.";
+    return;
+  }
+  const form = $("#train-form");
+  form.elements.checkpoint.value = run.latest_checkpoint;
+  setView("train");
+  $("#train-status").textContent = `Resume selected from ${run.display_name || run.id}. Choose iterations/envs, then start training.`;
+}
+
+async function handleRunAction(action, runId) {
+  if (!state.selectedRun || state.selectedRun.id !== runId) {
+    await selectRun(runId);
+  }
+  try {
+    if (action === "tensorboard") await startTensorBoardForRun(runId);
+    if (action === "play") await playRun(runId);
+    if (action === "resume") resumeRun(runId);
+    if (action === "debug") {
+      await loadDebug(runId);
+      $("#notes-status").textContent = "Debug output loaded.";
+    }
+  } catch (error) {
+    if (error.data && error.data.log_tail) {
+      $("#debug-command").textContent = error.data.command || "";
+      $("#debug-log").textContent = error.data.log_tail;
+    }
+    $("#notes-status").textContent = error.message;
+  }
 }
 
 function applyPreset(kind) {
@@ -169,6 +259,11 @@ function applyPreset(kind) {
   form.elements.device.value = "cuda:0";
 }
 
+function clearResume() {
+  $("#train-form").elements.checkpoint.value = "";
+  $("#train-status").textContent = "Resume checkpoint cleared.";
+}
+
 async function refreshAll() {
   await Promise.all([loadSystem(), loadTweaks(), loadRuns()]);
 }
@@ -180,11 +275,12 @@ document.querySelectorAll(".nav-button").forEach((button) => {
 $("#train-form").addEventListener("submit", startTraining);
 $("#smoke-button").addEventListener("click", () => applyPreset("smoke"));
 $("#debug-button").addEventListener("click", () => applyPreset("debug"));
+$("#clear-resume").addEventListener("click", clearResume);
 $("#refresh-button").addEventListener("click", refreshAll);
+$("#save-name").addEventListener("click", saveName);
 $("#save-notes").addEventListener("click", saveNotes);
-$("#play-run").addEventListener("click", playSelectedRun);
-$("#tensorboard-local").addEventListener("click", () => startTensorBoard("127.0.0.1"));
-$("#tensorboard-lan").addEventListener("click", () => startTensorBoard("0.0.0.0"));
+$("#resume-run").addEventListener("click", () => state.selectedRun && resumeRun(state.selectedRun.id));
+$("#play-run").addEventListener("click", () => state.selectedRun && playRun(state.selectedRun.id));
+$("#tensorboard-run").addEventListener("click", () => state.selectedRun && startTensorBoardForRun(state.selectedRun.id));
 
 refreshAll();
-

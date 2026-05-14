@@ -24,6 +24,16 @@ def _safe_note_id(run_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
 
 
+def tail_file(path: Path, max_chars: int = 50000) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    with path.open("rb") as file:
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(max(0, size - max_chars))
+        return file.read().decode("utf-8", errors="replace")
+
+
 def latest_checkpoint(log_dir: Path) -> str | None:
     models = []
     for path in log_dir.glob("model_*.pt"):
@@ -62,6 +72,34 @@ class HistoryStore:
                 break
         self._save_records(records)
 
+    def patch_run_metadata(self, run_id: str, **updates: Any) -> dict:
+        records = self._load_records()
+        now = datetime.now().isoformat(timespec="seconds")
+        for record in records:
+            if record.get("id") == run_id:
+                record.update(updates)
+                record["updated_at"] = now
+                self._save_records(records)
+                return record
+        discovered = self.get_run(run_id) or {"id": run_id, "source": "training_panel"}
+        record = {
+            "id": run_id,
+            "source": discovered.get("source", "training_panel"),
+            "created_at": discovered.get("created_at", now),
+            "updated_at": now,
+            "log_dir": discovered.get("log_dir"),
+            **updates,
+        }
+        records.append(record)
+        self._save_records(records)
+        return record
+
+    def rename_run(self, run_id: str, display_name: str) -> dict:
+        name = display_name.strip()
+        if len(name) > 120:
+            raise ValueError("display_name must be 120 characters or fewer")
+        return self.patch_run_metadata(run_id, display_name=name)
+
     def get_note(self, run_id: str) -> str:
         path = self.paths.notes_dir / f"{_safe_note_id(run_id)}.md"
         return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -96,11 +134,23 @@ class HistoryStore:
 
     def list_runs(self) -> list[dict]:
         records = self._load_records()
-        by_log_dir = {record.get("log_dir"): record for record in records if record.get("log_dir")}
-        merged = list(records)
-        known_ids = {record.get("id") for record in records}
-        for discovered in self.discover_rsl_runs():
-            if discovered["id"] in known_ids or discovered.get("log_dir") in by_log_dir:
+        discovered_runs = self.discover_rsl_runs()
+        discovered_by_id = {run["id"]: run for run in discovered_runs}
+        discovered_by_log_dir = {run.get("log_dir"): run for run in discovered_runs if run.get("log_dir")}
+        merged = []
+        represented_ids = set()
+        represented_log_dirs = set()
+        for record in records:
+            discovered = discovered_by_id.get(record.get("id")) or discovered_by_log_dir.get(record.get("log_dir"))
+            merged_record = {**(discovered or {}), **record}
+            merged.append(merged_record)
+            if discovered:
+                represented_ids.add(discovered["id"])
+                represented_log_dirs.add(discovered.get("log_dir"))
+            represented_ids.add(record.get("id"))
+            represented_log_dirs.add(record.get("log_dir"))
+        for discovered in discovered_runs:
+            if discovered["id"] in represented_ids or discovered.get("log_dir") in represented_log_dirs:
                 continue
             merged.append(discovered)
         for record in merged:
@@ -129,3 +179,22 @@ class HistoryStore:
                 return run
         return None
 
+    def get_debug(self, run_id: str) -> dict | None:
+        run = self.get_run(run_id)
+        if not run:
+            return None
+        process_log = Path(run["process_log"]) if run.get("process_log") else None
+        return {
+            "id": run_id,
+            "display_name": run.get("display_name"),
+            "status": run.get("status"),
+            "command": run.get("command"),
+            "log_dir": run.get("log_dir"),
+            "process_log": str(process_log) if process_log else None,
+            "process_log_tail": tail_file(process_log) if process_log else "",
+            "debug_hint": (
+                "This run was launched by the panel, so the command and captured terminal output are shown here."
+                if process_log
+                else "This run was discovered from logs/rsl_rl, so no panel process log is available."
+            ),
+        }

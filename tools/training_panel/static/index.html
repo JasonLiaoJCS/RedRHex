@@ -55,21 +55,18 @@
             <input name="seed" type="number" placeholder="optional" />
           </label>
           <label>
-            Checkpoint
-            <input name="checkpoint" placeholder="optional resume checkpoint" />
+            Resume Checkpoint
+            <input name="checkpoint" readonly placeholder="Select Resume on a history run" />
           </label>
           <label class="check-row">
             <input name="headless" type="checkbox" checked />
             Headless
           </label>
-          <label class="check-row">
-            <input name="resume" type="checkbox" />
-            Resume
-          </label>
           <div class="form-actions">
             <button type="submit" class="primary-button">Start Training</button>
             <button type="button" id="smoke-button" class="ghost-button">Use Smoke Defaults</button>
             <button type="button" id="debug-button" class="ghost-button">Use Debug Defaults</button>
+            <button type="button" id="clear-resume" class="ghost-button">Clear Resume</button>
           </div>
         </form>
         <div id="train-status" class="status-line"></div>
@@ -89,19 +86,29 @@
       </section>
 
       <section id="history" class="view">
-        <div class="history-actions">
-          <button id="tensorboard-local" class="primary-button">TensorBoard Local</button>
-          <button id="tensorboard-lan" class="ghost-button">TensorBoard LAN</button>
-        </div>
         <div class="history-layout">
           <div id="runs" class="run-list"></div>
-          <div class="notes-panel">
-            <h2 id="notes-title">Notes</h2>
+          <div class="details-panel">
+            <h2 id="details-title">Run Details</h2>
+            <label>
+              Display Name
+              <input id="run-name" placeholder="Select a run to rename it" />
+            </label>
+            <div class="form-actions compact-actions">
+              <button id="save-name" class="primary-button">Save Name</button>
+              <button id="resume-run" class="ghost-button">Resume From Checkpoint</button>
+            </div>
+            <h2>Notes</h2>
             <textarea id="notes-editor" placeholder="Select a run to add notes and observations."></textarea>
             <div class="form-actions">
               <button id="save-notes" class="primary-button">Save Notes</button>
-              <button id="play-run" class="ghost-button">Play Latest Checkpoint</button>
+              <button id="tensorboard-run" class="ghost-button">TensorBoard</button>
+              <button id="play-run" class="ghost-button">Play Checkpoint</button>
             </div>
+            <h2>Debug</h2>
+            <p class="muted-copy">Panel-launched runs show the exact command and captured terminal output here.</p>
+            <pre id="debug-command"></pre>
+            <pre id="debug-log"></pre>
             <div id="notes-status" class="status-line"></div>
           </div>
         </div>
@@ -129,4 +136,3 @@
     <script src="/static/app.js"></script>
   </body>
 </html>
-

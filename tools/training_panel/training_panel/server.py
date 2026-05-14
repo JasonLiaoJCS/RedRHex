@@ -5,12 +5,12 @@ import json
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from .commands import DEFAULT_TASK, TrainingParams
 from .config import PanelPaths
 from .history import HistoryStore
-from .processes import ProcessRegistry
+from .processes import ProcessRegistry, ProcessStartError
 from .rewards import reward_file_index
 
 
@@ -51,10 +51,22 @@ class PanelHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/notes"):
             run_id = parsed.path.split("/")[3]
             return self._json({"run_id": run_id, "notes": self.state.history.get_note(run_id)})
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/debug"):
+            run_id = parsed.path.split("/")[3]
+            debug = self.state.history.get_debug(run_id)
+            if not debug:
+                return self._json({"error": "Run not found"}, status=404)
+            return self._json(debug)
         if parsed.path == "/api/tweakables":
             return self._json(reward_file_index(self.state.paths.repo_root))
         if parsed.path == "/api/processes":
             return self._json({"processes": self.state.processes.list_processes()})
+        if parsed.path.startswith("/api/processes/") and parsed.path.endswith("/debug"):
+            process_id = parsed.path.split("/")[3]
+            debug = self.state.processes.get_process_debug(process_id)
+            if not debug:
+                return self._json({"error": "Process not found"}, status=404)
+            return self._json(debug)
         self._not_found()
 
     def do_POST(self) -> None:
@@ -69,8 +81,26 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self._json({"stopped": self.state.processes.stop(run_id)})
             if parsed.path == "/api/tensorboard/start":
                 host = str(payload.get("host") or "127.0.0.1")
-                port = int(payload.get("port") or 6006)
+                port = int(payload["port"]) if payload.get("port") else None
                 return self._json(self.state.processes.start_tensorboard(host=host, port=port))
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/rename"):
+                run_id = parsed.path.split("/")[3]
+                record = self.state.history.rename_run(run_id, str(payload.get("display_name") or ""))
+                return self._json({"saved": True, "run": record})
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/tensorboard"):
+                run_id = parsed.path.split("/")[3]
+                run = self.state.history.get_run(run_id)
+                if not run or not run.get("log_dir"):
+                    return self._json({"error": "No log directory found for run"}, status=404)
+                host = str(payload.get("host") or "127.0.0.1")
+                port = int(payload["port"]) if payload.get("port") else None
+                return self._json(
+                    self.state.processes.start_tensorboard(
+                        host=host,
+                        port=port,
+                        logdir=Path(str(run["log_dir"])),
+                    )
+                )
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/notes"):
                 run_id = parsed.path.split("/")[3]
                 self.state.history.set_note(run_id, str(payload.get("notes") or ""))
@@ -88,6 +118,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     ),
                     status=201,
                 )
+        except ProcessStartError as exc:
+            return self._json(exc.payload, status=500)
         except ValueError as exc:
             return self._json({"error": str(exc)}, status=400)
         self._not_found()
