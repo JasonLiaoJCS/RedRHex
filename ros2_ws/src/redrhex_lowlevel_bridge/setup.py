@@ -22,6 +22,12 @@ setup(
     entry_points={
         "console_scripts": [
             "lowlevel_bridge_node = redrhex_lowlevel_bridge.lowlevel_bridge_node:main",
+            "rinbo_bringup_check = redrhex_lowlevel_bridge.rinbo_bringup_check:main",
+            "rinbo_bringup_plan = redrhex_lowlevel_bridge.biorola_bringup_plan:main",
+            "rinbo_power_tool = redrhex_lowlevel_bridge.rinbo_power_tool:main",
+            "biorola_bringup_check = redrhex_lowlevel_bridge.rinbo_bringup_check:main",
+            "biorola_bringup_plan = redrhex_lowlevel_bridge.biorola_bringup_plan:main",
+            "biorola_power_tool = redrhex_lowlevel_bridge.rinbo_power_tool:main",
         ],
     },
 )

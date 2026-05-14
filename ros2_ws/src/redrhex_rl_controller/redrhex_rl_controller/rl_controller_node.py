@@ -16,6 +16,11 @@ from std_msgs.msg import Bool, Float32MultiArray, String
 
 from redrhex_msgs.msg import RedRhexMotorCommand, RedRhexMotorState
 
+try:
+    from rclpy._rclpy_pybind11 import RCLError
+except Exception:  # pragma: no cover - depends on rclpy version
+    RCLError = RuntimeError
+
 from . import redrhex_contract as C
 from .action_decoder import ActionDecoder, DecodedMotorCommand
 from .observation_builder import ObservationBuilder
@@ -25,7 +30,8 @@ from .state_machine import RedRhexState, RedRhexStateMachine, StateMachineInputs
 
 
 def _declare_get(node: Node, name: str, default):
-    node.declare_parameter(name, default)
+    if not node.has_parameter(name):
+        node.declare_parameter(name, default)
     return node.get_parameter(name).value
 
 
@@ -456,7 +462,7 @@ def main(args=None) -> None:
     node = RedRhexRLControllerNode()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except (KeyboardInterrupt, ExternalShutdownException, RCLError):
         pass
     finally:
         node.destroy_node()

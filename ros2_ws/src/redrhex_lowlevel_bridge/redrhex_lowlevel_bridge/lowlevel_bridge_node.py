@@ -15,6 +15,11 @@ from .rinbo_ros_backend import RinboRosBackend
 from .serial_bridge import SerialLowLevelBridge
 from .sbrio_udp_bridge import SbrioUdpBridge
 
+try:
+    from rclpy._rclpy_pybind11 import RCLError
+except Exception:  # pragma: no cover - depends on rclpy version
+    RCLError = RuntimeError
+
 
 MAIN_JOINT_NAMES_POLICY_ORDER = [
     "Revolute_15",
@@ -51,7 +56,11 @@ class LowLevelBridgeNode(Node):
         self.declare_parameter("rinbo.allow_enable", False)
         self.declare_parameter("rinbo.publish_when_disabled", False)
         self.declare_parameter("rinbo.disabled_servo_control_mode", 0)
+        self.declare_parameter("rinbo.publish_shutdown_disable", True)
+        self.declare_parameter("rinbo.shutdown_disable_repeats", 5)
+        self.declare_parameter("rinbo.shutdown_disable_period_s", 0.02)
         self.declare_parameter("rinbo.require_state", True)
+        self.declare_parameter("rinbo.block_if_duplicate_command_publishers", True)
         self.declare_parameter("rinbo.state_timeout_s", 0.25)
         self.declare_parameter("rinbo.main_position_counts_per_rev", 54984.83)
         self.declare_parameter("rinbo.main_pwm_per_rad_s", 120.0)
@@ -59,8 +68,11 @@ class LowLevelBridgeNode(Node):
         self.declare_parameter("rinbo.main_encoder_zero_counts_rinbo_order", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("rinbo.main_encoder_sign_rinbo_order", [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
         self.declare_parameter("rinbo.main_velocity_sign_policy_order", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        self.declare_parameter("rinbo.main_direction_positive_rinbo_order", [False, False, False, True, True, True])
-        self.declare_parameter("rinbo.abad_encoder_zero_rinbo_order", [739, 2566, 3283, 1945, 2070, 987])
+        self.declare_parameter("rinbo.main_direction_positive_rinbo_order", [True, True, True, False, False, False])
+        self.declare_parameter("rinbo.main_velocity_filter_alpha", 0.35)
+        self.declare_parameter("rinbo.main_velocity_max_dt_s", 0.20)
+        self.declare_parameter("rinbo.main_velocity_clip_rad_s", 80.0)
+        self.declare_parameter("rinbo.abad_encoder_zero_rinbo_order", [740, 2565, 3283, 1944, 2071, 989])
         self.declare_parameter("rinbo.abad_encoder_counts_per_rad", 1000.0)
         self.declare_parameter("rinbo.abad_encoder_min", 0)
         self.declare_parameter("rinbo.abad_encoder_max", 65535)
@@ -89,7 +101,7 @@ class LowLevelBridgeNode(Node):
                 bool(self.get_parameter("sbrio.allow_enable").value),
                 bool(self.get_parameter("sbrio.require_feedback").value),
             )
-        elif backend == "rinbo_ros":
+        elif backend in ("rinbo_ros", "biorola_ros"):
             self.bridge = RinboRosBackend(
                 self,
                 str(self.get_parameter("rinbo.command_topic").value),
@@ -100,7 +112,11 @@ class LowLevelBridgeNode(Node):
                 bool(self.get_parameter("rinbo.allow_enable").value),
                 bool(self.get_parameter("rinbo.publish_when_disabled").value),
                 int(self.get_parameter("rinbo.disabled_servo_control_mode").value),
+                bool(self.get_parameter("rinbo.publish_shutdown_disable").value),
+                int(self.get_parameter("rinbo.shutdown_disable_repeats").value),
+                float(self.get_parameter("rinbo.shutdown_disable_period_s").value),
                 bool(self.get_parameter("rinbo.require_state").value),
+                bool(self.get_parameter("rinbo.block_if_duplicate_command_publishers").value),
                 float(self.get_parameter("rinbo.state_timeout_s").value),
                 float(self.get_parameter("rinbo.main_position_counts_per_rev").value),
                 float(self.get_parameter("rinbo.main_pwm_per_rad_s").value),
@@ -109,6 +125,9 @@ class LowLevelBridgeNode(Node):
                 list(self.get_parameter("rinbo.main_encoder_sign_rinbo_order").value),
                 list(self.get_parameter("rinbo.main_velocity_sign_policy_order").value),
                 list(self.get_parameter("rinbo.main_direction_positive_rinbo_order").value),
+                float(self.get_parameter("rinbo.main_velocity_filter_alpha").value),
+                float(self.get_parameter("rinbo.main_velocity_max_dt_s").value),
+                float(self.get_parameter("rinbo.main_velocity_clip_rad_s").value),
                 list(self.get_parameter("rinbo.abad_encoder_zero_rinbo_order").value),
                 float(self.get_parameter("rinbo.abad_encoder_counts_per_rad").value),
                 int(self.get_parameter("rinbo.abad_encoder_min").value),
@@ -119,7 +138,7 @@ class LowLevelBridgeNode(Node):
             )
         else:
             raise ValueError(
-                f"Unknown low-level backend '{backend}'. Expected mock, serial, sbrio_udp, or rinbo_ros."
+                f"Unknown low-level backend '{backend}'. Expected mock, serial, sbrio_udp, rinbo_ros, or biorola_ros."
             )
         self.backend = backend
         self.bridge.connect()
@@ -176,7 +195,7 @@ def main(args=None) -> None:
     node = LowLevelBridgeNode()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except (KeyboardInterrupt, ExternalShutdownException, RCLError):
         pass
     finally:
         node.destroy_node()

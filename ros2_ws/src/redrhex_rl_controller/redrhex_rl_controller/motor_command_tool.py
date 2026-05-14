@@ -12,11 +12,18 @@ import json
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from std_msgs.msg import Bool
 
 from redrhex_msgs.msg import RedRhexMotorCommand
 
 from . import redrhex_contract as C
+
+try:
+    from rclpy._rclpy_pybind11 import RCLError
+except Exception:  # pragma: no cover - depends on rclpy version
+    RCLError = RuntimeError
 
 
 def _base_command(enable: bool, mode: int) -> RedRhexMotorCommand:
@@ -37,7 +44,12 @@ class MotorCommandTool(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("redrhex_motor_command_tool")
         self.args = args
-        self.pub = self.create_publisher(RedRhexMotorCommand, "/redrhex/motor_commands", 10)
+        self.lowlevel_heartbeat = False
+        self.pub = self.create_publisher(RedRhexMotorCommand, args.topic, 10)
+        self.create_subscription(Bool, args.heartbeat_topic, self._on_heartbeat, 10)
+
+    def _on_heartbeat(self, msg: Bool) -> None:
+        self.lowlevel_heartbeat = bool(msg.data)
 
     def build_command(self) -> RedRhexMotorCommand:
         msg = _base_command(enable=self.args.enable, mode=self.args.mode_id)
@@ -109,6 +121,7 @@ class MotorCommandTool(Node):
         if self.args.dry_run:
             print(json.dumps(self.summarize_command(msg), indent=2))
             return
+        self.wait_until_ready(msg.enable)
 
         period = 1.0 / max(float(self.args.rate_hz), 1.0)
         end_time = time.monotonic() + max(float(self.args.duration), period)
@@ -121,6 +134,30 @@ class MotorCommandTool(Node):
             self.pub.publish(msg)
             rclpy.spin_once(self, timeout_sec=0.0)
             time.sleep(period)
+
+    def wait_until_ready(self, enabled: bool) -> None:
+        self._wait_for_motor_command_subscriber()
+        if enabled and not self.args.skip_heartbeat_check:
+            deadline = time.monotonic() + max(float(self.args.heartbeat_timeout_s), 0.0)
+            while rclpy.ok() and time.monotonic() < deadline:
+                if self.lowlevel_heartbeat:
+                    return
+                rclpy.spin_once(self, timeout_sec=0.05)
+            raise RuntimeError(
+                f"Refusing enabled command because {self.args.heartbeat_topic} did not become true. "
+                "Start/fix redrhex_lowlevel_bridge first."
+            )
+
+    def _wait_for_motor_command_subscriber(self) -> None:
+        deadline = time.monotonic() + max(float(self.args.wait_for_subscriber_s), 0.0)
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.pub.get_subscription_count() > 0:
+                return
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self.pub.get_subscription_count() == 0 and not self.args.allow_no_subscriber:
+            raise RuntimeError(
+                f"No subscriber on {self.args.topic}. Start redrhex_lowlevel_bridge before manual motor tests."
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,6 +181,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required together with --enable. Confirms you have E-stop and the robot is safe to move.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the command JSON and do not publish.")
+    parser.add_argument("--topic", default="/redrhex/motor_commands")
+    parser.add_argument("--heartbeat-topic", default="/redrhex/lowlevel_heartbeat")
+    parser.add_argument("--wait-for-subscriber-s", type=float, default=2.0)
+    parser.add_argument(
+        "--allow-no-subscriber",
+        action="store_true",
+        help="Publish even if no low-level bridge subscriber is visible. Not recommended on hardware.",
+    )
+    parser.add_argument(
+        "--skip-heartbeat-check",
+        action="store_true",
+        help="Allow enabled commands without /redrhex/lowlevel_heartbeat=true. Not recommended on hardware.",
+    )
+    parser.add_argument("--heartbeat-timeout-s", type=float, default=2.0)
     parser.add_argument("--index", type=int, default=0, help="Leg/joint index 0..5 in policy order.")
     parser.add_argument("--position", type=float, default=0.0, help="Target ABAD position in rad.")
     parser.add_argument("--velocity", type=float, default=0.3, help="Target main-drive velocity in rad/s.")
@@ -177,6 +228,11 @@ def main(argv=None) -> None:
     node = MotorCommandTool(args)
     try:
         node.run()
+    except (KeyboardInterrupt, ExternalShutdownException, RCLError):
+        pass
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

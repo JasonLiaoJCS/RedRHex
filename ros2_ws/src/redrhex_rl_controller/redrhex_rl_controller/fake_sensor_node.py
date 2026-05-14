@@ -11,6 +11,11 @@ from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Bool
 
+try:
+    from rclpy._rclpy_pybind11 import RCLError
+except Exception:  # pragma: no cover - depends on rclpy version
+    RCLError = RuntimeError
+
 from . import redrhex_contract as C
 
 
@@ -86,7 +91,7 @@ def main(args=None) -> None:
     node = RedRhexFakeSensorNode()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except (KeyboardInterrupt, ExternalShutdownException, RCLError):
         pass
     finally:
         node.destroy_node()

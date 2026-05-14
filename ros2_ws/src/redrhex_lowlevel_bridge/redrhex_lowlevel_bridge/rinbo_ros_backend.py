@@ -1,6 +1,6 @@
-"""Adapter backend for JasonLiaoJCS/RhexROS2 rinbo_msgs.
+"""Adapter backend for JasonLiaoJCS/BioRoLaROS2 rinbo_msgs.
 
-This backend is for the existing RhexROS2 stack:
+This backend is for the existing BioRoLaROS2/RhexROS2 stack:
   /motor/command  rinbo_msgs/msg/MotorCmdStamped
   /motor/state    rinbo_msgs/msg/MotorStateStamped
 
@@ -29,7 +29,7 @@ class RinboLegMapping:
 
 
 class RinboRosBackend(LowLevelBridgeBase):
-    """ROS adapter for the existing RhexROS2 bridge.
+    """ROS adapter for the existing BioRoLaROS2/RhexROS2 bridge.
 
     The rinbo bridge expects PWM-like main-drive commands in LegCmd.voltage /
     LegCmd.direction. ABAD commands are sent as ServoCmd.position_encoder.
@@ -59,7 +59,11 @@ class RinboRosBackend(LowLevelBridgeBase):
         allow_enable: bool,
         publish_when_disabled: bool,
         disabled_servo_control_mode: int,
+        publish_shutdown_disable: bool,
+        shutdown_disable_repeats: int,
+        shutdown_disable_period_s: float,
         require_state: bool,
+        block_if_duplicate_command_publishers: bool,
         state_timeout_s: float,
         main_position_counts_per_rev: float,
         main_pwm_per_rad_s: float,
@@ -68,6 +72,9 @@ class RinboRosBackend(LowLevelBridgeBase):
         main_encoder_sign_rinbo_order: list[float],
         main_velocity_sign_policy_order: list[float],
         main_direction_positive_rinbo_order: list[bool],
+        main_velocity_filter_alpha: float,
+        main_velocity_max_dt_s: float,
+        main_velocity_clip_rad_s: float,
         abad_encoder_zero_rinbo_order: list[int],
         abad_encoder_counts_per_rad: float,
         abad_encoder_min: int,
@@ -85,7 +92,11 @@ class RinboRosBackend(LowLevelBridgeBase):
         self.allow_enable = bool(allow_enable)
         self.publish_when_disabled = bool(publish_when_disabled)
         self.disabled_servo_control_mode = int(disabled_servo_control_mode)
+        self.publish_shutdown_disable = bool(publish_shutdown_disable)
+        self.shutdown_disable_repeats = int(shutdown_disable_repeats)
+        self.shutdown_disable_period_s = float(shutdown_disable_period_s)
         self.require_state = bool(require_state)
+        self.block_if_duplicate_command_publishers = bool(block_if_duplicate_command_publishers)
         self.state_timeout_s = float(state_timeout_s)
         self.main_position_counts_per_rev = float(main_position_counts_per_rev)
         self.main_rad_per_count = 2.0 * math.pi / self.main_position_counts_per_rev
@@ -95,6 +106,9 @@ class RinboRosBackend(LowLevelBridgeBase):
         self.main_encoder_sign_rinbo_order = [float(x) for x in main_encoder_sign_rinbo_order]
         self.main_velocity_sign_policy_order = [float(x) for x in main_velocity_sign_policy_order]
         self.main_direction_positive_rinbo_order = [bool(x) for x in main_direction_positive_rinbo_order]
+        self.main_velocity_filter_alpha = float(main_velocity_filter_alpha)
+        self.main_velocity_max_dt_s = float(main_velocity_max_dt_s)
+        self.main_velocity_clip_rad_s = float(main_velocity_clip_rad_s)
         self.abad_encoder_zero_rinbo_order = [int(x) for x in abad_encoder_zero_rinbo_order]
         self.abad_encoder_counts_per_rad = float(abad_encoder_counts_per_rad)
         self.abad_encoder_min = int(abad_encoder_min)
@@ -125,24 +139,40 @@ class RinboRosBackend(LowLevelBridgeBase):
             raise ValueError("abad_encoder_counts_per_rad must be positive")
         if self.abad_encoder_min >= self.abad_encoder_max:
             raise ValueError("abad_encoder_min must be smaller than abad_encoder_max")
+        if not 0.0 <= self.main_velocity_filter_alpha <= 1.0:
+            raise ValueError("main_velocity_filter_alpha must be in [0, 1]")
+        if self.main_velocity_max_dt_s <= 0.0:
+            raise ValueError("main_velocity_max_dt_s must be positive")
+        if self.main_velocity_clip_rad_s <= 0.0:
+            raise ValueError("main_velocity_clip_rad_s must be positive")
+        if self.shutdown_disable_repeats < 0:
+            raise ValueError("shutdown_disable_repeats must be non-negative")
+        if self.shutdown_disable_period_s < 0.0:
+            raise ValueError("shutdown_disable_period_s must be non-negative")
 
         self.connected = False
         self.sequence = 0
         self.last_state_time: float | None = None
         self.latest_motor_state: RedRhexMotorState | None = None
         self.latest_positions_policy = [0.0] * 6
+        self.latest_velocities_policy = [0.0] * 6
+        self._prev_positions_policy: list[float] | None = None
+        self._prev_state_time: float | None = None
         self.latest_raw_positions_rinbo = [0.0] * 6
+        self.latest_servo_positions_rinbo = list(self.abad_encoder_zero_rinbo_order)
         self.last_command_was_enabled = False
         self.last_pwm_rinbo_order = [0.0] * 6
         self.last_abad_encoder_targets_rinbo_order = list(self.abad_encoder_zero_rinbo_order)
         self.last_actual_publish_state = "never"
+        self.last_block_reason = ""
+        self._last_warned_block_reason = ""
 
     def connect(self) -> None:
         try:
             from rinbo_msgs.msg import MotorCmdStamped, MotorStateStamped
-        except Exception as exc:  # pragma: no cover - requires external RhexROS2 overlay
+        except Exception as exc:  # pragma: no cover - requires external BioRoLaROS2 overlay
             raise RuntimeError(
-                "rinbo_msgs is required for backend='rinbo_ros'. Build/source RhexROS2 first."
+                "rinbo_msgs is required for backend='biorola_ros'/'rinbo_ros'. Build/source BioRoLaROS2 first."
             ) from exc
 
         self.MotorCmdStamped = MotorCmdStamped
@@ -159,6 +189,7 @@ class RinboRosBackend(LowLevelBridgeBase):
     def send_motor_command(self, cmd) -> None:
         if not self.connected:
             raise RuntimeError("Rinbo ROS backend is not connected")
+        self._validate_command_shape(cmd)
         enabled = bool(cmd.enable)
 
         preview_msg = self._make_motor_cmd_msg(cmd, enabled=enabled, preview=True)
@@ -167,11 +198,33 @@ class RinboRosBackend(LowLevelBridgeBase):
 
         if enabled and not self.allow_enable:
             self.last_actual_publish_state = "blocked_allow_enable"
+            self.last_block_reason = "rinbo.allow_enable is false"
+            self._warn_once(self.last_block_reason)
+            self.last_command_was_enabled = False
+            return
+        if enabled and self.require_state and not self.is_alive():
+            self.last_actual_publish_state = "blocked_no_recent_state"
+            self.last_block_reason = "no recent /motor/state"
+            self._warn_once(self.last_block_reason)
+            self.last_command_was_enabled = False
+            return
+        if enabled and self.block_if_duplicate_command_publishers:
+            duplicate_count, endpoint_names = self._command_publisher_count()
+            if duplicate_count > 1:
+                self.last_actual_publish_state = "blocked_duplicate_publishers"
+                self.last_block_reason = f"{duplicate_count} publishers on {self.command_topic}: {endpoint_names}"
+                self._warn_once(self.last_block_reason)
+                self.last_command_was_enabled = False
+                return
+        if enabled and self.cmd_pub.get_subscription_count() == 0:
+            self.last_actual_publish_state = "blocked_no_command_subscriber"
+            self.last_block_reason = f"no subscriber on {self.command_topic}"
+            self._warn_once(self.last_block_reason)
             self.last_command_was_enabled = False
             return
 
         # During dry-run, avoid publishing disabled preview packets because
-        # RhexROS2 servo commands have no per-servo enable. If motors were
+        # BioRoLaROS2 servo commands have no per-servo enable. If motors were
         # previously enabled, still send one disabled packet to release legs.
         if not enabled and not self.publish_when_disabled and not self.last_command_was_enabled:
             self.last_command_was_enabled = False
@@ -205,6 +258,12 @@ class RinboRosBackend(LowLevelBridgeBase):
             self._set_abad_neutral_targets(msg)
         return msg
 
+    def _validate_command_shape(self, cmd) -> None:
+        if len(cmd.target_velocity_rad_s) < 6:
+            raise ValueError("target_velocity_rad_s must contain at least 6 main-drive values")
+        if len(cmd.target_position_rad) < 12:
+            raise ValueError("target_position_rad must contain 6 main-drive + 6 ABAD values")
+
     def read_motor_state(self):
         return self.latest_motor_state
 
@@ -218,10 +277,13 @@ class RinboRosBackend(LowLevelBridgeBase):
         return time.monotonic() - self.last_state_time <= self.state_timeout_s
 
     def shutdown(self) -> None:
+        if self.connected and self.publish_shutdown_disable:
+            self._publish_shutdown_disable()
         self.connected = False
 
     def diagnostic_values(self) -> dict[str, str]:
         state_age = "none" if self.last_state_time is None else f"{time.monotonic() - self.last_state_time:.4f}"
+        publisher_count, publisher_names = self._command_publisher_count()
         return {
             "rinbo_command_topic": self.command_topic,
             "rinbo_state_topic": self.state_topic,
@@ -230,12 +292,51 @@ class RinboRosBackend(LowLevelBridgeBase):
             "rinbo_require_state": str(self.require_state),
             "rinbo_allow_enable": str(self.allow_enable),
             "rinbo_publish_when_disabled": str(self.publish_when_disabled),
+            "rinbo_block_if_duplicate_command_publishers": str(self.block_if_duplicate_command_publishers),
+            "rinbo_command_subscribers": str(self.cmd_pub.get_subscription_count() if hasattr(self, "cmd_pub") else 0),
+            "rinbo_command_publishers": f"{publisher_count}: {publisher_names}",
+            "rinbo_main_velocity_filter_alpha": f"{self.main_velocity_filter_alpha:.3f}",
+            "rinbo_main_velocity_clip_rad_s": f"{self.main_velocity_clip_rad_s:.3f}",
             "rinbo_last_state_age_s": state_age,
             "rinbo_last_command_enabled": str(self.last_command_was_enabled),
             "rinbo_actual_publish_state": self.last_actual_publish_state,
+            "rinbo_last_block_reason": self.last_block_reason,
             "rinbo_last_pwm_l1_l2_l3_r1_r2_r3": ",".join(f"{x:.2f}" for x in self.last_pwm_rinbo_order),
             "rinbo_last_abad_sl1_sl2_sl3_sr1_sr2_sr3": ",".join(str(x) for x in self.last_abad_encoder_targets_rinbo_order),
+            "rinbo_servo_state_sl1_sl2_sl3_sr1_sr2_sr3": ",".join(str(x) for x in self.latest_servo_positions_rinbo),
+            "rinbo_main_vel_policy_order_rad_s": ",".join(f"{x:.3f}" for x in self.latest_velocities_policy),
         }
+
+    def _warn_once(self, reason: str) -> None:
+        if reason != self._last_warned_block_reason:
+            self.node.get_logger().warn(f"Blocking enabled BioRoLaROS2 command: {reason}")
+            self._last_warned_block_reason = reason
+
+    def _command_publisher_count(self) -> tuple[int, str]:
+        try:
+            infos = self.node.get_publishers_info_by_topic(self.command_topic)
+        except Exception:
+            return 0, "unknown"
+        names = []
+        for info in infos:
+            node_name = getattr(info, "node_name", "")
+            node_namespace = getattr(info, "node_namespace", "")
+            names.append(f"{node_namespace.rstrip('/')}/{node_name}".replace("//", "/") or "<unknown>")
+        return len(infos), ",".join(names) if names else "none"
+
+    def _publish_shutdown_disable(self) -> None:
+        if not hasattr(self, "cmd_pub") or not hasattr(self, "MotorCmdStamped"):
+            return
+        msg = self.MotorCmdStamped()
+        msg.header.frame_id = "redrhex_shutdown_disable"
+        msg.servo_control_mode = self.disabled_servo_control_mode
+        self._disable_all_legs(msg)
+        self._set_abad_neutral_targets(msg)
+        for _ in range(self.shutdown_disable_repeats):
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            self.cmd_pub.publish(msg)
+            if self.shutdown_disable_period_s > 0.0:
+                time.sleep(self.shutdown_disable_period_s)
 
     def _disable_all_legs(self, msg) -> None:
         for field in self.RINBO_LEG_ORDER:
@@ -289,7 +390,8 @@ class RinboRosBackend(LowLevelBridgeBase):
         self.last_abad_encoder_targets_rinbo_order = targets
 
     def _on_rinbo_state(self, msg) -> None:
-        self.last_state_time = time.monotonic()
+        state_time = time.monotonic()
+        self.last_state_time = state_time
         rinbo_positions = [
             float(msg.l1.position),
             float(msg.l2.position),
@@ -299,6 +401,14 @@ class RinboRosBackend(LowLevelBridgeBase):
             float(msg.r3.position),
         ]
         self.latest_raw_positions_rinbo = rinbo_positions
+        self.latest_servo_positions_rinbo = [
+            int(getattr(msg.sl1, "position_encoder", 0)),
+            int(getattr(msg.sl2, "position_encoder", 0)),
+            int(getattr(msg.sl3, "position_encoder", 0)),
+            int(getattr(msg.sr1, "position_encoder", 0)),
+            int(getattr(msg.sr2, "position_encoder", 0)),
+            int(getattr(msg.sr3, "position_encoder", 0)),
+        ]
 
         rinbo_rad = [
             (rinbo_positions[i] - self.main_encoder_zero_counts_rinbo_order[i])
@@ -311,14 +421,16 @@ class RinboRosBackend(LowLevelBridgeBase):
         for mapping in self.POLICY_TO_RINBO_LEGS:
             rinbo_idx = self.RINBO_LEG_ORDER.index(mapping.rinbo_field)
             policy_positions[mapping.policy_index] = rinbo_rad[rinbo_idx]
+        policy_velocities = self._estimate_policy_velocities(policy_positions, state_time)
         self.latest_positions_policy = policy_positions
+        self.latest_velocities_policy = policy_velocities
 
         js = JointState()
         js.header.stamp = self.node.get_clock().now().to_msg()
         js.header.frame_id = "redrhex_base"
         js.name = list(self.main_joint_names_policy_order)
         js.position = [float(x) for x in policy_positions]
-        js.velocity = []
+        js.velocity = [float(x) for x in policy_velocities]
         self.joint_pub.publish(js)
 
         state = RedRhexMotorState()
@@ -326,9 +438,35 @@ class RinboRosBackend(LowLevelBridgeBase):
         state.header.frame_id = "redrhex_base"
         state.joint_names = list(self.main_joint_names_policy_order)
         state.position_rad = [float(x) for x in policy_positions]
-        state.velocity_rad_s = [0.0] * 6
+        state.velocity_rad_s = [float(x) for x in policy_velocities]
         state.effort_nm = [0.0] * 6
         state.current_a = []
         state.temperature_c = []
         state.fault = [False] * 6
         self.latest_motor_state = state
+
+    def _estimate_policy_velocities(self, policy_positions: list[float], state_time: float) -> list[float]:
+        if self._prev_positions_policy is None or self._prev_state_time is None:
+            self._prev_positions_policy = list(policy_positions)
+            self._prev_state_time = state_time
+            return list(self.latest_velocities_policy)
+
+        prev_positions = list(self._prev_positions_policy)
+        dt = state_time - self._prev_state_time
+        self._prev_positions_policy = list(policy_positions)
+        self._prev_state_time = state_time
+        if dt <= 1.0e-6 or dt > self.main_velocity_max_dt_s:
+            return [0.0] * 6
+
+        raw_vel = [
+            max(
+                -self.main_velocity_clip_rad_s,
+                min(self.main_velocity_clip_rad_s, (float(policy_positions[i]) - float(prev_positions[i])) / dt),
+            )
+            for i in range(6)
+        ]
+        alpha = self.main_velocity_filter_alpha
+        return [
+            alpha * raw_vel[i] + (1.0 - alpha) * self.latest_velocities_policy[i]
+            for i in range(6)
+        ]

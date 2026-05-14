@@ -1,6 +1,6 @@
 redrhex_lowlevel_bridge:
   ros__parameters:
-    backend: "mock"  # mock, serial, sbrio_udp, or rinbo_ros
+    backend: "mock"  # mock, serial, sbrio_udp, rinbo_ros, or biorola_ros
     feedback_rate_hz: 50.0
     mock:
       print_every_n: 50
@@ -25,7 +25,9 @@ redrhex_lowlevel_bridge:
       # sbRIO heartbeat/feedback packets within heartbeat_timeout_s.
       require_feedback: false
     rinbo:
-      # Adapter for https://github.com/JasonLiaoJCS/RhexROS2.git.
+      # Adapter for https://github.com/JasonLiaoJCS/BioRoLaROS2.git.
+      # It is also compatible with the older RhexROS2 repo because both use
+      # rinbo_msgs and the same /motor/* and /power/* topic contract.
       # It publishes rinbo_msgs/MotorCmdStamped and subscribes rinbo_msgs/MotorStateStamped.
       command_topic: "/motor/command"
       state_topic: "/motor/state"
@@ -34,20 +36,30 @@ redrhex_lowlevel_bridge:
       # real ABAD motors currently do not provide feedback.
       joint_state_topic: "/joint_states"
       # Safe debug topic. This mirrors the converted rinbo_msgs command so you
-      # can inspect mapping while allow_enable=false. RhexROS2 does NOT subscribe
+      # can inspect mapping while allow_enable=false. BioRoLaROS2 does NOT subscribe
       # to this topic.
       preview_topic: "/redrhex/rinbo_motor_command_preview"
       publish_preview: true
       # Keep false until motor power is off, E-stop works, and one-motor tests pass.
       allow_enable: false
-      # RhexROS2 servo command has no per-servo enable field. Keep this false
+      # BioRoLaROS2 servo command has no per-servo enable field. Keep this false
       # during dry-run so disabled /redrhex/motor_commands do not move ABAD servos.
       publish_when_disabled: false
       disabled_servo_control_mode: 0
+      # On Ctrl-C/shutdown, publish a few disabled packets to release main-drive
+      # PWM commands. This does not replace the sbRIO watchdog or physical E-stop.
+      publish_shutdown_disable: true
+      shutdown_disable_repeats: 5
+      shutdown_disable_period_s: 0.02
       # If true, /redrhex/lowlevel_heartbeat is false until /motor/state arrives.
       require_state: true
+      # When enabled commands are allowed, block them if another node is also
+      # publishing /motor/command. This catches accidental rinbo_tripod +
+      # RL-controller conflicts.
+      block_if_duplicate_command_publishers: true
       state_timeout_s: 0.25
-      # RhexROS2/rinbo_fsm uses about 54984.83 encoder counts per main-drive rev.
+      # BioRoLaROS2/rinbo_tripod uses about 54984.83 encoder counts per main-drive rev.
+      # BioRoLaROS2 rinbo_cali/rinbo_standing use 55296.0 in their local PID code.
       # Calibrate again on the real robot before closing the loop with RL.
       main_position_counts_per_rev: 54984.83
       # Conservative velocity-command to PWM conversion. This is NOT a physics
@@ -62,14 +74,20 @@ redrhex_lowlevel_bridge:
       # Per-policy-joint sign hook before velocity becomes PWM. Flip one value
       # at a time during lifted one-motor tests if a leg spins opposite to IsaacLab.
       main_velocity_sign_policy_order: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-      # RhexROS2 LegCmd.direction boolean for positive PWM in rinbo order.
-      # rinbo_standing/rinbo_cali use [false,false,false,true,true,true].
-      # rinbo_tripod uses the opposite convention; verify on YOUR active sbRIO firmware.
-      main_direction_positive_rinbo_order: [false, false, false, true, true, true]
+      # BioRoLaROS2 rinbo_tripod uses [true,true,true,false,false,false].
+      # rinbo_cali/rinbo_standing use the opposite convention internally.
+      # Keep allow_enable=false and verify one motor at a time before trusting this.
+      main_direction_positive_rinbo_order: [true, true, true, false, false, false]
+      # /motor/state currently provides main encoder position. The adapter
+      # estimates velocity for /joint_states and /motor_feedback so the policy
+      # sees a less ambiguous main_drive_vel observation.
+      main_velocity_filter_alpha: 0.35
+      main_velocity_max_dt_s: 0.20
+      main_velocity_clip_rad_s: 80.0
       # Rinbo servo order is [sl1, sl2, sl3, sr1, sr2, sr3].
-      # These are copied from the existing RhexROS2 rinbo_fsm stand-like defaults
+      # These are copied from the existing BioRoLaROS2 rinbo_fsm stand-like defaults
       # and must be calibrated to your mechanical neutral ABAD pose.
-      abad_encoder_zero_rinbo_order: [739, 2566, 3283, 1945, 2070, 987]
+      abad_encoder_zero_rinbo_order: [740, 2565, 3283, 1944, 2071, 989]
       # TODO: measure ABAD servo encoder counts per radian on the real mechanism.
       abad_encoder_counts_per_rad: 1000.0
       abad_encoder_min: 0
