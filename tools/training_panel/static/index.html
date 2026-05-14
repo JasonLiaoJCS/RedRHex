@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RedRHex Training Panel</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">R</span>
+        <div>
+          <strong>RedRHex</strong>
+          <span>Training Panel</span>
+        </div>
+      </div>
+      <nav>
+        <button class="nav-button active" data-view="train">Train</button>
+        <button class="nav-button" data-view="tweaks">Rewards</button>
+        <button class="nav-button" data-view="history">History</button>
+        <button class="nav-button" data-view="access">Access</button>
+      </nav>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Train</h1>
+          <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
+        </div>
+        <button id="refresh-button" class="ghost-button">Refresh</button>
+      </header>
+
+      <section id="train" class="view active">
+        <form id="train-form" class="panel-grid">
+          <label>
+            Task
+            <input name="task" value="Template-Redrhex-Direct-v0" />
+          </label>
+          <label>
+            Environments
+            <input name="num_envs" type="number" min="1" max="8192" value="4" />
+          </label>
+          <label>
+            Iterations
+            <input name="max_iterations" type="number" min="1" value="1" />
+          </label>
+          <label>
+            Device
+            <input name="device" value="cuda:0" />
+          </label>
+          <label>
+            Seed
+            <input name="seed" type="number" placeholder="optional" />
+          </label>
+          <label>
+            Checkpoint
+            <input name="checkpoint" placeholder="optional resume checkpoint" />
+          </label>
+          <label class="check-row">
+            <input name="headless" type="checkbox" checked />
+            Headless
+          </label>
+          <label class="check-row">
+            <input name="resume" type="checkbox" />
+            Resume
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="primary-button">Start Training</button>
+            <button type="button" id="smoke-button" class="ghost-button">Use Smoke Defaults</button>
+            <button type="button" id="debug-button" class="ghost-button">Use Debug Defaults</button>
+          </div>
+        </form>
+        <div id="train-status" class="status-line"></div>
+      </section>
+
+      <section id="tweaks" class="view">
+        <div class="split">
+          <div>
+            <h2>Tweakable Files</h2>
+            <div id="tweak-files" class="card-list"></div>
+          </div>
+          <div>
+            <h2>Reward Scales</h2>
+            <div id="reward-scales" class="scale-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="history" class="view">
+        <div class="history-actions">
+          <button id="tensorboard-local" class="primary-button">TensorBoard Local</button>
+          <button id="tensorboard-lan" class="ghost-button">TensorBoard LAN</button>
+        </div>
+        <div class="history-layout">
+          <div id="runs" class="run-list"></div>
+          <div class="notes-panel">
+            <h2 id="notes-title">Notes</h2>
+            <textarea id="notes-editor" placeholder="Select a run to add notes and observations."></textarea>
+            <div class="form-actions">
+              <button id="save-notes" class="primary-button">Save Notes</button>
+              <button id="play-run" class="ghost-button">Play Latest Checkpoint</button>
+            </div>
+            <div id="notes-status" class="status-line"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="access" class="view">
+        <div class="access-grid">
+          <article>
+            <h2>Local</h2>
+            <code>python -m tools.training_panel --host 127.0.0.1 --port 8080</code>
+          </article>
+          <article>
+            <h2>LAN</h2>
+            <code>python -m tools.training_panel --host 0.0.0.0 --port 8080</code>
+          </article>
+          <article>
+            <h2>SSH Tunnel</h2>
+            <code>ssh -L 8080:127.0.0.1:8080 user@host</code>
+          </article>
+        </div>
+        <pre id="system-info"></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
+

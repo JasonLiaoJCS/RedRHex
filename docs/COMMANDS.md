@@ -264,6 +264,39 @@ http://localhost:6006
 
 如果是遠端機器，請用 SSH port forwarding 或遠端桌面開瀏覽器。
 
+## 8.1 Training Panel
+
+這個 branch 有一個本機 training panel，可以用表單啟動 train、查看 reward/tweakable files、整理 training history notes，並一鍵啟動 TensorBoard / play checkpoint。
+
+本機使用：
+
+```bash
+cd /home/lab_user1/Py/RedRHex
+source /home/lab_user1/miniconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab_bin
+python -m tools.training_panel --host 127.0.0.1 --port 8080
+```
+
+瀏覽器打開：
+
+```text
+http://127.0.0.1:8080
+```
+
+LAN 使用：
+
+```bash
+python -m tools.training_panel --host 0.0.0.0 --port 8080
+```
+
+SSH tunnel 使用：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@host
+```
+
+V1 是 read-only reward/config browser：只顯示檔案、說明、reward scale index，不直接改 source code。
+
 ## 9. 目前這台機器已驗證到哪裡
 
 已完成：
