@@ -15,6 +15,9 @@
 **/*.usdz
 # Allow main robot model
 !/RedRhex.usd
+# Allow repo-local converted RedRHex dependency USDs
+!/test_7_description/test_7_description/urdf/test_7/**/*.usd
+!/test_7_description/test_7_description/urdf/test_7/*.usd
 
 # Python
 .DS_Store

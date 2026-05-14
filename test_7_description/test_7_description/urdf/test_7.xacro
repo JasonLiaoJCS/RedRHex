@@ -1,0 +1,685 @@
+<?xml version="1.0" ?>
+<robot name="test_7" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+<xacro:include filename="materials.xacro" />
+<xacro:include filename="test_7.trans" />
+<xacro:include filename="test_7.gazebo" />
+<link name="base_link">
+  <inertial>
+    <origin xyz="0.1959041196844772 0.0005 0.09274999999999999" rpy="0 0 0"/>
+    <mass value="0.7234414774999993"/>
+    <inertia ixx="0.003198" iyy="0.014077" izz="0.010879" ixy="0.0" iyz="-0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_1">
+  <inertial>
+    <origin xyz="-0.027999999999999997 0.029045196653441855 -0.01267198273318998" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="-0.0" iyz="4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.2262 -0.001 -0.2675" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.2262 -0.001 -0.2675" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="right_feet_1">
+  <inertial>
+    <origin xyz="-0.056770902465522737 -0.06389571088452817 0.004464488680738898" rpy="0 0 0"/>
+    <mass value="0.056036638091914365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="-0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1147 -0.0335 -0.298752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1147 -0.0335 -0.298752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_2">
+  <inertial>
+    <origin xyz="-0.023000000000003462 -0.0001111441899141613 0.014664419986633537" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="0.0" iyz="-0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.4153 -0.0335 -0.178" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.4153 -0.0335 -0.178" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_2">
+  <inertial>
+    <origin xyz="-0.041862027726190465 0.0 0.012499999999999872" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.3923 -0.0335 -0.20825" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.3923 -0.0335 -0.20825" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="right_feet_2">
+  <inertial>
+    <origin xyz="-0.05677090246552324 -0.06389571088452818 0.004464644163733988" rpy="0 0 0"/>
+    <mass value="0.056036638091914365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="-0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.3078 -0.0335 -0.21675" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.3078 -0.0335 -0.21675" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_2">
+  <inertial>
+    <origin xyz="-0.02799999999999997 0.02904519665344188 -0.012671982733189951" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="-0.0" iyz="4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.4193 -0.001 -0.1855" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.4193 -0.001 -0.1855" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_3">
+  <inertial>
+    <origin xyz="0.027999999999999987 0.02904519665344188 -0.012671982733189896" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="-0.0" iyz="4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="0.028 -0.0 -0.1855" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0.028 -0.0 -0.1855" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_3">
+  <inertial>
+    <origin xyz="-0.02300000000000291 -0.00011114418991418906 0.014664419986633537" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="0.0" iyz="-0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.024 -0.0325 -0.178" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.024 -0.0325 -0.178" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_3">
+  <inertial>
+    <origin xyz="-0.041862027726190035 -2.7755575615628914e-17 0.012499844517004699" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.001 -0.0325 -0.208252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.001 -0.0325 -0.208252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="right_feet_3">
+  <inertial>
+    <origin xyz="-0.05677090246552273 -0.06389571088452833 -0.0035355113192612198" rpy="0 0 0"/>
+    <mass value="0.056036638091914365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="-0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="0.0835 -0.0325 -0.224752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0.0835 -0.0325 -0.224752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/right_feet_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_1">
+  <inertial>
+    <origin xyz="-0.023000000000002935 -0.00011114418991417518 0.014664419986633481" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="0.0" iyz="-0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.2222 -0.0335 -0.26" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.2222 -0.0335 -0.26" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_1">
+  <inertial>
+    <origin xyz="-0.04186202772618994 -2.0816681711721685e-17 0.012499844517004866" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1992 -0.0335 -0.290252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1992 -0.0335 -0.290252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_5">
+  <inertial>
+    <origin xyz="0.02800000000000009 0.02904519665344188 0.012671982733190009" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="0.0" iyz="-4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="0.028 -0.001 -0.0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0.028 -0.001 -0.0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_5">
+  <inertial>
+    <origin xyz="-0.02299999999999705 -0.00011114418991414049 -0.014664419986633388" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="-0.0" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.024 -0.0335 -0.0075" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.024 -0.0335 -0.0075" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_5">
+  <inertial>
+    <origin xyz="-0.04186202772618993 6.245004513516506e-17 -0.012499844517004699" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.001 -0.0335 0.022752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.001 -0.0335 0.022752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_5.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_6">
+  <inertial>
+    <origin xyz="0.02800000000000008 0.02904519665344188 0.012671982733189924" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="0.0" iyz="-4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1702 -0.001 0.082" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1702 -0.001 0.082" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="top_bottom_connector_7">
+  <inertial>
+    <origin xyz="-0.027999999999999914 0.029045196653441883 0.012671982733189955" rpy="0 0 0"/>
+    <mass value="0.035057625091388524"/>
+    <inertia ixx="2.2e-05" iyy="1.9e-05" izz="3.8e-05" ixy="0.0" iyz="-4e-06" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.4193 -0.001 0.0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_7.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.4193 -0.001 0.0" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/top_bottom_connector_7.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_7">
+  <inertial>
+    <origin xyz="0.023000000000002685 -0.00011114418991420294 -0.014664419986633407" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="-0.0" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.3673 -0.0335 -0.0075" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_7.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.3673 -0.0335 -0.0075" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_7.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="motor_holder_6">
+  <inertial>
+    <origin xyz="0.023000000000002824 -0.000111144189914196 -0.014664419986633453" rpy="0 0 0"/>
+    <mass value="0.06529297389998337"/>
+    <inertia ixx="2.2e-05" iyy="3.4e-05" izz="3.1e-05" ixy="-0.0" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1742 -0.0335 0.0745" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1742 -0.0335 0.0745" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/motor_holder_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_6">
+  <inertial>
+    <origin xyz="-0.04186202772618991 6.938893903907228e-18 -0.012499844517004782" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1972 -0.0335 0.104752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1972 -0.0335 0.104752" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_6.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_connect_4">
+  <inertial>
+    <origin xyz="-0.041862027726189965 0.0 -0.012499999999999956" rpy="0 0 0"/>
+    <mass value="0.02279147200880718"/>
+    <inertia ixx="1e-06" iyy="1.4e-05" izz="1.2e-05" ixy="0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.3903 -0.0335 0.02275" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_4.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.3903 -0.0335 0.02275" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_connect_4.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_3">
+  <inertial>
+    <origin xyz="-0.056770902465522896 -0.06389571088452764 0.003535511319261171" rpy="0 0 0"/>
+    <mass value="0.05603663809191365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="0.0835 -0.0335 0.039252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="0.0835 -0.0335 0.039252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_3.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_2">
+  <inertial>
+    <origin xyz="-0.05677090246552303 -0.06389571088452778 0.0035355113192612198" rpy="0 0 0"/>
+    <mass value="0.05603663809191365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.1127 -0.0335 0.121252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.1127 -0.0335 0.121252" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_2.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="left_feet_1">
+  <inertial>
+    <origin xyz="-0.05677090246552319 -0.06389571088452783 0.0035353558362659562" rpy="0 0 0"/>
+    <mass value="0.05603663809191365"/>
+    <inertia ixx="0.000134" iyy="2.8e-05" izz="0.000156" ixy="-2.6e-05" iyz="0.0" ixz="-0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.3058 -0.0335 0.03925" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.3058 -0.0335 0.03925" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="package://test_7_description/meshes/left_feet_1.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<joint name="Rigid 1" type="fixed">
+  <origin xyz="0.2262 0.001 0.2675" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_1"/>
+</joint>
+
+<joint name="Revolute 5" type="continuous">
+  <origin xyz="-0.0845 0.0 0.0085" rpy="0 0 0"/>
+  <parent link="left_feet_connect_1"/>
+  <child link="right_feet_1"/>
+  <axis xyz="-0.0 0.0 1.0"/>
+</joint>
+
+<joint name="Revolute 6" type="continuous">
+  <origin xyz="-0.004 0.0325 -0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_2"/>
+  <child link="motor_holder_2"/>
+  <axis xyz="1.0 0.0 0.0"/>
+</joint>
+
+<joint name="Revolute 7" type="continuous">
+  <origin xyz="-0.023 0.0 0.03025" rpy="0 0 0"/>
+  <parent link="motor_holder_2"/>
+  <child link="left_feet_connect_2"/>
+  <axis xyz="-0.0 0.0 1.0"/>
+</joint>
+
+<joint name="Revolute 8" type="continuous">
+  <origin xyz="-0.0845 0.0 0.0085" rpy="0 0 0"/>
+  <parent link="left_feet_connect_2"/>
+  <child link="right_feet_2"/>
+  <axis xyz="-0.0 0.0 1.0"/>
+</joint>
+
+<joint name="Rigid 9" type="fixed">
+  <origin xyz="0.4193 0.001 0.1855" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_2"/>
+</joint>
+
+<joint name="Rigid 10" type="fixed">
+  <origin xyz="-0.028 0.0 0.1855" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_3"/>
+</joint>
+
+<joint name="Revolute 11" type="continuous">
+  <origin xyz="0.052 0.0325 -0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_3"/>
+  <child link="motor_holder_3"/>
+  <axis xyz="1.0 0.0 0.0"/>
+</joint>
+
+<joint name="Revolute 12" type="continuous">
+  <origin xyz="-0.023 0.0 0.030252" rpy="0 0 0"/>
+  <parent link="motor_holder_3"/>
+  <child link="left_feet_connect_3"/>
+  <axis xyz="-0.0 -0.0 1.0"/>
+</joint>
+
+<joint name="Revolute 13" type="continuous">
+  <origin xyz="-0.0845 0.0 0.0165" rpy="0 0 0"/>
+  <parent link="left_feet_connect_3"/>
+  <child link="right_feet_3"/>
+  <axis xyz="0.0 0.0 -1.0"/>
+</joint>
+
+<joint name="Revolute 14" type="continuous">
+  <origin xyz="-0.004 0.0325 -0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_1"/>
+  <child link="motor_holder_1"/>
+  <axis xyz="1.0 0.0 0.0"/>
+</joint>
+
+<joint name="Revolute 15" type="continuous">
+  <origin xyz="-0.023 0.0 0.030252" rpy="0 0 0"/>
+  <parent link="motor_holder_1"/>
+  <child link="left_feet_connect_1"/>
+  <axis xyz="-0.0 0.0 1.0"/>
+</joint>
+
+<joint name="Rigid 16" type="fixed">
+  <origin xyz="-0.028 0.001 0.0" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_5"/>
+</joint>
+
+<joint name="Rigid 17" type="fixed">
+  <origin xyz="0.052 0.0325 0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_5"/>
+  <child link="motor_holder_5"/>
+</joint>
+
+<joint name="Rigid 18" type="fixed">
+  <origin xyz="-0.023 0.0 -0.030252" rpy="0 0 0"/>
+  <parent link="motor_holder_5"/>
+  <child link="left_feet_connect_5"/>
+</joint>
+
+<joint name="Rigid 19" type="fixed">
+  <origin xyz="0.1702 0.001 -0.082" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_6"/>
+</joint>
+
+<joint name="Rigid 20" type="fixed">
+  <origin xyz="0.4193 0.001 0.0" rpy="0 0 0"/>
+  <parent link="base_link"/>
+  <child link="top_bottom_connector_7"/>
+</joint>
+
+<joint name="Rigid 21" type="fixed">
+  <origin xyz="-0.052 0.0325 0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_7"/>
+  <child link="motor_holder_7"/>
+</joint>
+
+<joint name="Rigid 22" type="fixed">
+  <origin xyz="0.004 0.0325 0.0075" rpy="0 0 0"/>
+  <parent link="top_bottom_connector_6"/>
+  <child link="motor_holder_6"/>
+</joint>
+
+<joint name="Rigid 23" type="fixed">
+  <origin xyz="0.023 0.0 -0.030252" rpy="0 0 0"/>
+  <parent link="motor_holder_6"/>
+  <child link="left_feet_connect_6"/>
+</joint>
+
+<joint name="Rigid 24" type="fixed">
+  <origin xyz="0.023 0.0 -0.03025" rpy="0 0 0"/>
+  <parent link="motor_holder_7"/>
+  <child link="left_feet_connect_4"/>
+</joint>
+
+<joint name="Rigid 25" type="fixed">
+  <origin xyz="-0.0845 0.0 -0.0165" rpy="0 0 0"/>
+  <parent link="left_feet_connect_5"/>
+  <child link="left_feet_3"/>
+</joint>
+
+<joint name="Rigid 26" type="fixed">
+  <origin xyz="-0.0845 0.0 -0.0165" rpy="0 0 0"/>
+  <parent link="left_feet_connect_6"/>
+  <child link="left_feet_2"/>
+</joint>
+
+<joint name="Rigid 27" type="fixed">
+  <origin xyz="-0.0845 0.0 -0.0165" rpy="0 0 0"/>
+  <parent link="left_feet_connect_4"/>
+  <child link="left_feet_1"/>
+</joint>
+
+</robot>

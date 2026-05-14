@@ -6,22 +6,22 @@
 """
 RedRhex RHex-style Wheg Locomotion PPO 訓練配置
 
-動作空間 (12):
-- [0:6] 主驅動速度調整
-- [6:12] ABAD 位置
+動作空間 (6):
+- [0:3] 主驅動速度調整
+- [3:6] ABAD 位置
 
-觀測空間 (56):
+觀測空間 (35):
 - base_lin_vel (3)
 - base_ang_vel (3)
 - projected_gravity (3)
-- main_drive_pos_sin (6)
-- main_drive_pos_cos (6)
-- main_drive_vel (6)
-- abad_pos (6)
-- abad_vel (6)
+- main_drive_pos_sin (3)
+- main_drive_pos_cos (3)
+- main_drive_vel (3)
+- abad_pos (3)
+- abad_vel (3)
 - velocity_command (3)
 - gait_phase (2)
-- last_actions (12)
+- last_actions (6)
 """
 
 from isaaclab.utils import configclass
@@ -44,7 +44,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.8,  # 稍低的初始噪聲，因為動作範圍較小
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        # 網路大小適合 12 DOF 動作和 56 維觀測
+        # 網路大小適合目前 repo-local URDF 的 6 維動作和 35 維觀測
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="elu",

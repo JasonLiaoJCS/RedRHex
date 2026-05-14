@@ -65,7 +65,10 @@ class RedrhexEnv(DirectRLEnv):
         self._debug_print_info()
 
         print(f"[RedrhexEnv] 環境初始化完成")
-        print(f"[RedrhexEnv] 動作空間: {self.cfg.action_space} (6 main_drive + 6 ABAD)")
+        print(
+            f"[RedrhexEnv] 動作空間: {self.cfg.action_space} "
+            f"({self.num_main_drive_joints} main_drive + {self.num_abad_joints} ABAD)"
+        )
         print(f"[RedrhexEnv] 觀測空間: {self.cfg.observation_space}")
         
         # 自動啟用 debug visualization（如果配置啟用且有 GUI）
@@ -80,6 +83,9 @@ class RedrhexEnv(DirectRLEnv):
         """設置關節索引映射"""
         # 獲取所有關節名稱
         joint_names = self.robot.data.joint_names
+        self.num_main_drive_joints = len(self.cfg.main_drive_joint_names)
+        self.num_abad_joints = len(self.cfg.abad_joint_names)
+        self.num_damper_joints = len(self.cfg.damper_joint_names)
         
         # 主驅動關節索引
         self._main_drive_indices = []
@@ -123,17 +129,16 @@ class RedrhexEnv(DirectRLEnv):
         )
         
         # 方向乘數 - 從配置讀取
-        # 右側腿 (idx 0,1,2) → -1, 左側腿 (idx 3,4,5) → +1
         self._direction_multiplier = torch.tensor(
             self.cfg.leg_direction_multiplier, device=self.device
-        ).unsqueeze(0)  # Shape: [1, 6]
+        ).unsqueeze(0)
         
         print(f"[關節索引] 主驅動: {self._main_drive_indices.tolist()}")
         print(f"[關節索引] ABAD: {self._abad_indices.tolist()}")
         print(f"[關節索引] 避震: {self._damper_indices.tolist()}")
         print(f"[方向乘數] {self.cfg.leg_direction_multiplier}")
-        print(f"[Tripod A] indices: {self._tripod_a_indices.tolist()} (joints 15, 18, 24)")
-        print(f"[Tripod B] indices: {self._tripod_b_indices.tolist()} (joints 7, 12, 23)")
+        print(f"[Tripod A] indices: {self._tripod_a_indices.tolist()}")
+        print(f"[Tripod B] indices: {self._tripod_b_indices.tolist()}")
 
     def _setup_buffers(self):
         """設置內部緩衝區"""
@@ -141,16 +146,16 @@ class RedrhexEnv(DirectRLEnv):
         self.joint_pos = self.robot.data.joint_pos.clone()
         self.joint_vel = self.robot.data.joint_vel.clone()
         
-        # 動作緩衝 (12 維: 6 main_drive + 6 ABAD)
+        # 動作緩衝: main drive velocities + ABAD positions
         self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self.last_actions = torch.zeros_like(self.actions)
         
         # 主驅動上一次速度 (用於計算加速度)
-        self.last_main_drive_vel = torch.zeros(self.num_envs, 6, device=self.device)
+        self.last_main_drive_vel = torch.zeros(self.num_envs, self.num_main_drive_joints, device=self.device)
 
         # 避震關節的初始位置（從 config 中讀取）
         # 這些關節需要保持在初始角度，不能被拉直
-        # 順序要匹配 damper_joint_names: ["Revolute_5", "Revolute_13", "Revolute_25", "Revolute_26", "Revolute_27", "Revolute_8"]
+        # 順序要匹配 damper_joint_names。
         damper_init_angles = []
         for joint_name in self.cfg.damper_joint_names:
             angle = self.cfg.robot_cfg.init_state.joint_pos.get(joint_name, 0.0)
@@ -313,7 +318,7 @@ class RedrhexEnv(DirectRLEnv):
         # 每條腿的目標相位偏移
         # Tripod A (legs 0, 3, 5): 相位 0
         # Tripod B (legs 1, 2, 4): 相位 π
-        self.leg_phase_offsets = torch.zeros(6, device=self.device)
+        self.leg_phase_offsets = torch.zeros(self.num_main_drive_joints, device=self.device)
         self.leg_phase_offsets[self._tripod_a_indices] = 0.0
         self.leg_phase_offsets[self._tripod_b_indices] = math.pi
 
@@ -346,15 +351,17 @@ class RedrhexEnv(DirectRLEnv):
         print(f"\n📐 腿部配置:")
         print(f"   主驅動關節順序: {self.cfg.main_drive_joint_names}")
         print(f"   方向乘數: {self.cfg.leg_direction_multiplier}")
-        print(f"   (右側腿 idx 0,1,2 = -1, 左側腿 idx 3,4,5 = +1)")
         
         print(f"\n🦿 Tripod 分組:")
-        print(f"   Tripod A (idx {self._tripod_a_indices.tolist()}): 關節 15, 18, 24")
-        print(f"   Tripod B (idx {self._tripod_b_indices.tolist()}): 關節 7, 12, 23")
+        print(f"   Tripod A (idx {self._tripod_a_indices.tolist()})")
+        print(f"   Tripod B (idx {self._tripod_b_indices.tolist()})")
         
         print(f"\n🎮 動作空間 ({self.cfg.action_space}):")
-        print(f"   [0:6] 主驅動速度 (scale: ±{self.cfg.main_drive_vel_scale} rad/s)")
-        print(f"   [6:12] ABAD 位置 (scale: ±{self.cfg.abad_pos_scale} rad)")
+        print(f"   [0:{self.num_main_drive_joints}] 主驅動速度 (scale: ±{self.cfg.main_drive_vel_scale} rad/s)")
+        print(
+            f"   [{self.num_main_drive_joints}:{self.num_main_drive_joints + self.num_abad_joints}] "
+            f"ABAD 位置 (scale: ±{self.cfg.abad_pos_scale} rad)"
+        )
         
         print(f"\n💡 RHex 步態原理:")
         print(f"   - C型腿持續旋轉（非擺動），像輪子一樣推進")
@@ -374,7 +381,7 @@ class RedrhexEnv(DirectRLEnv):
         
         動作格式 (12 維):
         - [0:6]: 主驅動目標角速度 (相對於基礎速度的調整)
-        - [6:12]: ABAD 目標位置
+        - next slice: ABAD 目標位置
         
         注意：左右側腿需要相反的旋轉方向才能前進！
         - 右側 (Legs 1,2,3): 負向旋轉
@@ -382,13 +389,12 @@ class RedrhexEnv(DirectRLEnv):
         """
         # ===== 主驅動關節：速度控制 =====
         # 動作 [-1, 1] 映射到速度調整
-        drive_actions = self.actions[:, :6]
+        drive_actions = self.actions[:, : self.num_main_drive_joints]
         
         # 基礎速度
         base_vel = self.cfg.base_gait_angular_vel
         
         # 使用配置中的方向乘數（已在 _setup_joint_indices 中初始化）
-        # 右側 (idx 0,1,2) → -1, 左側 (idx 3,4,5) → +1
         
         # 計算目標速度：基礎速度 * 方向 + 動作調整 * 方向
         target_drive_vel = (base_vel + drive_actions * self.cfg.main_drive_vel_scale) * self._direction_multiplier
@@ -401,7 +407,9 @@ class RedrhexEnv(DirectRLEnv):
         self.robot.set_joint_velocity_target(target_drive_vel, joint_ids=self._main_drive_indices)
         
         # ===== ABAD 關節：位置控制 =====
-        abad_actions = self.actions[:, 6:12]
+        abad_start = self.num_main_drive_joints
+        abad_end = abad_start + self.num_abad_joints
+        abad_actions = self.actions[:, abad_start:abad_end]
         target_abad_pos = abad_actions * self.cfg.abad_pos_scale
         
         # 限制位置範圍
@@ -514,13 +522,13 @@ class RedrhexEnv(DirectRLEnv):
         rewards = torch.zeros(self.num_envs, device=self.device)
 
         # ===== 獲取狀態 =====
-        main_drive_vel = self.joint_vel[:, self._main_drive_indices]  # [N, 6]
-        main_drive_pos = self.joint_pos[:, self._main_drive_indices]  # [N, 6]
-        abad_pos = self.joint_pos[:, self._abad_indices]  # [N, 6]
+        main_drive_vel = self.joint_vel[:, self._main_drive_indices]
+        main_drive_pos = self.joint_pos[:, self._main_drive_indices]
+        abad_pos = self.joint_pos[:, self._abad_indices]
         
         # 有效速度（考慮旋轉方向）
-        effective_vel = main_drive_vel * self._direction_multiplier  # [N, 6]
-        vel_magnitude = torch.abs(effective_vel)  # [N, 6]
+        effective_vel = main_drive_vel * self._direction_multiplier
+        vel_magnitude = torch.abs(effective_vel)
         mean_vel = vel_magnitude.mean(dim=1)
         min_vel = vel_magnitude.min(dim=1).values
         num_active_legs = (vel_magnitude > 0.3).float().sum(dim=1)
@@ -617,9 +625,14 @@ class RedrhexEnv(DirectRLEnv):
         rewards += rew_abad_action
         
         # ABAD 左右對稱性（旋轉時應該非對稱以產生差速轉向）
-        abad_left = abad_pos[:, 3:6].mean(dim=1)  # 左側 ABAD 平均
-        abad_right = abad_pos[:, 0:3].mean(dim=1)  # 右側 ABAD 平均
-        abad_asymmetry = torch.abs(abad_left - abad_right)
+        right_ids = [idx for idx in self.cfg.right_leg_indices if idx < abad_pos.shape[1]]
+        left_ids = [idx for idx in self.cfg.left_leg_indices if idx < abad_pos.shape[1]]
+        if right_ids and left_ids:
+            abad_left = abad_pos[:, left_ids].mean(dim=1)
+            abad_right = abad_pos[:, right_ids].mean(dim=1)
+            abad_asymmetry = torch.abs(abad_left - abad_right)
+        else:
+            abad_asymmetry = torch.zeros(self.num_envs, device=self.device)
         
         # 需要轉向時，獎勵非對稱；直走時，獎勵對稱
         rew_abad_stability = torch.where(

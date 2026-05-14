@@ -74,27 +74,17 @@ REDRHEX_CFG = ArticulationCfg(
         # USD 顯示的是度數，這裡轉換為弧度
         joint_pos={
             # ===== 主驅動關節 (Main Drive) =====
-            # 右側: 45°, 左側: -45°
             "Revolute_15": 45.0 * math.pi / 180,   # 右前 - 45°
             "Revolute_12": 45.0 * math.pi / 180,   # 右後 - 45°
             "Revolute_7": 45.0 * math.pi / 180,    # 右中 - 45°
-            "Revolute_18": -45.0 * math.pi / 180,  # 左前 - -45°
-            "Revolute_23": -45.0 * math.pi / 180,  # 左中 - -45°
-            "Revolute_24": -45.0 * math.pi / 180,  # 左後 - -45°
             # ===== ABAD 關節 - 全部 0° =====
             "Revolute_14": 0.0,
             "Revolute_6": 0.0,
             "Revolute_11": 0.0,
-            "Revolute_17": 0.0,
-            "Revolute_22": 0.0,
-            "Revolute_21": 0.0,
             # ===== 避震關節 (Damper) =====
             "Revolute_5": 45.0 * math.pi / 180,    # 45°
             "Revolute_13": -45.0 * math.pi / 180,  # -45°
             "Revolute_8": 45.0 * math.pi / 180,    # 45°
-            "Revolute_25": 45.0 * math.pi / 180,   # 45°
-            "Revolute_26": 45.0 * math.pi / 180,   # 45°
-            "Revolute_27": 45.0 * math.pi / 180,   # 45°
         },
         joint_vel={".*": 0.0},
     ),
@@ -104,8 +94,7 @@ REDRHEX_CFG = ArticulationCfg(
         # RHex 腿需要足夠扭矩來驅動 ~12kg 機身
         "main_drive": ImplicitActuatorCfg(
             joint_names_expr=[
-                "Revolute_15", "Revolute_12", "Revolute_18",
-                "Revolute_23", "Revolute_24", "Revolute_7"
+                "Revolute_15", "Revolute_12", "Revolute_7"
             ],
             effort_limit=15.0,       # 提高力矩限制以驅動重機身
             velocity_limit=15.0,     # 提高速度限制允許快速旋轉
@@ -115,8 +104,7 @@ REDRHEX_CFG = ArticulationCfg(
         # ABAD 關節 - 位置控制，小範圍調節
         "abad": ImplicitActuatorCfg(
             joint_names_expr=[
-                "Revolute_14", "Revolute_11", "Revolute_17",
-                "Revolute_22", "Revolute_21", "Revolute_6"
+                "Revolute_14", "Revolute_11", "Revolute_6"
             ],
             effort_limit=8.0,        # 提高力矩以有效調節姿態
             velocity_limit=5.0,
@@ -128,8 +116,7 @@ REDRHEX_CFG = ArticulationCfg(
         # 目標：盡可能保持形狀不變
         "damper": ImplicitActuatorCfg(
             joint_names_expr=[
-                "Revolute_5", "Revolute_13", "Revolute_25",
-                "Revolute_26", "Revolute_27", "Revolute_8"
+                "Revolute_5", "Revolute_13", "Revolute_8"
             ],
             effort_limit=50.0,       # 高力矩限制以維持位置
             velocity_limit=1.0,      # 低速度限制防止快速移動
@@ -164,26 +151,26 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     episode_length_s = 30.0  # 增加 episode 長度讓機器人有更多學習時間
 
     # ===================
-    # Action Space: 6 main drive velocities + 6 ABAD positions = 12
+    # Action Space: 3 main drive velocities + 3 ABAD positions = 6
     # ===================
-    action_space = 12
+    action_space = 6
     
     # ===================
     # Observation Space:
     # - base_lin_vel (3)
     # - base_ang_vel (3) 
     # - projected_gravity (3)
-    # - main_drive_pos_sin (6) - 用 sin 表示循環相位
-    # - main_drive_pos_cos (6) - 用 cos 表示循環相位
-    # - main_drive_vel (6)
-    # - abad_pos (6)
-    # - abad_vel (6)
+    # - main_drive_pos_sin (3) - 用 sin 表示循環相位
+    # - main_drive_pos_cos (3) - 用 cos 表示循環相位
+    # - main_drive_vel (3)
+    # - abad_pos (3)
+    # - abad_vel (3)
     # - velocity_command (3)
     # - gait_phase (2) - sin/cos
-    # - last_actions (12)
-    # Total: 3+3+3+6+6+6+6+6+3+2+12 = 56
+    # - last_actions (6)
+    # Total: 3+3+3+3+3+3+3+3+3+2+6 = 35
     # ===================
-    observation_space = 56
+    observation_space = 35
     state_space = 0
 
     # ===================
@@ -260,24 +247,17 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "Revolute_15",  # idx 0 - Leg 1 (右前) - Tripod A
         "Revolute_7",   # idx 1 - Leg 2 (右中) - Tripod B
         "Revolute_12",  # idx 2 - Leg 3 (右後) - Tripod B
-        "Revolute_18",  # idx 3 - Leg 4 (左前) - Tripod A
-        "Revolute_23",  # idx 4 - Leg 5 (左中) - Tripod B
-        "Revolute_24",  # idx 5 - Leg 6 (左後) - Tripod A
     ]
     
     # 方向乘數 (前進時的旋轉方向)
-    # 右側腿 (idx 0,1,2): 負向旋轉 → -1
-    # 左側腿 (idx 3,4,5): 正向旋轉 → +1
-    leg_direction_multiplier = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+    # 目前 repo-local URDF exposes the right-side active joints.
+    leg_direction_multiplier = [-1.0, -1.0, -1.0]
     
     # ABAD 關節 (位置控制) - 順序對應主驅動
     abad_joint_names = [
         "Revolute_14",  # Leg 1 (右前)
         "Revolute_6",   # Leg 2 (右中)
         "Revolute_11",  # Leg 3 (右後)
-        "Revolute_17",  # Leg 4 (左前)
-        "Revolute_22",  # Leg 5 (左中)
-        "Revolute_21",  # Leg 6 (左後)
     ]
     
     # 避震關節 (被動) - 順序對應主驅動
@@ -285,9 +265,6 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
         "Revolute_5",   # Leg 1 (右前)
         "Revolute_8",   # Leg 2 (右中)
         "Revolute_13",  # Leg 3 (右後)
-        "Revolute_25",  # Leg 4 (左前)
-        "Revolute_26",  # Leg 5 (左中)
-        "Revolute_27",  # Leg 6 (左後)
     ]
 
     # ===================
@@ -297,17 +274,16 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # - Tripod A: 15(idx0), 18(idx3), 24(idx5) = 右前 + 左前 + 左後
     # - Tripod B: 7(idx1), 12(idx2), 23(idx4) = 右中 + 右後 + 左中
     # 這樣的分組確保任何時刻都有對角線支撐
-    tripod_a_leg_indices = [0, 3, 5]  # joints 15, 18, 24
-    tripod_b_leg_indices = [1, 2, 4]  # joints 7, 12, 23
+    tripod_a_leg_indices = [0]     # joint 15
+    tripod_b_leg_indices = [1, 2]  # joints 7, 12
     
     # ===================
     # Leg Side Groups (for motor direction)
     # ===================
     # 基於 main_drive_joint_names 的索引
     # Right side: idx 0, 1, 2 → joints 15, 7, 12
-    # Left side: idx 3, 4, 5 → joints 18, 23, 24
     right_leg_indices = [0, 1, 2]  # 右側腿
-    left_leg_indices = [3, 4, 5]   # 左側腿
+    left_leg_indices = []          # 目前 repo-local URDF only includes the right-side active joints
 
     # ===================
     # Action Scaling
