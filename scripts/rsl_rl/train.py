@@ -79,6 +79,7 @@ import gymnasium as gym
 import os
 import torch
 from datetime import datetime
+from pathlib import Path
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -89,6 +90,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
@@ -161,6 +163,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # Apply reward scale overrides written by the training panel (if any)
+    _override_file = Path(__file__).parents[2] / "tools" / "training_panel" / "active_reward_override.json"
+    if _override_file.exists():
+        import json as _json
+        _overrides = _json.loads(_override_file.read_text(encoding="utf-8"))
+        _applied = []
+        for _key, _val in _overrides.items():
+            if hasattr(env_cfg, _key):
+                setattr(env_cfg, _key, float(_val))
+                _applied.append(f"{_key}={_val}")
+        if _applied:
+            print(f"[INFO] Training panel reward overrides applied: {', '.join(_applied)}")
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -170,7 +185,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        if agent_cfg.load_checkpoint and (
+            os.path.isabs(agent_cfg.load_checkpoint) or os.path.exists(agent_cfg.load_checkpoint)
+        ):
+            resume_path = retrieve_file_path(agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:

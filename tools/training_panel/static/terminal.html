@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RedRHex Process Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="terminal-body">
+    <main class="terminal-main">
+      <header class="terminal-header">
+        <div>
+          <h1>Process Console</h1>
+          <p id="terminal-target">Loading...</p>
+        </div>
+        <div class="terminal-actions">
+          <span id="terminal-live" class="status-badge muted-pill">Output: Idle</span>
+          <button type="button" id="terminal-theme" class="ghost-button">Dark Mode</button>
+          <button type="button" id="terminal-refresh" class="ghost-button">Refresh</button>
+          <button type="button" id="terminal-copy" class="ghost-button">Copy Output</button>
+          <button type="button" id="terminal-attach" class="ghost-button">Copy Attach</button>
+          <button type="button" id="terminal-stop" class="ghost-button">Stop Process</button>
+        </div>
+      </header>
+      <section class="terminal-grid">
+        <article>
+          <h2>Command</h2>
+          <pre id="terminal-command"></pre>
+        </article>
+        <article>
+          <h2>Output</h2>
+          <pre id="terminal-output"></pre>
+        </article>
+      </section>
+    </main>
+    <script src="/static/terminal.js"></script>
+  </body>
+</html>

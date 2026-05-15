@@ -544,84 +544,74 @@ class RedrhexEnv(DirectRLEnv):
         actual_wz = self.base_ang_vel[:, 2]  # 實際旋轉速度
 
         # ===== 1. 速度追蹤獎勵（核心！參考 anymal_c）=====
-        
+
         # 1.1 線速度 XY 追蹤 (參考 anymal_c 的 track_lin_vel_xy_exp)
-        # 使用 exp(-error/0.25) 映射，誤差越小獎勵越高
         lin_vel_error = torch.sum(
             torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1
-        )  # squared error: (cmd_vx - actual_vx)^2 + (cmd_vy - actual_vy)^2
-        rew_track_lin_vel = torch.exp(-lin_vel_error / 0.25) * 4.0  # 高權重
+        )
+        rew_track_lin_vel = torch.exp(-lin_vel_error / 0.25) * self.cfg.rew_scale_vel_tracking
         rewards += rew_track_lin_vel
-        
-        # 1.2 角速度 Z 追蹤 (參考 anymal_c 的 track_ang_vel_z_exp)
+
+        # 1.2 角速度 Z 追蹤
         yaw_rate_error = torch.square(cmd_wz - actual_wz)
-        rew_track_ang_vel = torch.exp(-yaw_rate_error / 0.25) * 2.5  # 較高權重
+        rew_track_ang_vel = torch.exp(-yaw_rate_error / 0.25) * self.cfg.rew_scale_ang_vel_tracking
         rewards += rew_track_ang_vel
-        
+
         # 1.3 原地旋轉特別獎勵
-        # 當 vx, vy 目標接近 0 且有旋轉命令時，額外獎勵旋轉追蹤
         is_rotation_mode = (torch.abs(cmd_vx) < 0.1) & (torch.abs(cmd_vy) < 0.1) & (torch.abs(cmd_wz) > 0.3)
-        
-        # 原地旋轉時：
-        # - 獎勵旋轉方向正確
-        # - 懲罰不必要的線速度
-        wz_sign_match = (cmd_wz * actual_wz) > 0  # 旋轉方向正確
-        wz_magnitude_reward = torch.abs(actual_wz) * wz_sign_match.float()  # 只有方向正確時獎勵大小
-        lin_vel_in_rotation = torch.sqrt(actual_vx**2 + actual_vy**2)  # 旋轉時的線速度（應該接近 0）
-        
+        wz_sign_match = (cmd_wz * actual_wz) > 0
+        wz_magnitude_reward = torch.abs(actual_wz) * wz_sign_match.float()
+        lin_vel_in_rotation = torch.sqrt(actual_vx**2 + actual_vy**2)
         rotation_bonus = torch.where(
             is_rotation_mode,
-            wz_magnitude_reward * 3.0 - lin_vel_in_rotation * 2.0,  # 獎勵旋轉，懲罰移動
+            wz_magnitude_reward * self.cfg.rew_scale_rotation_direction - lin_vel_in_rotation * 2.0,
             torch.zeros_like(actual_wz)
         )
         rewards += rotation_bonus.clamp(min=-2.0, max=4.0)
-        
-        # 1.4 組合成舊的追蹤獎勵（for TensorBoard 相容）
-        vel_error_2d = torch.sqrt(lin_vel_error)  # L2 error
-        rew_vel_tracking = torch.exp(-vel_error_2d * 2.5) * 2.0  # 額外追蹤獎勵
+
+        # 1.4 二次速度追蹤
+        vel_error_2d = torch.sqrt(lin_vel_error)
+        rew_vel_tracking = torch.exp(-vel_error_2d * 2.5) * self.cfg.rew_scale_vel_tracking2
         rewards += rew_vel_tracking
-        
-        # forward_vel 相容舊版
+
+        # 前進速度獎勵
         rew_forward_vel = torch.where(
             torch.abs(cmd_vx) > 0.05,
-            actual_vx * torch.sign(cmd_vx) * 3.0,  # 正確方向給獎勵
-            torch.zeros_like(actual_vx)  # 無前進命令時不給此獎勵
+            actual_vx * torch.sign(cmd_vx) * self.cfg.rew_scale_forward_vel,
+            torch.zeros_like(actual_vx)
         )
         rewards += rew_forward_vel.clamp(min=-2.0, max=4.0)
 
         # ===== 2. 方向對齊獎勵 =====
-        cmd_vel_2d = torch.stack([cmd_vx, cmd_vy], dim=1)  # [N, 2]
-        actual_vel_2d = torch.stack([actual_vx, actual_vy], dim=1)  # [N, 2]
+        cmd_vel_2d = torch.stack([cmd_vx, cmd_vy], dim=1)
+        actual_vel_2d = torch.stack([actual_vx, actual_vy], dim=1)
         cmd_speed = torch.norm(cmd_vel_2d, dim=1).clamp(min=0.01)
         actual_speed = torch.norm(actual_vel_2d, dim=1).clamp(min=0.01)
-        
-        # 只在有移動命令時計算方向對齊
         has_move_cmd = cmd_speed > 0.05
         direction_dot = (cmd_vel_2d * actual_vel_2d).sum(dim=1) / (cmd_speed * actual_speed + 1e-6)
         rew_direction_align = torch.where(
             has_move_cmd,
-            direction_dot * 1.5,  # 對齊獎勵
-            torch.zeros_like(direction_dot)  # 無移動命令時不計算
+            direction_dot * self.cfg.rew_scale_direction_align,
+            torch.zeros_like(direction_dot)
         )
-        rewards += rew_direction_align.clamp(min=-1.5, max=1.5)
-        
+        rewards += rew_direction_align.clamp(
+            min=-self.cfg.rew_scale_direction_align,
+            max=self.cfg.rew_scale_direction_align,
+        )
+
         # ===== 3. 方向正確獎勵 =====
-        # 實際速度向量與命令同向時給獎勵
-        rew_correct_dir = rew_direction_align  # 複用
+        rew_correct_dir = rew_direction_align
 
         # ===== 4. ABAD 使用獎勵 =====
-        # 當需要側向移動或旋轉時，ABAD 應該有所動作
-        need_lateral = torch.abs(cmd_vy) > 0.1  # 需要側向移動
-        need_rotation = torch.abs(cmd_wz) > 0.3  # 需要旋轉
+        need_lateral = torch.abs(cmd_vy) > 0.1
+        need_rotation = torch.abs(cmd_wz) > 0.3
         need_abad = need_lateral | need_rotation
-        abad_magnitude = torch.abs(abad_pos).mean(dim=1)  # ABAD 動作幅度
-        
-        # 需要側向/旋轉時，獎勵 ABAD 使用；不需要時，獎勵 ABAD 保持中立
+        abad_magnitude = torch.abs(abad_pos).mean(dim=1)
         rew_abad_action = torch.where(
             need_abad,
-            abad_magnitude * 0.8,  # 需要時：獎勵 ABAD 動作
-            (1.0 - abad_magnitude) * 0.4  # 不需要：獎勵 ABAD 保持中立
-        )
+            abad_magnitude * 0.8,
+            (1.0 - abad_magnitude) * 0.4
+        ) * self.cfg.rew_scale_abad_action
         rewards += rew_abad_action
         
         # ABAD 左右對稱性（旋轉時應該非對稱以產生差速轉向）
@@ -633,102 +623,88 @@ class RedrhexEnv(DirectRLEnv):
             abad_asymmetry = torch.abs(abad_left - abad_right)
         else:
             abad_asymmetry = torch.zeros(self.num_envs, device=self.device)
-        
-        # 需要轉向時，獎勵非對稱；直走時，獎勵對稱
         rew_abad_stability = torch.where(
             need_abad,
-            abad_asymmetry * 0.5,  # 轉向：獎勵非對稱
-            (1.0 - abad_asymmetry) * 0.3  # 直走：獎勵對稱
-        )
+            abad_asymmetry * 0.5,
+            (1.0 - abad_asymmetry) * 0.3
+        ) * self.cfg.rew_scale_abad_stability
         rewards += rew_abad_stability
 
         # ===== 4. 腿旋轉獎勵 =====
-        
-        # 4.1 正確方向旋轉
         correct_direction = effective_vel > 0.3
-        rew_rotation_dir = correct_direction.float().sum(dim=1) * 0.3
+        rew_rotation_dir = correct_direction.float().sum(dim=1) * self.cfg.rew_scale_rotation_dir
         rewards += rew_rotation_dir
-        
-        # 4.2 所有腿都要動
-        rew_all_legs = num_active_legs * 0.2
+
+        rew_all_legs = num_active_legs * self.cfg.rew_scale_all_legs
         rewards += rew_all_legs
-        
-        # 4.3 最慢的腿也要動
-        rew_min_vel = torch.clamp(min_vel, max=3.0) * 0.3
+
+        rew_min_vel = torch.clamp(min_vel, max=3.0) * self.cfg.rew_scale_min_leg_vel
         rewards += rew_min_vel
-        
-        # 4.4 平均旋轉速度
-        rew_mean_vel = torch.clamp(mean_vel, max=5.0) * 0.2
+
+        rew_mean_vel = torch.clamp(mean_vel, max=5.0) * self.cfg.rew_scale_mean_leg_vel
         rewards += rew_mean_vel
-        
-        # 合併用於 TensorBoard
+
         rew_correct_dir = rew_direction_align
 
         # ===== 5. 穩定性懲罰 =====
-        
-        # 5.1 傾斜懲罰
         grav_xy = self.projected_gravity[:, :2]
         tilt = torch.norm(grav_xy, dim=1)
-        rew_orientation = -tilt * 0.3
+        rew_orientation = tilt * self.cfg.rew_scale_orientation   # scale is negative
         rewards += rew_orientation
-        
-        # 5.2 高度保持
+
         base_height = self.robot.data.root_pos_w[:, 2]
         target_height = 0.12
         height_error = torch.abs(base_height - target_height)
-        rew_base_height = -height_error * 0.3
+        rew_base_height = height_error * self.cfg.rew_scale_base_height   # scale is negative
         rewards += rew_base_height
-        
-        # 5.3 垂直速度懲罰
+
         z_vel = self.base_lin_vel[:, 2]
-        rew_lin_vel_z = -torch.abs(z_vel) * 0.15
+        rew_lin_vel_z = torch.abs(z_vel) * self.cfg.rew_scale_lin_vel_z   # scale is negative
         rewards += rew_lin_vel_z
-        
-        # 5.4 不需要的角速度懲罰（xy 角速度）
+
         ang_vel_xy = self.base_ang_vel[:, :2]
-        rew_ang_vel_xy = -torch.norm(ang_vel_xy, dim=1) * 0.1
+        rew_ang_vel_xy = torch.norm(ang_vel_xy, dim=1) * self.cfg.rew_scale_ang_vel_xy  # scale is negative
         rewards += rew_ang_vel_xy
 
         # ===== 6. 存活獎勵 =====
-        rew_alive = torch.ones(self.num_envs, device=self.device) * 0.15
+        rew_alive = torch.ones(self.num_envs, device=self.device) * self.cfg.rew_scale_alive
         rewards += rew_alive
 
         # ===== 7. 步態協調 =====
         effective_pos = main_drive_pos * self._direction_multiplier
         leg_phase = torch.remainder(effective_pos, 2 * math.pi)
-        
+
         phase_a = leg_phase[:, self._tripod_a_indices]
         phase_b = leg_phase[:, self._tripod_b_indices]
-        
+
         def phase_coherence(phases):
             sin_mean = torch.sin(phases).mean(dim=1)
             cos_mean = torch.cos(phases).mean(dim=1)
             return torch.sqrt(sin_mean**2 + cos_mean**2)
-        
+
         coherence_a = phase_coherence(phase_a)
         coherence_b = phase_coherence(phase_b)
-        rew_tripod_sync = (coherence_a + coherence_b) * 0.15
+        rew_tripod_sync = (coherence_a + coherence_b) * self.cfg.rew_scale_gait_coherence
         rewards += rew_tripod_sync
-        
+
         mean_phase_a = torch.atan2(torch.sin(phase_a).mean(dim=1), torch.cos(phase_a).mean(dim=1))
         mean_phase_b = torch.atan2(torch.sin(phase_b).mean(dim=1), torch.cos(phase_b).mean(dim=1))
         phase_diff = torch.abs(mean_phase_a - mean_phase_b)
         phase_diff = torch.min(phase_diff, 2 * math.pi - phase_diff)
         phase_diff_error = torch.abs(phase_diff - math.pi)
-        rew_gait_sync = torch.exp(-phase_diff_error) * 0.1
+        rew_gait_sync = torch.exp(-phase_diff_error) * self.cfg.rew_scale_gait_phase_offset
         rewards += rew_gait_sync
-        
-        # 持續支撐
+
         in_stance = leg_phase < math.pi
         stance_a = in_stance[:, self._tripod_a_indices].float().sum(dim=1)
         stance_b = in_stance[:, self._tripod_b_indices].float().sum(dim=1)
         has_support = ((stance_a >= 1) | (stance_b >= 1)).float()
-        rew_continuous_support = has_support * 0.15
+        rew_continuous_support = has_support * self.cfg.rew_scale_continuous_support
         rewards += rew_continuous_support
 
         # 動作平滑性
         action_diff = self.actions - self.last_actions
-        rew_action_rate = -torch.norm(action_diff, dim=1) * 0.02
+        rew_action_rate = torch.norm(action_diff, dim=1) * self.cfg.rew_scale_action_rate  # scale is negative
         rewards += rew_action_rate
         
         rew_smooth_rotation = torch.zeros(self.num_envs, device=self.device)

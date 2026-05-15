@@ -349,33 +349,49 @@ class RedrhexEnvCfg(DirectRLEnvCfg):
     # ===================
     # Reward Scales
     # ===================
-    
-    # --- 核心獎勵：前進運動（最重要）---
-    rew_scale_forward_vel = 8.0         # 大幅提高前進獎勵
-    rew_scale_vel_tracking = 3.0        # 提高速度追蹤獎勵
-    rew_scale_alive = 0.5               # 降低存活獎勵（避免原地不動）
-    
-    # --- 步態獎勵 ---
-    rew_scale_gait_sync = 0.2           # 降低同步要求
-    rew_scale_smooth_rotation = 0.0     # 完全移除（不懲罰速度變化）
-    rew_scale_rotation_direction = 3.0  # 大幅提高旋轉方向獎勵
-    
-    # --- 穩定性懲罰（大幅降低）---
-    rew_scale_orientation = -0.05       # 大幅降低傾斜懲罰
-    rew_scale_base_height = -0.02       # 大幅降低高度懲罰
-    rew_scale_lin_vel_z = -0.02         # 大幅降低垂直跳動懲罰
-    rew_scale_ang_vel_xy = -0.01        # 大幅降低角速度懲罰
-    
-    # --- ABAD 獎勵 ---
-    rew_scale_abad_action = 0.0         # 完全移除 ABAD 動作懲罰
-    rew_scale_abad_stability = 0.1      # 降低 ABAD 穩定獎勵
-    
-    # --- 平滑性懲罰（完全移除）---
-    rew_scale_action_rate = 0.0         # 完全移除動作變化率懲罰
-    rew_scale_drive_acc = 0.0           # 完全移除主驅動加速度懲罰
-    
-    # --- 碰撞懲罰 ---
-    rew_scale_collision = -1.0          # 身體碰撞懲罰
+    # These defaults match the actual training behavior. Set a scale to 0.0 to
+    # disable that reward component. All values can be overridden via reward presets
+    # in the training panel without editing this file.
+
+    # --- Locomotion Goals ---
+    rew_scale_forward_vel       = 3.0   # Forward velocity in commanded direction
+    rew_scale_vel_tracking      = 4.0   # Linear XY velocity tracking (exp loss)
+    rew_scale_ang_vel_tracking  = 2.5   # Angular Z velocity tracking (exp loss)
+    rew_scale_vel_tracking2     = 2.0   # Secondary velocity tracking (L2 error)
+    rew_scale_direction_align   = 1.5   # Velocity direction alignment reward
+
+    # --- Rotation Mode ---
+    rew_scale_rotation_direction = 3.0  # In-place rotation bonus magnitude
+    rew_scale_smooth_rotation    = 0.0  # Smooth rotation (currently disabled)
+
+    # --- Leg Motion ---
+    rew_scale_rotation_dir      = 0.3   # Per-leg correct rotation direction
+    rew_scale_all_legs          = 0.2   # All legs active reward
+    rew_scale_min_leg_vel       = 0.3   # Slowest-leg speed reward
+    rew_scale_mean_leg_vel      = 0.2   # Mean leg speed reward
+
+    # --- Stability Penalties (negative = punish) ---
+    rew_scale_orientation       = -0.3  # Body tilt penalty
+    rew_scale_base_height       = -0.3  # Base height deviation penalty
+    rew_scale_lin_vel_z         = -0.15 # Vertical bouncing penalty
+    rew_scale_ang_vel_xy        = -0.1  # Roll/pitch angular velocity penalty
+
+    # --- Gait Coordination ---
+    rew_scale_gait_coherence    = 0.15  # Tripod phase coherence (within group)
+    rew_scale_gait_phase_offset = 0.1   # Tripod A vs B antiphase reward
+    rew_scale_continuous_support = 0.15 # At-least-one-leg-on-ground reward
+
+    # --- ABAD Control ---
+    rew_scale_abad_action       = 1.0   # ABAD action reward multiplier (1.0 = full)
+    rew_scale_abad_stability    = 1.0   # ABAD stability reward multiplier (1.0 = full)
+
+    # --- Survival & Smoothness ---
+    rew_scale_alive             = 0.15  # Alive bonus per step
+    rew_scale_action_rate       = -0.02 # Action change rate penalty
+    rew_scale_drive_acc         = 0.0   # Drive acceleration penalty (disabled)
+
+    # --- Collision ---
+    rew_scale_collision         = -1.0  # Body collision penalty (not yet wired)
 
     # ===================
     # Termination Conditions

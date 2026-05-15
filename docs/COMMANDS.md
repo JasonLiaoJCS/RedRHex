@@ -238,7 +238,11 @@ $ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/play.py \
   --num_envs 1 \
   --headless \
   --video \
-  --video_length 600 \
+  --video_length 1200 \
+  --video_width 1920 \
+  --video_height 1080 \
+  --video_fps 30 \
+  --rendering_mode quality \
   --device cuda:0 \
   --checkpoint logs/rsl_rl/redrhex_wheg/<run_name>/model_<iteration>.pt
 ```
@@ -248,6 +252,8 @@ $ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/play.py \
 ```text
 logs/rsl_rl/redrhex_wheg/<run_name>/videos/play/
 ```
+
+Training Panel 會在 panel 啟動的訓練成功完成後，自動用最新 checkpoint 執行同樣的 headless 錄影流程，預設使用 High quality：1920x1080、1200 steps、30 FPS、quality rendering。錄影完成後可以在 History 詳細頁直接播放 MP4。
 
 ## 8. TensorBoard
 
@@ -300,10 +306,20 @@ V1 是 read-only reward/config browser：只顯示檔案、說明、reward scale
 History 頁面功能：
 
 - Rename：替 training run 加上好讀名稱。
-- TensorBoard：針對該 run 的 log directory 啟動 TensorBoard。
-- Play：用該 run 的 latest checkpoint 啟動 `scripts/rsl_rl/play.py`。
+- TensorBoard：會先打開一個等待中的分頁，再針對該 run 的 log directory 啟動 TensorBoard，成功後把分頁導到該 port。
+- Play：用該 run 的 latest checkpoint 啟動 `scripts/rsl_rl/play.py`，並把該 process 選到 Process Console。
+- Recorded Result：嵌入最新 MP4，並用單一 High quality 預設錄影。panel 啟動的 training 成功後，也會自動用 High quality 錄一次。
 - Resume：把該 run 的 latest checkpoint 帶回 Train 表單，再由你選擇新的 env / iteration 後繼續 train。
-- Debug：顯示 panel 執行的完整 command 和 captured terminal log，方便失敗時看錯誤。TensorBoard / Play 如果啟動後馬上失敗，也會把 log tail 回傳到 panel。
+- Process Console：統一取代原本分散的 Debug / Open Terminal，顯示完整 command、即時 output、診斷文字、process log path。若系統有 `tmux`，panel process 會跑在 detached tmux session，按 `Copy Attach Command` 後可在 SSH 裡貼上並直接用 `Ctrl+C` 停 Isaac。
+- Pop Out：把同一個 Process Console 開在獨立瀏覽器分頁，LAN 或 SSH tunnel 使用時也能看 log。
+- Copy Output / Copy Attach Command：複製目前 output 或真 terminal attach command，方便貼給 Codex 或保存錯誤訊息。
+- Open Run Folder / Open Video Folder / Open Log Folder：只允許 repo log roots 內的路徑；本機會嘗試用 `xdg-open` / `gio open` 打開，遠端使用時仍會回傳可複製的 path / command。
+- Stop Process：對目前 Process Console 指向的 Training / Play / Video / TensorBoard process 送出類似 `Ctrl+C` 的中斷；如果 Isaac Sim 沒關掉，panel 會再升級停止。
+- Delete Run：先列出即將刪除的 repo log / note 路徑，必須輸入完整 run id 才會刪除；若該 run 還有 process 在跑，會先拒絕刪除。
+
+Video default：
+
+- High：1920x1080、1200 steps、30 FPS、quality rendering。
 
 ## 9. 目前這台機器已驗證到哪裡
 

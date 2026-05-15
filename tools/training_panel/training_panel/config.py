@@ -38,6 +38,14 @@ class PanelPaths:
         return self.isaaclab_root / "isaaclab.sh"
 
     @property
+    def conda_root(self) -> Path:
+        return self.conda_sh.parents[2]
+
+    @property
+    def conda_prefix(self) -> Path:
+        return self.conda_root / "envs" / self.conda_env
+
+    @property
     def panel_log_root(self) -> Path:
         return self.repo_root / "logs" / "training_panel"
 
@@ -57,8 +65,11 @@ class PanelPaths:
     def rsl_rl_log_root(self) -> Path:
         return self.repo_root / "logs" / "rsl_rl" / "redrhex_wheg"
 
+    @property
+    def reward_override_file(self) -> Path:
+        return self.repo_root / "tools" / "training_panel" / "active_reward_override.json"
+
     def ensure_dirs(self) -> None:
         self.panel_log_root.mkdir(parents=True, exist_ok=True)
         self.process_log_dir.mkdir(parents=True, exist_ok=True)
         self.notes_dir.mkdir(parents=True, exist_ok=True)
-

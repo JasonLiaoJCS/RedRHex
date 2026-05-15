@@ -1,0 +1,39 @@
+{
+  "active_preset_id": "baseline",
+  "presets": [
+    {
+      "id": "baseline",
+      "name": "Baseline",
+      "description": "The current default reward configuration. Good starting point — balanced between speed and stability.",
+      "built_in": true,
+      "values": {}
+    },
+    {
+      "id": "speed-focus",
+      "name": "Speed Focus",
+      "description": "Emphasises forward velocity and tracking. Robot learns to move faster but may be less stable. Try this after a baseline run succeeds.",
+      "built_in": true,
+      "values": {
+        "rew_scale_forward_vel": 5.0,
+        "rew_scale_vel_tracking": 6.0,
+        "rew_scale_ang_vel_tracking": 3.5,
+        "rew_scale_orientation": -0.1,
+        "rew_scale_base_height": -0.1
+      }
+    },
+    {
+      "id": "stability-focus",
+      "name": "Stability Focus",
+      "description": "Strongly penalises tilting and height deviation. Robot learns to stay upright and balanced first. Good for early-stage training when the robot keeps falling.",
+      "built_in": true,
+      "values": {
+        "rew_scale_forward_vel": 1.5,
+        "rew_scale_vel_tracking": 2.0,
+        "rew_scale_orientation": -0.6,
+        "rew_scale_base_height": -0.6,
+        "rew_scale_lin_vel_z": -0.3,
+        "rew_scale_alive": 0.3
+      }
+    }
+  ]
+}

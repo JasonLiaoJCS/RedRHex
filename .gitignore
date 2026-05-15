@@ -47,6 +47,7 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+tools/training_panel/active_reward_override.json
 
 # Doc Outputs
 **/docs/_build/*
