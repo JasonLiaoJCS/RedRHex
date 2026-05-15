@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from tools.training_panel.training_panel.config import PanelPaths
-from tools.training_panel.training_panel.history import HistoryStore, latest_checkpoint, latest_video, tail_file
+from tools.training_panel.training_panel.history import HistoryStore, latest_checkpoint, latest_onnx, latest_video, tail_file
 from tools.training_panel.training_panel.server import PanelHandler, PanelState, route_id
 
 
@@ -43,6 +43,14 @@ class HistoryTests(unittest.TestCase):
             os.utime(old, (100, 100))
             os.utime(new, (200, 200))
             self.assertTrue(latest_video(run).endswith("rl-video-step-600.mp4"))
+
+    def test_latest_onnx_discovers_exported_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            exported = run / "exported"
+            exported.mkdir()
+            (exported / "policy.onnx").write_text("onnx", encoding="utf-8")
+            self.assertTrue(latest_onnx(run).endswith("exported/policy.onnx"))
 
     def test_rename_discovered_run_preserves_log_data(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +177,58 @@ class HistoryTests(unittest.TestCase):
             self.assertFalse(run.exists())
             self.assertEqual(store.get_run("failed_run"), None)
             self.assertEqual(store.get_note("failed_run"), "")
+
+    def test_compact_preview_keeps_highest_iteration_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "logs" / "rsl_rl" / "redrhex_wheg" / "compact_run"
+            run.mkdir(parents=True)
+            (run / "model_0.pt").write_text("old", encoding="utf-8")
+            (run / "model_10.pt").write_text("new", encoding="utf-8")
+            (run / "model_2.pt").write_text("mid", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+
+            preview = store.compact_preview("compact_run")
+
+            self.assertTrue(preview["kept_checkpoint"].endswith("model_10.pt"))
+            self.assertEqual(preview["delete_count"], 2)
+            self.assertEqual([item["iteration"] for item in preview["delete_paths"]], [0, 2])
+
+    def test_compact_run_deletes_only_old_top_level_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "logs" / "rsl_rl" / "redrhex_wheg" / "compact_run"
+            run.mkdir(parents=True)
+            (run / "model_0.pt").write_text("old", encoding="utf-8")
+            (run / "model_10.pt").write_text("new", encoding="utf-8")
+            (run / "events.out.tfevents.test").write_text("event", encoding="utf-8")
+            params = run / "params"
+            params.mkdir()
+            (params / "env.yaml").write_text("params", encoding="utf-8")
+            video_dir = run / "videos" / "play"
+            video_dir.mkdir(parents=True)
+            (video_dir / "rl-video-step-0.mp4").write_text("video", encoding="utf-8")
+            exported = run / "exported"
+            exported.mkdir()
+            (exported / "policy.pt").write_text("jit", encoding="utf-8")
+            (exported / "policy.onnx").write_text("onnx", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+            store.set_note("compact_run", "keep this")
+
+            with self.assertRaises(ValueError):
+                store.compact_run("compact_run", confirmation="wrong")
+
+            result = store.compact_run("compact_run", confirmation="compact_run")
+
+            self.assertTrue(result["compacted"])
+            self.assertFalse((run / "model_0.pt").exists())
+            self.assertTrue((run / "model_10.pt").exists())
+            self.assertTrue((run / "events.out.tfevents.test").exists())
+            self.assertTrue((params / "env.yaml").exists())
+            self.assertTrue((video_dir / "rl-video-step-0.mp4").exists())
+            self.assertTrue((exported / "policy.pt").exists())
+            self.assertTrue((exported / "policy.onnx").exists())
+            self.assertEqual(store.get_note("compact_run"), "keep this")
 
 
 if __name__ == "__main__":

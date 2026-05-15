@@ -22,6 +22,7 @@ parser.add_argument("--video_length", type=int, default=200, help="Length of the
 parser.add_argument("--video_width", type=int, default=None, help="Width of recorded video frames.")
 parser.add_argument("--video_height", type=int, default=None, help="Height of recorded video frames.")
 parser.add_argument("--video_fps", type=int, default=None, help="FPS metadata for recorded videos.")
+parser.add_argument("--export_policy_only", action="store_true", default=False, help="Export policy files and exit.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -179,6 +180,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    print(f"[INFO]: Exported policy JIT to: {os.path.join(export_model_dir, 'policy.pt')}")
+    print(f"[INFO]: Exported policy ONNX to: {os.path.join(export_model_dir, 'policy.onnx')}")
+
+    if args_cli.export_policy_only:
+        env.close()
+        return
 
     dt = env.unwrapped.step_dt
 

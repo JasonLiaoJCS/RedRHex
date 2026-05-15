@@ -103,6 +103,45 @@ class ProcessRegistryTests(unittest.TestCase):
                     proc.wait(timeout=8)
                 time.sleep(0.1)
 
+    def test_onnx_export_process_uses_export_only_flags_and_updates_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            log_dir = paths.rsl_rl_log_root / "run_one"
+            log_dir.mkdir(parents=True)
+            checkpoint = log_dir / "model_10.pt"
+            checkpoint.write_text("x", encoding="utf-8")
+            history.add_run(
+                {
+                    "id": "run_one",
+                    "source": "training_panel",
+                    "status": "completed",
+                    "created_at": "2026-05-15T11:00:00",
+                    "log_dir": str(log_dir),
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+            result = registry.start_onnx_export("run_one", str(checkpoint), device="cpu")
+            try:
+                debug = registry.get_process_debug(result["id"])
+                self.assertIsNotNone(debug)
+                self.assertEqual(debug["kind"], "onnx")
+                self.assertEqual(debug["source_run_id"], "run_one")
+                self.assertIn("--headless", debug["command"])
+                self.assertIn("--export_policy_only", debug["command"])
+                self.assertIn("attach_command", debug)
+                run = history.get_run("run_one")
+                self.assertEqual(run["onnx_status"], "exporting")
+                self.assertEqual(run["onnx_process_id"], result["id"])
+                self.assertEqual(run["onnx_pid"], result["pid"])
+            finally:
+                proc = registry._processes.get(result["id"])
+                registry.stop(result["id"])
+                if proc:
+                    proc.wait(timeout=8)
+                time.sleep(0.1)
+
     def test_successful_training_monitor_starts_video_recording(self):
         class CompletedProcess:
             def wait(self):
@@ -170,6 +209,20 @@ class ProcessRegistryTests(unittest.TestCase):
                 self.assertEqual([process["run_id"] for process in play_processes], [result["id"]])
                 self.assertEqual(video_processes, [])
                 self.assertEqual([process["run_id"] for process in registry.running_media_processes()], [result["id"]])
+            finally:
+                registry.stop(result["id"])
+                if proc:
+                    proc.wait(timeout=8)
+
+    def test_running_isaac_processes_includes_onnx_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            registry = ProcessRegistry(paths, HistoryStore(paths))
+            result = registry.start_onnx_export("run_one", "/tmp/checkpoint.pt", device="cpu")
+            proc = registry._processes.get(result["id"])
+            try:
+                self.assertEqual([process["run_id"] for process in registry.running_isaac_processes()], [result["id"]])
             finally:
                 registry.stop(result["id"])
                 if proc:

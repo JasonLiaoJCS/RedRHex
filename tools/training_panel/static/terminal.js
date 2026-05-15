@@ -117,6 +117,9 @@ function outputDiagnosis(output) {
   if (/no MP4 was produced|No recorded video found/i.test(output)) {
     return "Diagnosis: the video process ended but no MP4 was found. Check the play/video output and encoder dependencies.";
   }
+  if (/policy\.onnx was not produced|ONNX export finished/i.test(output)) {
+    return "Diagnosis: ONNX export finished without exported/policy.onnx. Check the checkpoint load and exporter output.";
+  }
   return "";
 }
 

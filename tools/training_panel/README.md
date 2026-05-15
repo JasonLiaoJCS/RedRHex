@@ -2,8 +2,8 @@
 
 Local web panel for launching small RSL-RL training runs, finding reward tuning files, viewing run history, and keeping notes.
 
-**Version:** 1.0.0  
-**Published by:** BioRoLa ABAD RHex Team  
+**Version:** 1.1.0
+**Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
 ## Run
@@ -41,6 +41,8 @@ History actions:
 - `Rename` is handled in the details panel after selecting a run.
 - `TensorBoard` opens a pending browser tab immediately, starts TensorBoard for that run's log directory, then points the tab at the launched port.
 - `Play` starts `scripts/rsl_rl/play.py` with the latest checkpoint and selects that process in the Process Console.
+- `Export ONNX` exports the latest checkpoint to `exported/policy.onnx` and selects that export process in the Process Console.
+- `Compact Run` deletes old top-level `model_*.pt` checkpoints after confirmation, keeping the highest-iteration checkpoint and preserving videos, TensorBoard logs, params, notes, and exported policy files.
 - `Recorded Result` embeds the latest MP4 and records one high-quality default video. After a successful panel-launched training run, the panel automatically records the same high-quality result.
 - `Resume` sends the latest checkpoint back to the Train form so you can choose new env/iteration values before continuing training.
 - `Process Console` shows the exact panel-launched command, live output, diagnosis text, and attach metadata. When `tmux` is installed, panel processes run in detached tmux sessions so you can attach from SSH with the copied command and use `Ctrl+C` directly.

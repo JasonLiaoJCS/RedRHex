@@ -98,6 +98,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not preview:
                 return self._json({"error": "Run not found"}, status=404)
             return self._json(preview)
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/compact-preview"):
+            run_id = route_id(parsed.path)
+            try:
+                return self._json(self.state.history.compact_preview(run_id))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=404 if str(exc) == "Run not found" else 400)
         if parsed.path == "/api/tweakables":
             return self._json(reward_file_index(self.state.paths.repo_root))
         if parsed.path == "/api/rewards/defaults":
@@ -190,10 +196,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 run = self.state.history.get_run(run_id)
                 if not run or not run.get("latest_checkpoint"):
                     return self._json({"error": "No checkpoint found for run"}, status=404)
-                active_media = self.state.processes.running_media_processes()
+                active_media = self.state.processes.running_isaac_processes()
                 if active_media:
                     return self._json(
-                        {"error": "Stop the active play/video process before starting another Isaac action.", "processes": active_media},
+                        {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
                         status=409,
                     )
                 return self._json(
@@ -202,6 +208,25 @@ class PanelHandler(BaseHTTPRequestHandler):
                         checkpoint=str(run["latest_checkpoint"]),
                         device=str(payload.get("device") or "cuda:0"),
                         video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
+                    ),
+                    status=201,
+                )
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-onnx"):
+                run_id = route_id(parsed.path)
+                run = self.state.history.get_run(run_id)
+                if not run or not run.get("latest_checkpoint"):
+                    return self._json({"error": "No checkpoint found for run"}, status=404)
+                active_media = self.state.processes.running_isaac_processes()
+                if active_media:
+                    return self._json(
+                        {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
+                        status=409,
+                    )
+                return self._json(
+                    self.state.processes.start_onnx_export(
+                        run_id=run_id,
+                        checkpoint=str(run["latest_checkpoint"]),
+                        device=str(payload.get("device") or "cuda:0"),
                     ),
                     status=201,
                 )
@@ -245,6 +270,20 @@ class PanelHandler(BaseHTTPRequestHandler):
                         delete_logs=bool(payload.get("delete_logs", True)),
                     )
                 )
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/compact"):
+                run_id = route_id(parsed.path)
+                running = self.state.processes.running_for_run(run_id)
+                if running:
+                    return self._json(
+                        {"error": "Stop running processes for this run before compacting it", "processes": running},
+                        status=409,
+                    )
+                return self._json(
+                    self.state.history.compact_run(
+                        run_id,
+                        confirmation=str(payload.get("confirmation") or ""),
+                    )
+                )
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/notes"):
                 run_id = route_id(parsed.path)
                 self.state.history.set_note(run_id, str(payload.get("notes") or ""))
@@ -254,10 +293,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 run = self.state.history.get_run(run_id)
                 if not run or not run.get("latest_checkpoint"):
                     return self._json({"error": "No checkpoint found for run"}, status=404)
-                active_media = self.state.processes.running_media_processes()
+                active_media = self.state.processes.running_isaac_processes()
                 if active_media:
                     return self._json(
-                        {"error": "Stop the active play/video process before starting another Isaac action.", "processes": active_media},
+                        {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
                         status=409,
                     )
                 return self._json(

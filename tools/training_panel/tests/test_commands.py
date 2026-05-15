@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.training_panel.training_panel.commands import VideoParams, play_argv, shell_for_command
+from tools.training_panel.training_panel.commands import VideoParams, export_onnx_argv, play_argv, shell_for_command
 from tools.training_panel.training_panel.config import PanelPaths
 
 
@@ -55,6 +55,14 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(high.height, 1080)
         self.assertEqual(high.length, 1200)
         self.assertEqual(high.rendering_mode, "quality")
+
+    def test_export_onnx_argv_uses_headless_export_only_play(self):
+        argv = export_onnx_argv("/tmp/model_10.pt", device="cuda:0")
+        self.assertIn("scripts/rsl_rl/play.py", argv)
+        self.assertIn("--headless", argv)
+        self.assertIn("--export_policy_only", argv)
+        self.assertEqual(argv[argv.index("--device") + 1], "cuda:0")
+        self.assertEqual(argv[argv.index("--checkpoint") + 1], "/tmp/model_10.pt")
 
 
 if __name__ == "__main__":

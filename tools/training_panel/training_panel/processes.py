@@ -18,6 +18,7 @@ from .commands import (
     TrainingParams,
     VideoParams,
     display_isaaclab_command,
+    export_onnx_argv,
     play_argv,
     shell_for_command,
     shell_for_isaaclab,
@@ -25,12 +26,18 @@ from .commands import (
     training_argv,
 )
 from .config import PanelPaths, timestamp_id
-from .history import HistoryStore, latest_checkpoint, latest_video, tail_file
+from .history import HistoryStore, latest_checkpoint, latest_onnx, latest_video, tail_file
 
 EXTERNAL_PLAY_ID_PREFIX = "external_play_"
+EXTERNAL_ONNX_ID_PREFIX = "external_onnx_"
 EXTERNAL_TRAINING_ID_PREFIX = "external_training_"
 EXTERNAL_TENSORBOARD_ID_PREFIX = "external_tensorboard_"
-EXTERNAL_ID_PREFIXES = (EXTERNAL_PLAY_ID_PREFIX, EXTERNAL_TRAINING_ID_PREFIX, EXTERNAL_TENSORBOARD_ID_PREFIX)
+EXTERNAL_ID_PREFIXES = (
+    EXTERNAL_PLAY_ID_PREFIX,
+    EXTERNAL_ONNX_ID_PREFIX,
+    EXTERNAL_TRAINING_ID_PREFIX,
+    EXTERNAL_TENSORBOARD_ID_PREFIX,
+)
 
 @dataclass
 class ProcessInfo:
@@ -308,6 +315,51 @@ class ProcessRegistry:
             "video_params": params.to_dict(),
         }
 
+    def start_onnx_export(self, run_id: str, checkpoint: str, device: str = "cuda:0") -> dict:
+        onnx_id = f"onnx_{timestamp_id()}"
+        argv = export_onnx_argv(checkpoint=checkpoint, device=device)
+        shell = shell_for_isaaclab(self.paths, argv)
+        log_file = self.paths.process_log_dir / f"{onnx_id}.log"
+        spawned = self._spawn_shell(onnx_id, shell, log_file)
+        proc = spawned.proc
+        self._register(
+            onnx_id,
+            "onnx",
+            spawned,
+            log_file,
+            datetime.now().isoformat(timespec="seconds"),
+            shell,
+            source_run_id=run_id,
+        )
+        self.history.update_run(
+            run_id,
+            onnx_status="exporting",
+            onnx_process_id=onnx_id,
+            onnx_pid=proc.pid,
+            onnx_process_log=str(log_file),
+            onnx_command=shell,
+            onnx_process_attach_command=spawned.attach_command,
+            onnx_tmux_session=spawned.tmux_session,
+            onnx_exit_file=spawned.exit_file,
+            onnx_error=None,
+        )
+        thread = threading.Thread(
+            target=self._monitor_onnx,
+            args=(run_id, onnx_id, proc),
+            daemon=True,
+        )
+        thread.start()
+        return {
+            "id": onnx_id,
+            "source_run_id": run_id,
+            "pid": proc.pid,
+            "process_log": str(log_file),
+            "command": shell,
+            "tmux_session": spawned.tmux_session,
+            "attach_command": spawned.attach_command,
+            "exit_file": spawned.exit_file,
+        }
+
     def get_process_debug(self, process_id: str) -> dict | None:
         with self._lock:
             info = self._infos.get(process_id)
@@ -343,10 +395,13 @@ class ProcessRegistry:
         ]
 
     def running_media_processes(self) -> list[dict]:
+        return self.running_isaac_processes()
+
+    def running_isaac_processes(self) -> list[dict]:
         return [
             process
             for process in self.list_processes()
-            if process.get("returncode") is None and process.get("kind") in ("play", "video")
+            if process.get("returncode") is None and process.get("kind") in ("play", "video", "onnx")
         ]
 
     def stop_all_for_run(self, source_run_id: str) -> list[str]:
@@ -421,6 +476,7 @@ class ProcessRegistry:
     def _external_processes(self) -> list[dict]:
         return [
             *self._external_training_processes(),
+            *self._external_onnx_processes(),
             *self._external_play_processes(),
             *self._external_tensorboard_processes(),
         ]
@@ -513,6 +569,47 @@ class ProcessRegistry:
             }
         return list(by_group.values())
 
+    def _external_onnx_processes(self) -> list[dict]:
+        try:
+            output = subprocess.check_output(
+                ["ps", "-eo", "pid=,pgid=,stat=,args="],
+                text=True,
+                errors="replace",
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        by_group = {}
+        for line in output.splitlines():
+            parts = line.strip().split(maxsplit=3)
+            if len(parts) < 4:
+                continue
+            pid_text, pgid_text, stat, command = parts
+            if not self._is_repo_onnx_process(command, pid_text):
+                continue
+            try:
+                pid = int(pid_text)
+                process_group = int(pgid_text)
+            except ValueError:
+                continue
+            source_run_id = self._source_run_id_from_command(command)
+            if not source_run_id:
+                continue
+            log_file = self._matching_onnx_log(command)
+            by_group[process_group] = {
+                "kind": "onnx",
+                "pid": pid,
+                "process_group": process_group,
+                "run_id": f"{EXTERNAL_ONNX_ID_PREFIX}{process_group}",
+                "source_run_id": source_run_id,
+                "log_file": str(log_file) if log_file else "",
+                "started_at": "",
+                "command": command,
+                "returncode": None,
+                "external": True,
+                "stat": stat,
+            }
+        return list(by_group.values())
+
     def _external_tensorboard_processes(self) -> list[dict]:
         try:
             output = subprocess.check_output(
@@ -587,6 +684,18 @@ class ProcessRegistry:
             return None
         return max(candidates, key=lambda path: path.stat().st_mtime)
 
+    def _matching_onnx_log(self, command: str) -> Path | None:
+        checkpoint_match = re.search(r"--checkpoint\s+(\S+)", command)
+        checkpoint = checkpoint_match.group(1) if checkpoint_match else ""
+        candidates = []
+        for path in self.paths.process_log_dir.glob("onnx_*.log"):
+            text = tail_file(path, max_chars=20000)
+            if checkpoint and checkpoint in text:
+                candidates.append(path)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
     def _matching_tensorboard_log(self, command: str) -> Path | None:
         logdir_match = re.search(r"--logdir\s+(\S+)", command)
         logdir = logdir_match.group(1) if logdir_match else ""
@@ -621,7 +730,18 @@ class ProcessRegistry:
     def _is_repo_play_process(self, command: str, pid_text: str) -> bool:
         if self._is_tmux_server_command(command):
             return False
+        if "--export_policy_only" in command:
+            return False
         if "scripts/rsl_rl/play.py" not in command:
+            return False
+        if "isaaclab.sh -p" not in command and "python" not in command:
+            return False
+        return self._command_or_cwd_matches_repo(command, pid_text)
+
+    def _is_repo_onnx_process(self, command: str, pid_text: str) -> bool:
+        if self._is_tmux_server_command(command):
+            return False
+        if "scripts/rsl_rl/play.py" not in command or "--export_policy_only" not in command:
             return False
         if "isaaclab.sh -p" not in command and "python" not in command:
             return False
@@ -883,6 +1003,21 @@ class ProcessRegistry:
             latest_video=video,
             has_video=bool(video),
             video_error=None if returncode == 0 and video else "Video process finished but no MP4 was produced.",
+        )
+
+    def _monitor_onnx(self, source_run_id: str, onnx_id: str, proc: subprocess.Popen) -> None:
+        returncode = proc.wait()
+        run = self.history.get_run(source_run_id) or {}
+        log_dir = Path(run["log_dir"]) if run.get("log_dir") else None
+        onnx_path = latest_onnx(log_dir) if log_dir and log_dir.exists() else None
+        self.history.update_run(
+            source_run_id,
+            onnx_status="completed" if returncode == 0 and onnx_path else "failed",
+            onnx_returncode=returncode,
+            onnx_process_id=onnx_id,
+            onnx_path=onnx_path,
+            has_onnx=bool(onnx_path),
+            onnx_error=None if returncode == 0 and onnx_path else "ONNX export finished but policy.onnx was not produced.",
         )
 
     @staticmethod

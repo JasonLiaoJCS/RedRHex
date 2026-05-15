@@ -22,7 +22,7 @@
         <button class="nav-button" data-view="access">Access</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 1.0</span>
+        <span class="release-version">Version 1.1</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -35,7 +35,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V1.0</span>
+          <span class="release-chip">Training Panel V1.1</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -187,9 +187,13 @@
             <div class="section-header"><h3>Actions</h3></div>
             <div class="run-actions-panel">
               <button type="button" id="play-run" class="ghost-button" data-tooltip="Run the checkpoint in Isaac Sim for visualization (no training)">Play</button>
+              <button type="button" id="export-onnx" class="ghost-button" data-tooltip="Export the latest checkpoint to exported/policy.onnx">Export ONNX</button>
+              <button type="button" id="copy-onnx-path" class="ghost-button" hidden data-tooltip="Copy exported/policy.onnx path">Copy ONNX Path</button>
+              <button type="button" id="open-onnx-folder" class="ghost-button" hidden data-tooltip="Open the exported policy folder (local only)">Open Export Folder</button>
               <button type="button" id="tensorboard-run" class="ghost-button" data-tooltip="Open TensorBoard to visualize training metrics and reward curves">TensorBoard</button>
               <button type="button" id="resume-run" class="ghost-button" data-tooltip="Start a new training run resuming from this checkpoint">Resume to Train</button>
               <button type="button" id="open-run-folder" class="ghost-button" data-tooltip="Open the training log folder in the file manager (local only)">Open Folder</button>
+              <button type="button" id="compact-run" class="danger-button" data-tooltip="Delete old model_*.pt checkpoints and keep the newest one">Compact Run</button>
               <button type="button" id="delete-run" class="danger-button" data-tooltip="Permanently delete this run entry and its log files from disk">Delete</button>
             </div>
             <div id="run-info-block" style="display:none">

@@ -63,6 +63,20 @@ def latest_video(log_dir: Path) -> str | None:
     return str(max(videos, key=lambda path: path.stat().st_mtime))
 
 
+def latest_onnx(log_dir: Path) -> str | None:
+    onnx = log_dir / "exported" / "policy.onnx"
+    return str(onnx) if onnx.is_file() else None
+
+
+def checkpoint_inventory(log_dir: Path) -> list[tuple[int, Path]]:
+    checkpoints = []
+    for path in log_dir.glob("model_*.pt"):
+        match = MODEL_RE.match(path.name)
+        if match and path.is_file():
+            checkpoints.append((int(match.group(1)), path))
+    return sorted(checkpoints, key=lambda item: item[0])
+
+
 class HistoryStore:
     def __init__(self, paths: PanelPaths):
         self.paths = paths
@@ -240,6 +254,7 @@ class HistoryStore:
                 continue
             checkpoint = latest_checkpoint(log_dir)
             video = latest_video(log_dir)
+            onnx = latest_onnx(log_dir)
             params_dir = log_dir / "params"
             runs.append(
                 {
@@ -251,6 +266,8 @@ class HistoryStore:
                     "latest_checkpoint": checkpoint,
                     "latest_video": video,
                     "has_video": bool(video),
+                    "onnx_path": onnx,
+                    "has_onnx": bool(onnx),
                     "has_tensorboard": any(log_dir.glob("events.out.tfevents.*")),
                     "has_params": params_dir.exists(),
                 }
@@ -286,7 +303,9 @@ class HistoryStore:
             if log_dir and log_dir.exists():
                 record["latest_checkpoint"] = latest_checkpoint(log_dir)
                 record["latest_video"] = latest_video(log_dir)
+                record["onnx_path"] = latest_onnx(log_dir)
                 record["has_video"] = bool(record["latest_video"])
+                record["has_onnx"] = bool(record["onnx_path"])
                 record["has_tensorboard"] = any(log_dir.glob("events.out.tfevents.*"))
                 env_yaml = log_dir / "params" / "env.yaml"
                 if env_yaml.exists() and defaults:
@@ -320,6 +339,22 @@ class HistoryStore:
         run = self.get_run(run_id)
         if not run:
             return None
+        if run.get("onnx_status") in ("exporting", "failed") and run.get("onnx_process_log"):
+            onnx_log = Path(run["onnx_process_log"])
+            return {
+                "id": run_id,
+                "display_name": run.get("display_name"),
+                "status": f"onnx {run.get('onnx_status')}",
+                "pid": run.get("onnx_pid"),
+                "returncode": run.get("onnx_returncode"),
+                "command": run.get("onnx_command"),
+                "log_dir": run.get("log_dir"),
+                "process_log": str(onnx_log),
+                "process_log_tail": tail_file(onnx_log),
+                "attach_command": run.get("onnx_process_attach_command"),
+                "tmux_session": run.get("onnx_tmux_session"),
+                "debug_hint": "This run is showing the ONNX export process log.",
+            }
         if run.get("video_status") in ("recording", "failed") and run.get("video_process_log"):
             video_log = Path(run["video_process_log"])
             return {
@@ -444,3 +479,71 @@ class HistoryStore:
         ]
         self._save_records(kept)
         return {"deleted": True, "run_id": run_id, "deleted_paths": deleted_paths}
+
+    def compact_preview(self, run_id: str) -> dict:
+        run = self.get_run(run_id)
+        if not run:
+            raise ValueError("Run not found")
+        if not run.get("log_dir"):
+            raise ValueError("Run has no linked log directory")
+        log_dir = Path(run["log_dir"])
+        if not log_dir.exists():
+            raise ValueError("Run log directory does not exist")
+        checkpoints = checkpoint_inventory(log_dir)
+        if not checkpoints:
+            raise ValueError("No model_*.pt checkpoints found")
+        kept_iteration, kept_path = checkpoints[-1]
+        delete_items = []
+        bytes_to_free = 0
+        for iteration, path in checkpoints[:-1]:
+            size = path.stat().st_size
+            bytes_to_free += size
+            delete_items.append(
+                {
+                    "iteration": iteration,
+                    "path": str(path),
+                    "bytes": size,
+                }
+            )
+        return {
+            "id": run_id,
+            "log_dir": str(log_dir),
+            "kept_checkpoint": str(kept_path),
+            "kept_iteration": kept_iteration,
+            "delete_count": len(delete_items),
+            "bytes_to_free": bytes_to_free,
+            "delete_paths": delete_items,
+            "requires_confirmation": run_id,
+            "warning": "This permanently deletes old top-level model_*.pt checkpoint files and keeps the newest checkpoint.",
+        }
+
+    def compact_run(self, run_id: str, confirmation: str) -> dict:
+        if confirmation != run_id:
+            raise ValueError("Type the exact run id to confirm compaction")
+        preview = self.compact_preview(run_id)
+        log_dir = Path(preview["log_dir"])
+        if not _is_within(log_dir, self.paths.rsl_rl_log_root):
+            raise ValueError(f"Refusing to compact path outside RSL-RL log root: {log_dir}")
+        deleted_paths = []
+        for item in preview["delete_paths"]:
+            path = Path(item["path"])
+            if path.parent != log_dir or not MODEL_RE.match(path.name):
+                raise ValueError(f"Refusing to delete non-checkpoint path: {path}")
+            if not _is_within(path, self.paths.rsl_rl_log_root):
+                raise ValueError(f"Refusing to delete path outside RSL-RL log root: {path}")
+            if path.exists():
+                path.unlink()
+                deleted_paths.append(str(path))
+        self.patch_run_metadata(
+            run_id,
+            compacted_at=datetime.now().isoformat(timespec="seconds"),
+            compacted_deleted_count=len(deleted_paths),
+            compacted_bytes_freed=preview["bytes_to_free"],
+        )
+        return {
+            "compacted": True,
+            "run_id": run_id,
+            "kept_checkpoint": preview["kept_checkpoint"],
+            "deleted_paths": deleted_paths,
+            "bytes_freed": preview["bytes_to_free"],
+        }

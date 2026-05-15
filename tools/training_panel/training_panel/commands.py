@@ -132,6 +132,7 @@ def play_argv(
     video_height: int | None = None,
     video_fps: int | None = None,
     rendering_mode: str | None = None,
+    export_policy_only: bool = False,
 ) -> list[str]:
     argv = [
         "scripts/rsl_rl/play.py",
@@ -156,8 +157,26 @@ def play_argv(
             argv.extend(["--video_fps", str(video_fps)])
         if rendering_mode:
             argv.extend(["--rendering_mode", rendering_mode])
+    if export_policy_only:
+        argv.append("--export_policy_only")
     argv.extend(["--checkpoint", checkpoint])
     return argv
+
+
+def export_onnx_argv(
+    checkpoint: str,
+    task: str = DEFAULT_TASK,
+    num_envs: int = 1,
+    device: str = "cuda:0",
+) -> list[str]:
+    return play_argv(
+        checkpoint=checkpoint,
+        task=task,
+        num_envs=num_envs,
+        device=device,
+        headless=True,
+        export_policy_only=True,
+    )
 
 
 def tensorboard_argv(logdir: Path, host: str, port: int) -> list[str]:

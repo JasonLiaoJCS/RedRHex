@@ -307,6 +307,13 @@ function videoSummary(run) {
   return "";
 }
 
+function onnxSummary(run) {
+  if (run.onnx_path) return "ONNX ready";
+  if (run.onnx_status === "exporting") return "exporting ONNX";
+  if (run.onnx_status === "failed") return "ONNX failed";
+  return "";
+}
+
 function runLogSummary(run) {
   return run.log_dir ? "training log saved" : "no training log";
 }
@@ -344,20 +351,21 @@ function activeProcessForRun(runId, kind = "") {
 }
 
 function activeMediaProcess() {
-  return state.activeProcesses.find((process) => process.kind === "play" || process.kind === "video") || null;
+  return state.activeProcesses.find((process) => ["play", "video", "onnx"].includes(process.kind)) || null;
 }
 
 function mediaLockMessage(process) {
   if (!process) return "";
-  return process.kind === "video"
-    ? "Video recording is running. Stop recording before starting playback or another video."
-    : "Playback is running. Stop Play before starting another playback or video.";
+  if (process.kind === "video") return "Video recording is running. Stop recording before starting another Isaac action.";
+  if (process.kind === "onnx") return "ONNX export is running. Stop it before starting playback or recording.";
+  return "Playback is running. Stop Play before starting another Isaac action.";
 }
 
 function consoleTargetForRun(runId) {
   const processId =
     activeProcessIdForRun(runId, "play") ||
     activeProcessIdForRun(runId, "video") ||
+    activeProcessIdForRun(runId, "onnx") ||
     activeProcessIdForRun(runId, "training") ||
     activeProcessIdForRun(runId, "tensorboard") ||
     activeProcessIdForRun(runId);
@@ -443,9 +451,11 @@ function renderRuns() {
       const canCheckpoint = Boolean(run.latest_checkpoint);
       const playProcessId = activeProcessIdForRun(run.id, "play");
       const videoProcessId = activeProcessIdForRun(run.id, "video");
+      const onnxProcessId = activeProcessIdForRun(run.id, "onnx");
       const paramSummary = runParamSummary(run);
       const timeSummary = runTimeSummary(run);
       const videoText = videoProcessId ? "recording video" : videoSummary(run);
+      const onnxText = onnxProcessId ? "exporting ONNX" : onnxSummary(run);
       const selected = state.selectedRunIds.has(run.id) ? "checked" : "";
       const playAction = playProcessId ? "stop-play" : "play";
       const playLabel = playProcessId ? "Stop Play" : "Play";
@@ -470,7 +480,7 @@ function renderRuns() {
             : run.reward_diff_count > 0
               ? `<small><span class="reward-diff-badge">${escapeHtml(String(run.reward_diff_count))} reward override${run.reward_diff_count !== 1 ? "s" : ""}</span></small>`
               : ""}
-          <small>${escapeHtml(checkpointSummary(run))}${videoText ? ` · ${escapeHtml(videoText)}` : ""}${escapeHtml(runStatusDetail(run))}${run.has_notes ? " <strong>+ notes</strong>" : ""}</small>
+          <small>${escapeHtml(checkpointSummary(run))}${videoText ? ` · ${escapeHtml(videoText)}` : ""}${onnxText ? ` · ${escapeHtml(onnxText)}` : ""}${escapeHtml(runStatusDetail(run))}${run.has_notes ? " <strong>+ notes</strong>" : ""}</small>
           <div class="run-actions">
             <button type="button" data-action="tensorboard" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTensorboard)} data-tooltip="Open metrics">TensorBoard</button>
             <button type="button" data-action="${playAction}" data-run-id="${escapeHtml(run.id)}" ${playProcessAttr} ${runButtonDisabled(playDisabled)} data-tooltip="${playProcessId ? "Stop Isaac playback" : "Play checkpoint"}">${escapeHtml(playLabel)}</button>
@@ -521,11 +531,22 @@ function videoFolder(run) {
   return run && run.latest_video ? String(run.latest_video).replace(/\/[^/]+$/, "") : "";
 }
 
+function onnxFolder(run) {
+  return run && run.onnx_path ? String(run.onnx_path).replace(/\/[^/]+$/, "") : "";
+}
+
 function activeVideoProcessId(run) {
   if (!run) return "";
   const processId = activeProcessIdForRun(run.id, "video");
   if (processId) return processId;
   return run.video_status === "recording" ? run.video_process_id || "" : "";
+}
+
+function activeOnnxProcessId(run) {
+  if (!run) return "";
+  const processId = activeProcessIdForRun(run.id, "onnx");
+  if (processId) return processId;
+  return run.onnx_status === "exporting" ? run.onnx_process_id || "" : "";
 }
 
 function videoPresetLabel(preset) {
@@ -598,6 +619,7 @@ function renderRunDetails() {
   const run = state.selectedRun;
   const runName = $("#run-name");
   const playProcessId = run ? activeProcessIdForRun(run.id, "play") : "";
+  const onnxProcessId = run ? activeOnnxProcessId(run) : "";
   const mediaProcess = activeMediaProcess();
 
   // Header
@@ -622,6 +644,8 @@ function renderRunDetails() {
     if (run.params?.max_iterations != null) rows.push(["Iters", run.params.max_iterations]);
     const ckptIter = checkpointIteration(run.latest_checkpoint);
     if (ckptIter !== null) rows.push(["Checkpoint", `iter ${ckptIter}`]);
+    const onnxText = onnxProcessId ? "exporting" : (run.onnx_path ? "ready" : (run.onnx_status === "failed" ? "failed" : "missing"));
+    rows.push(["ONNX", onnxText]);
     if (run.reward_preset_id && run.reward_preset_id !== "baseline")
       rows.push(["Reward preset", run.reward_preset_id]);
     infoGrid.innerHTML = rows
@@ -652,10 +676,17 @@ function renderRunDetails() {
 
   // Action buttons
   $("#delete-run").disabled = !run;
+  $("#compact-run").disabled = !run || !run.log_dir || Boolean(run && activeProcessForRun(run.id));
   $("#open-run-folder").disabled = !run || !run.log_dir;
   $("#tensorboard-run").disabled = !run || !run.log_dir;
   $("#play-run").disabled = !run || (!run.latest_checkpoint && !playProcessId) || Boolean(mediaProcess && !playProcessId);
   $("#play-run").textContent = playProcessId ? "Stop Play" : "Play";
+  $("#export-onnx").disabled = !run || !run.latest_checkpoint || Boolean(mediaProcess);
+  $("#export-onnx").textContent = onnxProcessId ? "Exporting ONNX" : "Export ONNX";
+  $("#copy-onnx-path").hidden = !run || !run.onnx_path;
+  $("#copy-onnx-path").disabled = !run || !run.onnx_path;
+  $("#open-onnx-folder").hidden = !run || !run.onnx_path;
+  $("#open-onnx-folder").disabled = !run || !run.onnx_path;
   $("#resume-run").disabled = !run || !run.latest_checkpoint;
   $("#stop-process").disabled = !state.debugTarget && !run;
 
@@ -840,6 +871,19 @@ async function copyVideoPath() {
   setStatus(`Video path copied: ${state.selectedRun.latest_video}`);
 }
 
+async function openOnnxFolder() {
+  await openLocation(onnxFolder(state.selectedRun), "ONNX export folder");
+}
+
+async function copyOnnxPath() {
+  if (!state.selectedRun || !state.selectedRun.onnx_path) {
+    setStatus("No ONNX path is available yet.");
+    return;
+  }
+  await copyText(state.selectedRun.onnx_path);
+  setStatus(`ONNX path copied: ${state.selectedRun.onnx_path}`);
+}
+
 function isLiveDebug(debug) {
   if (debug.kind) return debug.returncode === null;
   return debug.status === "running" || debug.status === "stopping" || debug.status === "video recording";
@@ -868,6 +912,9 @@ function outputDiagnosis(output) {
   }
   if (/no MP4 was produced|No recorded video found/i.test(output)) {
     return "Diagnosis: the video process ended but no MP4 was found. Open the process log folder and check the play/video output.";
+  }
+  if (/policy\.onnx was not produced|ONNX export finished/i.test(output)) {
+    return "Diagnosis: ONNX export finished without exported/policy.onnx. Check the checkpoint load and exporter output.";
   }
   return "";
 }
@@ -1073,6 +1120,26 @@ async function recordVideo() {
       ? `Recording high quality video. Attach with: ${data.attach_command}`
       : "Recording high quality video."
   );
+  await loadRuns();
+}
+
+async function exportOnnx() {
+  if (!state.selectedRun) {
+    setStatus("Select a run first.");
+    return;
+  }
+  const mediaProcess = activeMediaProcess();
+  if (mediaProcess) {
+    setStatus(mediaLockMessage(mediaProcess));
+    await loadRuns();
+    return;
+  }
+  const data = await api(`/api/runs/${encodeURIComponent(state.selectedRun.id)}/export-onnx`, {
+    method: "POST",
+    body: JSON.stringify({ device: "cuda:0" }),
+  });
+  setDebugTarget({ type: "process", id: data.id });
+  setStatus(data.attach_command ? `Exporting ONNX. Attach with: ${data.attach_command}` : "Exporting ONNX.");
   await loadRuns();
 }
 
@@ -1842,6 +1909,61 @@ async function refreshAll() {
   if (state.selectedRun) setDebugTarget({ type: "run", id: state.selectedRun.id });
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = value / 1024;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function formatCompactPreview(preview) {
+  const paths = preview.delete_paths.length
+    ? preview.delete_paths.map((item) => `- model_${item.iteration}.pt (${formatBytes(item.bytes)}): ${item.path}`).join("\n")
+    : "- No old checkpoints will be deleted.";
+  return [
+    "This permanently deletes old top-level model_*.pt checkpoints.",
+    "",
+    `Kept checkpoint: ${preview.kept_checkpoint}`,
+    `Deleting: ${preview.delete_count} file(s), ${formatBytes(preview.bytes_to_free)} total`,
+    "",
+    paths,
+    "",
+    "Videos, TensorBoard logs, params, notes, and exported policy files are preserved.",
+    "",
+    `To confirm, type this exact run id: ${preview.id}`,
+  ].join("\n");
+}
+
+async function compactSelectedRun() {
+  if (!state.selectedRun) {
+    setStatus("Select a run first.");
+    return;
+  }
+  const runId = state.selectedRun.id;
+  const preview = await api(`/api/runs/${encodeURIComponent(runId)}/compact-preview`);
+  if (preview.delete_count === 0) {
+    setStatus(`Nothing to compact. Keeping ${preview.kept_checkpoint}.`);
+    return;
+  }
+  const confirmation = window.prompt(formatCompactPreview(preview), "");
+  if (confirmation === null) {
+    setStatus("Compact cancelled.");
+    return;
+  }
+  const result = await api(`/api/runs/${encodeURIComponent(runId)}/compact`, {
+    method: "POST",
+    body: JSON.stringify({ confirmation }),
+  });
+  await loadRuns();
+  setStatus(`Compacted ${result.run_id}. Deleted ${result.deleted_paths.length} checkpoint(s), freed ${formatBytes(result.bytes_freed)}.`);
+}
+
 document.querySelectorAll(".nav-button").forEach((button) => {
   button.addEventListener("click", () => setView(button.dataset.view));
 });
@@ -1867,7 +1989,11 @@ $("#run-name").addEventListener("input", () => {
 });
 $("#save-notes").addEventListener("click", () => saveNotes().catch(handleActionError));
 $("#delete-run").addEventListener("click", () => deleteSelectedRun().catch(handleActionError));
+$("#compact-run").addEventListener("click", () => compactSelectedRun().catch(handleActionError));
 $("#open-run-folder").addEventListener("click", () => openRunFolder().catch(handleActionError));
+$("#export-onnx").addEventListener("click", () => exportOnnx().catch(handleActionError));
+$("#copy-onnx-path").addEventListener("click", () => copyOnnxPath().catch(handleActionError));
+$("#open-onnx-folder").addEventListener("click", () => openOnnxFolder().catch(handleActionError));
 $("#record-video").addEventListener("click", () => recordVideo().catch(handleActionError));
 $("#stop-recording").addEventListener("click", () => stopVideoRecording().catch(handleActionError));
 $("#open-video-folder").addEventListener("click", () => openVideoFolder().catch(handleActionError));
