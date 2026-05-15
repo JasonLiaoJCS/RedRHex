@@ -29,99 +29,235 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REDRHEX_USD_PATH = os.path.normpath(os.path.join(
     _THIS_DIR, "..", "..", "..", "..", "..", "..", "RedRhex.usd"
 ))
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
+from isaaclab.terrains.height_field import hf_terrains_cfg as hf  # 高度場地形
+from isaaclab.terrains.trimesh import mesh_terrains_cfg as mesh    # 網格地形
 from isaaclab.utils import configclass
 
-##
-# RedRhex Robot Configuration
-##
+from isaaclab.sensors import ContactSensorCfg
+
+
+REDRHEX_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
+    size=(6.0, 6.0),
+    border_width=3.0,
+    num_rows=6,
+    num_cols=12,
+    curriculum=True,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 0.15),
+    use_cache=False,
+    sub_terrains={
+        "flat": mesh.MeshPlaneTerrainCfg(
+            proportion=0.20,
+        ),
+        "random_rough": hf.HfRandomUniformTerrainCfg(
+            proportion=0.25,
+            noise_range=(0.01, 0.06),
+            noise_step=0.005,
+            border_width=0.25,
+        ),
+        "wave": hf.HfWaveTerrainCfg(
+            proportion=0.15,
+            amplitude_range=(0.01, 0.06),
+            num_waves=2,
+            border_width=0.25,
+        ),
+        "stairs": hf.HfPyramidStairsTerrainCfg(
+            proportion=0.20,
+            step_height_range=(0.02, 0.12),
+            step_width=0.28,
+            platform_width=1.2,
+            border_width=0.25,
+        ),
+        "boxes": mesh.MeshRandomGridTerrainCfg(
+            proportion=0.20,
+            grid_width=0.45,
+            grid_height_range=(0.02, 0.12),
+            platform_width=1.5,
+        ),
+    },
+)
+
+# =============================================================================
+# 【機器人本體配置】定義 RedRhex 機器人的物理屬性
+# =============================================================================
+# ArticulationCfg = 關節式機器人的配置類別
+# 這裡定義了機器人的：重量、材質、物理行為、初始姿態、馬達參數等
 
 REDRHEX_CFG = ArticulationCfg(
+    # -------------------------------------------------------------------------
+    # 【生成設定】從 USD 文件載入 3D 模型
+    # -------------------------------------------------------------------------
     spawn=sim_utils.UsdFileCfg(
-        usd_path=_REDRHEX_USD_PATH,
-        activate_contact_sensors=True,
+        usd_path=_REDRHEX_USD_PATH,           # 3D 模型文件路徑
+        activate_contact_sensors=True,         # 啟用接觸感測器（檢測碰撞）
+        
+        # 【質量屬性】決定機器人有多重
+        # 重量很重要！太輕會不穩定，太重會難以移動
         mass_props=sim_utils.MassPropertiesCfg(
-            # 整機目標質量約 13.5-15 kg：機身 12 kg + 6 腿各 ~0.35 kg
-            # 設定較高密度以增加法向力，抑制無效彈跳
-            density=2500.0,  # kg/m³ - 提高密度使機身約 12 kg
+            # 整機目標質量約 13.5-15 公斤：
+            #   - 機身約 12 公斤
+            #   - 6 隻腿各約 0.35 公斤
+            # 設定較高密度可以增加機器人對地面的壓力，防止亂跳
+            density=2500.0,  # 密度（公斤/立方公尺）- 決定機身約 12 公斤
         ),
+        
+        # 【剛體物理屬性】決定機器人如何回應物理力
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.2,       # 降低阻尼讓機器人可以移動
-            angular_damping=0.3,      # 適中的角阻尼
-            max_linear_velocity=10.0,  # 提高最大線速度
-            max_angular_velocity=20.0,  # 提高最大角速度以允許腿旋轉
-            max_depenetration_velocity=1.0,  # 適度的穿透恢復速度
+            disable_gravity=False,              # 保持重力（不能飛！）
+            retain_accelerations=False,         # 不保留加速度（節省記憶體）
+            linear_damping=0.1,                 # 線性阻尼：減緩直線運動，數值越大移動越慢
+            angular_damping=0.2,                # 角阻尼：減緩旋轉運動
+            max_linear_velocity=10.0,           # 最大移動速度（公尺/秒）
+            max_angular_velocity=20.0,          # 最大旋轉速度（弧度/秒），要夠大才能讓腿轉動
+            max_depenetration_velocity=1.0,     # 穿透恢復速度：當物體意外重疊時，分開的速度
         ),
+        
+        # 【關節系統屬性】決定關節如何運作
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,  # 暫時關閉自碰撞，減少不穩定
-            solver_position_iteration_count=16,  # 增加迭代次數
-            solver_velocity_iteration_count=8,
-            fix_root_link=False,
+            enabled_self_collisions=False,       # 關閉自身碰撞（防止腿撞到身體造成不穩定）
+            solver_position_iteration_count=16,  # 位置求解器迭代次數：越多越精確但越慢
+            solver_velocity_iteration_count=8,   # 速度求解器迭代次數
+            fix_root_link=False,                 # 機器人可以自由移動（不固定在原地）
         ),
     ),
+    # -------------------------------------------------------------------------
+    # 【初始狀態】機器人在模擬開始時的位置和姿態
+    # -------------------------------------------------------------------------
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.5),  # 提高初始高度以避免穿透地面
-        # 四元數 (w, x, y, z) rotate 90 deg around x axis
+        # 初始位置 (x, y, z)
+        # ★★★ 降低初始高度，避免落地時前傾/後仰 ★★★
+        # 目標站立高度約 0.12m，設為 0.15m 讓機器人穩定落地
+        pos=(0.0, 0.0, 0.3),
+        
+        # 初始旋轉（四元數格式 w, x, y, z）
+        # 這個數值讓機器人繞 X 軸旋轉 90 度，調整到正確朝向
         rot=(0.7071068, 0.7071068, 0.0, 0.0),
-        # 明確設置所有關節位置，匹配 USD 文件中的默認值
-        # USD 顯示的是度數，這裡轉換為弧度
+        
+        # 【關節初始位置】每個關節開始時的角度
+        # 注意：USD 文件顯示的是「度」，但程式要用「弧度」
+        # 轉換公式：弧度 = 度數 × π ÷ 180
         joint_pos={
-            # ===== 主驅動關節 (Main Drive) =====
-            "Revolute_15": 45.0 * math.pi / 180,   # 右前 - 45°
-            "Revolute_12": 45.0 * math.pi / 180,   # 右後 - 45°
-            "Revolute_7": 45.0 * math.pi / 180,    # 右中 - 45°
-            # ===== ABAD 關節 - 全部 0° =====
-            "Revolute_14": 0.0,
-            "Revolute_6": 0.0,
-            "Revolute_11": 0.0,
-            # ===== 避震關節 (Damper) =====
+            # =====================================================
+            # 主驅動關節 (Main Drive) - 控制腿的旋轉
+            # 右側腿：初始角度 45°
+            # 左側腿：初始角度 -45°（方向相反）
+            # =====================================================
+            "Revolute_15": 45.0 * math.pi / 180,   # 右前腿 - 45°
+            "Revolute_12": 45.0 * math.pi / 180,   # 右後腿 - 45°
+            "Revolute_7": 45.0 * math.pi / 180,    # 右中腿 - 45°
+            "Revolute_18": -45.0 * math.pi / 180,  # 左前腿 - -45°
+            "Revolute_23": -45.0 * math.pi / 180,  # 左中腿 - -45°
+            "Revolute_24": -45.0 * math.pi / 180,  # 左後腿 - -45°
+            
+            # =====================================================
+            # ABAD 關節 - 控制腿的外展/內收
+            # 全部從 0° 開始（腿朝正下方）
+            # =====================================================
+            "Revolute_14": 0.0,  # 右前腿
+            "Revolute_6": 0.0,   # 右中腿
+            "Revolute_11": 0.0,  # 右後腿
+            "Revolute_17": 0.0,  # 左前腿
+            "Revolute_22": 0.0,  # 左中腿
+            "Revolute_21": 0.0,  # 左後腿
+            
+            # =====================================================
+            # 避震關節 (Damper) - 吸收衝擊用
+            # 這些關節會被鎖定，保持固定角度
+            # =====================================================
             "Revolute_5": 45.0 * math.pi / 180,    # 45°
             "Revolute_13": -45.0 * math.pi / 180,  # -45°
             "Revolute_8": 45.0 * math.pi / 180,    # 45°
+            "Revolute_25": 45.0 * math.pi / 180,   # 45°
+            "Revolute_26": 45.0 * math.pi / 180,   # 45°
+            "Revolute_27": 45.0 * math.pi / 180,   # 45°
         },
+        # 所有關節的初始速度都是 0（靜止狀態）
         joint_vel={".*": 0.0},
     ),
+    
+    # 關節位置限制的軟化係數（0.9 = 允許到達 90% 的極限位置）
     soft_joint_pos_limit_factor=0.9,
+    # -------------------------------------------------------------------------
+    # 【致動器配置】定義三種不同類型關節的馬達特性
+    # -------------------------------------------------------------------------
+    # 致動器（Actuator）= 讓關節動起來的「馬達」
+    # 每種關節因為功能不同，需要不同的馬達設定
     actuators={
-        # 主驅動關節 - 速度控制，允許連續旋轉
-        # RHex 腿需要足夠扭矩來驅動 ~12kg 機身
-        "main_drive": ImplicitActuatorCfg(
+        # =================================================================
+        # 【主驅動馬達】讓腿持續旋轉的關鍵！
+        # =================================================================
+        # 控制方式：速度控制（告訴馬達要轉多快）
+        # 
+        # ★★★ 重要原理（初學者必讀）★★★
+        # 這裡用的是「隱式致動器」(Implicit Actuator)
+        # 力矩計算公式：力矩 = 阻尼 × (目標速度 - 當前速度)
+        # 
+        # 白話解釋：
+        # - 如果目標速度是 10，當前速度是 0
+        # - 力矩 = 50 × (10 - 0) = 500 牛頓米
+        # - 阻尼(damping)越大，馬達推力越強
+        # - 如果阻尼太低，腿會轉不動！
+        "main_drive": DCMotorCfg(
+            # 這 6 個關節是主驅動關節
             joint_names_expr=[
-                "Revolute_15", "Revolute_12", "Revolute_7"
+                "Revolute_15", "Revolute_12", "Revolute_18",
+                "Revolute_23", "Revolute_24", "Revolute_7"
             ],
-            effort_limit=15.0,       # 提高力矩限制以驅動重機身
-            velocity_limit=15.0,     # 提高速度限制允許快速旋轉
-            stiffness=0.0,           # 純速度控制，無位置剛性
-            damping=1.0,             # 低阻尼讓腿可以持續旋轉
+            effort_limit=100.0,      # 最大力矩限制（牛頓米）- 馬達能出的最大力
+            effort_limit_sim=100.0,
+            velocity_limit=30.0,     # 最大轉速限制（弧度/秒）
+            velocity_limit_sim=30.0,
+            stiffness=0.0,           # 剛性 = 0，表示純速度控制（不追蹤位置）
+            damping=50.0,            # ★ 阻尼值：決定馬達推力強度！數值越大越有力
+            saturation_effort=100.0,
         ),
-        # ABAD 關節 - 位置控制，小範圍調節
-        "abad": ImplicitActuatorCfg(
+        
+        # =================================================================
+        # 【ABAD 馬達】讓腿往外或往內擺動
+        # =================================================================
+        # 控制方式：位置控制（告訴馬達要擺到什麼角度）
+        # 用途：調整機器人轉彎、側移、保持平衡
+        "abad": DCMotorCfg(
             joint_names_expr=[
-                "Revolute_14", "Revolute_11", "Revolute_6"
+                "Revolute_14", "Revolute_11", "Revolute_17",
+                "Revolute_22", "Revolute_21", "Revolute_6"
             ],
-            effort_limit=8.0,        # 提高力矩以有效調節姿態
-            velocity_limit=5.0,
-            stiffness=40.0,          # 較高剛性維持位置
-            damping=4.0,
+            effort_limit=8.0,        # 力矩限制（較小，因為只需微調）
+            effort_limit_sim=8.0,
+            velocity_limit=5.0,      # 速度限制（不需要快速擺動）
+            velocity_limit_sim=5.0,
+            stiffness=40.0,          # 較高剛性：讓關節能精準到達目標位置
+            damping=4.0,             # 中等阻尼：防止過度震盪
+            saturation_effort=8.0,
         ),
-        # 避震關節 - 固定形狀，不在 action space 中
-        # 這些關節不能被驅動，使用高剛性+高阻尼讓它們保持初始角度
-        # 目標：盡可能保持形狀不變
+        
+        # =================================================================
+        # 【避震關節】被動式，不由 AI 控制
+        # =================================================================
+        # 控制方式：固定位置（用極高剛性鎖住）
+        # 用途：像汽車避震器一樣吸收衝擊，保護機身
+        # 
+        # 設計理念：
+        # - 這些關節不在 AI 的「動作空間」中
+        # - 用超高剛性讓它們保持初始角度
+        # - 高阻尼防止任何振動
         "damper": ImplicitActuatorCfg(
             joint_names_expr=[
-                "Revolute_5", "Revolute_13", "Revolute_8"
+                "Revolute_5", "Revolute_13", "Revolute_25",
+                "Revolute_26", "Revolute_27", "Revolute_8"
             ],
-            effort_limit=50.0,       # 高力矩限制以維持位置
-            velocity_limit=1.0,      # 低速度限制防止快速移動
-            stiffness=200.0,         # 很高剛性 - 保持初始角度
-            damping=20.0,            # 高阻尼 - 抑制任何振動
+            effort_limit_sim=50.0,   # 高力矩：能抵抗外力維持位置
+            velocity_limit_sim=1.0,  # 極低速度限制：防止快速移動
+            stiffness=200.0,         # 超高剛性：像彈簧一樣強力拉回原位
+            damping=20.0,            # 高阻尼：吸收任何震動
         ),
     },
 )
@@ -130,300 +266,1556 @@ REDRHEX_CFG = ArticulationCfg(
 @configclass
 class RedrhexEnvCfg(DirectRLEnvCfg):
     """
-    Configuration for the RedRhex hexapod RHex-style locomotion environment.
+    ==========================================================================
+    RedRhex 強化學習環境配置
+    ==========================================================================
     
-    控制架構：
-    - 主驅動關節：速度控制（RL 輸出目標角速度）
-    - ABAD 關節：位置控制（RL 輸出目標位置偏移）
-    - 避震關節：被動（不在 action space 中）
+    【什麼是強化學習環境？】
+    想像你在訓練一隻小狗：
+    - 環境 = 小狗活動的場地
+    - 觀察 = 小狗看到的東西（地面、障礙物...）
+    - 動作 = 小狗能做的事（走、跑、轉彎...）
+    - 獎勵 = 做對事給零食，做錯扣分
     
-    質量估計（UPE 材質 ~940 kg/m³）：
-    - 機身 (base_link): ~12 kg
-    - 每隻腿 (C-leg): ~0.35 kg
-    - 整機總質量: ~14 kg
+    這個類別定義了機器人的「訓練場」：
+    1. 機器人能「看到」什麼（觀察空間）
+    2. 機器人能「做」什麼（動作空間）
+    3. 什麼是「好」的行為（獎勵函數）
+    
+    【控制架構說明】
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ 關節類型      │ 控制方式      │ AI 輸出內容                      │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ 主驅動關節    │ 速度控制      │ 目標角速度（轉多快）             │
+    │ ABAD 關節     │ 位置控制      │ 目標位置偏移（擺多少度）         │
+    │ 避震關節      │ 被動          │ 不控制（不在動作空間中）         │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    【機器人重量參考】（使用 UPE 材質，密度約 940 kg/m³）
+    - 機身 (base_link): 約 12 公斤
+    - 每隻腿 (C-leg): 約 0.35 公斤
+    - 整機總重量: 約 14 公斤
     """
 
-    # ===================
-    # Environment Settings
-    # ===================
-    # 120 Hz 模擬，decimation=2 → 60 Hz 控制頻率
-    decimation = 2
-    episode_length_s = 30.0  # 增加 episode 長度讓機器人有更多學習時間
-
-    # ===================
-    # Action Space: 3 main drive velocities + 3 ABAD positions = 6
-    # ===================
-    action_space = 6
+    # =========================================================================
+    # 【基本環境設定】
+    # =========================================================================
     
-    # ===================
-    # Observation Space:
-    # - base_lin_vel (3)
-    # - base_ang_vel (3) 
-    # - projected_gravity (3)
-    # - main_drive_pos_sin (3) - 用 sin 表示循環相位
-    # - main_drive_pos_cos (3) - 用 cos 表示循環相位
-    # - main_drive_vel (3)
-    # - abad_pos (3)
-    # - abad_vel (3)
-    # - velocity_command (3)
-    # - gait_phase (2) - sin/cos
-    # - last_actions (6)
-    # Total: 3+3+3+3+3+3+3+3+3+2+6 = 35
-    # ===================
-    observation_space = 35
-    state_space = 0
+    # 控制頻率計算：
+    # - 物理模擬以 120 Hz 運行（每秒 120 次物理計算）
+    # - decimation = 2 表示每 2 次物理計算，AI 才做一次決策
+    # - 所以 AI 控制頻率 = 120 ÷ 2 = 60 Hz（每秒決策 60 次）
+    decimation = 2
+    
+    # 每個訓練回合（episode）持續 30 秒
+    # 越長的回合讓機器人有更多時間學習和探索
+    episode_length_s = 60
 
-    # ===================
-    # Simulation Settings
-    # ===================
+    # =========================================================================
+    # 【動作空間】AI 能控制的東西
+    # =========================================================================
+    # 總共 12 個動作：
+    # - 6 個主驅動關節的目標速度
+    # - 6 個 ABAD 關節的目標位置
+    # 
+    # AI 神經網路會輸出 12 個數字（範圍 -1 到 +1）
+    # 這些數字會被縮放成實際的速度或角度
+    action_space = 12
+    
+    # =========================================================================
+    # 【觀察空間】AI 能「看到」的資訊
+    # =========================================================================
+    # 機器人需要知道自己的狀態才能做出正確決策
+    # 
+    # 觀察內容詳細說明：
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ 資訊類型              │ 維度  │ 說明                                 │
+    # ├──────────────────────────────────────────────────────────────────────┤
+    # │ base_lin_vel          │  3    │ 機身線速度 (x, y, z 方向)            │
+    # │ base_ang_vel          │  3    │ 機身角速度 (繞 x, y, z 軸)           │
+    # │ projected_gravity     │  3    │ 重力方向（用來判斷傾斜程度）         │
+    # │ main_drive_pos_sin    │  6    │ 主驅動關節位置的正弦值（循環相位）   │
+    # │ main_drive_pos_cos    │  6    │ 主驅動關節位置的餘弦值（循環相位）   │
+    # │ main_drive_vel        │  6    │ 主驅動關節的當前速度                 │
+    # │ abad_pos              │  6    │ ABAD 關節的當前位置                  │
+    # │ abad_vel              │  6    │ ABAD 關節的當前速度                  │
+    # │ velocity_command      │  3    │ 目標速度命令 (vx, vy, wz)            │
+    # │ gait_phase            │  2    │ 步態相位 (sin/cos 表示)              │
+    # │ last_actions          │ 12    │ 上一次的動作（讓動作更平滑）         │
+    # ├──────────────────────────────────────────────────────────────────────┤
+    # │ 總計                  │ 56    │ 3+3+3+6+6+6+6+6+3+2+12 = 56          │
+    # └──────────────────────────────────────────────────────────────────────┘
+    # 
+    # 為什麼用 sin/cos 表示旋轉位置？
+    # 因為旋轉是循環的（0° = 360°），用 sin/cos 可以讓 AI 更容易理解循環性質
+    observation_space = 56
+
+    # 額外 observation groups：
+    # - history: 給 actor 用的短時序記憶（顯式 observation history）
+    # - critic: 給 privileged critic 用的特權資訊
+    # - teacher: 保留給後續 distillation / student-teacher 實驗
+    policy_history_length = 5
+    history_observation_space = observation_space * (policy_history_length - 1)
+    critic_privileged_observation_space = 47
+    teacher_observation_space = observation_space + history_observation_space + critic_privileged_observation_space
+
+    # state_space 對 DirectRLEnv 來說就是 asymmetric critic 的特權觀測空間
+    state_space = critic_privileged_observation_space
+
+    # =========================================================================
+    # 【物理模擬設定】定義虛擬世界的物理規則
+    # =========================================================================
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 120,  # 120 Hz 模擬頻率（較低以獲得穩定性）
+        # 模擬時間步長：每秒 120 次物理計算
+        # 越小越精確，但計算量越大
+        dt=1 / 250,
+        
+        # 渲染間隔：每 2 次物理計算才更新一次畫面（節省效能）
         render_interval=2,
+        
+        # 重力加速度 (x, y, z) 單位：公尺/秒²
+        # z = -9.81 表示向下的地球重力
         gravity=(0.0, 0.0, -9.81),
+        
+        # 【物理材質】定義物體表面的摩擦和彈性
+        # ★ 貼近現實橡膠輪胎/抖青地面的摩擦係數 ★
         physics_material=sim_utils.RigidBodyMaterialCfg(
+            # 摩擦力合併模式：當兩個物體接觸時，如何計算總摩擦力
+            # "multiply" = 兩者相乘（比較保守）
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.2,   # 提高摩擦力幫助 C-leg 抓地
-            dynamic_friction=1.0,  # 提高動摩擦
-            restitution=0.0,       # 無彈跳
+            
+            # 靜摩擦係數：物體靜止時需要多大力才能推動
+            # 橡膠 vs 抖青 約 0.8~1.2，設為 1.2 以增強抓地力
+            static_friction=1.2,
+            
+            # 動摩擦係數：物體移動時的阻力
+            # 通常比靜摩擦稍低
+            dynamic_friction=1.0,
+            
+            # 彈性係數：碰撞後反彈的程度
+            # 0 = 完全不彈（像黏土）
+            # 1 = 完全彈回（像超級彈力球）
+            restitution=0.0,  # 設為 0 防止機器人亂跳
         ),
     )
 
-    # ===================
-    # Robot Configuration
-    # ===================
+    # =========================================================================
+    # 【機器人配置】引用前面定義的機器人設定
+    # =========================================================================
+    # replace() 方法會複製 REDRHEX_CFG，但把路徑改成環境專用的路徑
+    # "/World/envs/env_.*/Robot" 是一個正則表達式模板
+    # 當有多個環境時，會自動變成 env_0, env_1, env_2...
     robot_cfg: ArticulationCfg = REDRHEX_CFG.replace(prim_path="/World/envs/env_.*/Robot")
 
-    # ===================
-    # Scene Configuration
-    # ===================
+    # =========================================================================
+    # 【接觸感測器配置】偵測機器人是否碰到東西
+    # =========================================================================
+    # 這很重要！用來檢測：
+    # - 身體是否摔倒撞到地面（這是壞事）
+    # - 腿是否正確接觸地面（這是好事）
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        # 監測機器人所有部位的碰撞
+        prim_path="/World/envs/env_.*/Robot/.*",
+        
+        # 保留最近 3 筆碰撞紀錄
+        history_length=3,
+        
+        # 更新頻率：0.0 表示每次物理計算都更新
+        update_period=0.0,
+        
+        # 追蹤腳在空中的時間（用於分析步態）
+        track_air_time=True,
+    )
+    
+    # 身體部位名稱 - 這些部位不應該碰到地面！
+    # 如果 base_link（主機身）碰到地面，表示機器人摔倒了
+    body_names = ["base_link"]
+    
+    # 腿部名稱 - 這些部位碰到地面是正常的
+    # 使用正則表達式匹配所有包含 "leg" 的部位
+    leg_names = [".*leg.*", ".*Leg.*"]
+
+    # =========================================================================
+    # 【場景配置】設定訓練環境
+    # =========================================================================
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        # 同時模擬 4096 個環境！
+        # 這就是 GPU 平行訓練的威力：一次訓練數千個機器人
         num_envs=4096,
+        
+        # 每個環境之間的間距（公尺）
+        # 太近會互相干擾，太遠會浪費空間
         env_spacing=2.5,
+        
+        # 複製物理設定到所有環境（加速模擬）
         replicate_physics=True,
     )
 
-    # ===================
-    # Terrain Configuration
-    # ===================
+    # =========================================================================
+    # 【地形配置】設定機器人腳下的地面
+    # =========================================================================
+    # 
+    # ★★★ terrain_type 三種選項 ★★★
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ terrain_type  │ 說明                                               │
+    # ├─────────────────────────────────────────────────────────────────────┤
+    # │ "plane"       │ 平坦地面（預設，最簡單）                            │
+    # │ "generator"   │ 程序化生成地形（需配合 terrain_generator 參數）     │
+    # │ "usd"         │ 從 USD 檔案載入自訂地形（需配合 usd_path 參數）     │
+    # └─────────────────────────────────────────────────────────────────────┘
+    #
+    # ★★★ 如何使用 "generator" 生成複雜地形 ★★★
+    #
+    # 步驟 1: 把 terrain_type 改成 "generator"
+    # 步驟 2: 加入 terrain_generator 參數（見下方範例）
+    #
+    # 可用的子地形類型：
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 高度場地形 (hf.xxx)           │ 說明                               │
+    # ├─────────────────────────────────────────────────────────────────────┤
+    # │ hf.HfRandomUniformTerrainCfg  │ 隨機高低起伏地形                   │
+    # │ hf.HfPyramidSlopedTerrainCfg  │ 金字塔斜坡                         │
+    # │ hf.HfPyramidStairsTerrainCfg  │ 金字塔階梯                         │
+    # │ hf.HfDiscreteObstaclesTerrainCfg │ 隨機障礙物                      │
+    # │ hf.HfWaveTerrainCfg           │ 波浪地形                           │
+    # │ hf.HfSteppingStonesTerrainCfg │ 踏腳石                             │
+    # └─────────────────────────────────────────────────────────────────────┘
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 網格地形 (mesh.xxx)           │ 說明                               │
+    # ├─────────────────────────────────────────────────────────────────────┤
+    # │ mesh.MeshPlaneTerrainCfg      │ 平坦網格                           │
+    # │ mesh.MeshPyramidStairsTerrainCfg │ 金字塔階梯                      │
+    # │ mesh.MeshRandomGridTerrainCfg │ 隨機格子高低                       │
+    # │ mesh.MeshRailsTerrainCfg      │ 軌道地形                           │
+    # │ mesh.MeshPitTerrainCfg        │ 坑洞地形                           │
+    # │ mesh.MeshBoxTerrainCfg        │ 箱子/台階                          │
+    # │ mesh.MeshGapTerrainCfg        │ 間隙地形                           │
+    # │ mesh.MeshStarTerrainCfg       │ 星形地形                           │
+    # └─────────────────────────────────────────────────────────────────────┘
+    #
+    # =========================================================================
+    
+    # -------------------------------------------------------------------------
+    # 【預設】rough terrain generator
+    # 以課程化難度生成 rough / wave / stairs / boxes 的混合地形，
+    # 讓策略從一開始就對真機更常見的高度變化與接觸不確定性有適應能力。
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=REDRHEX_ROUGH_TERRAINS_CFG,
         collision_group=-1,
+        max_init_terrain_level=1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
+            static_friction=1.2,   # 提高：橡膠 vs 抖青 約 0.8~1.2
+            dynamic_friction=1.0,  # 提高
         ),
         debug_vis=False,
     )
+    # -------------------------------------------------------------------------
 
-    # ===================
-    # Joint Names Mapping (按功能分組)
-    # ===================
-    # 
-    # 機器人腿的物理佈局:
-    #   前方 (Forward +X)
-    #        ^
-    #        |
-    #   [Leg1] [Leg4]    (前排)
-    #   [Leg2] [Leg5]    (中排)
-    #   [Leg3] [Leg6]    (後排)
-    #   右側    左側
-    #
-    # 關節對應:
-    # - 主驅動 (360° 旋轉): 15, 12, 7 (右側); 18, 23, 24 (左側)
-    # - ABAD (外展內收): 14, 11, 6 (右側); 17, 22, 21 (左側)
-    # - 避震 (被動): 5, 13, 8 (右側); 25, 26, 27 (左側)
-    #
-    # Tripod 分組 (交替支撐):
-    # - Tripod A: Leg1(15), Leg4(18), Leg6(24) → 前右 + 前左 + 後左
-    # - Tripod B: Leg2(7), Leg3(12), Leg5(23) → 中右 + 後右 + 中左
+    # -------------------------------------------------------------------------
+    # 【範例 2】金字塔階梯地形（取消註解即可使用）
+    # -------------------------------------------------------------------------
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground",
+    #     terrain_type="generator",  # ← 改成 generator
+    #     terrain_generator=TerrainGeneratorCfg(
+    #         size=(8.0, 8.0),        # 每個子地形的大小 (寬, 長) 公尺
+    #         num_rows=4,             # 地形網格的行數
+    #         num_cols=4,             # 地形網格的列數
+    #         border_width=0.5,       # 邊界寬度
+    #         curriculum=False,       # 是否啟用課程學習（難度遞增）
+    #         sub_terrains={
+    #             "pyramid_stairs": hf.HfPyramidStairsTerrainCfg(
+    #                 proportion=1.0,           # 這種地形佔 100%
+    #                 step_height_range=(0.05, 0.15),  # 階梯高度 5~15 公分
+    #                 step_width=0.3,           # 階梯寬度 30 公分
+    #                 platform_width=1.0,       # 中央平台寬度
+    #             ),
+    #         },
+    #     ),
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         friction_combine_mode="multiply",
+    #         restitution_combine_mode="multiply",
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #     ),
+    #     debug_vis=False,
+    # )
     
-    # 主驅動關節 (連續旋轉) - 順序: [右前, 右中, 右後, 左前, 左中, 左後]
-    # 索引:                        [  0,    1,    2,    3,    4,    5  ]
+    # -------------------------------------------------------------------------
+    # 【範例 3】隨機起伏地形（取消註解即可使用）
+    # -------------------------------------------------------------------------
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground",
+    #     terrain_type="generator",
+    #     terrain_generator=TerrainGeneratorCfg(
+    #         size=(8.0, 8.0),
+    #         num_rows=4,
+    #         num_cols=4,
+    #         sub_terrains={
+    #             "random_rough": hf.HfRandomUniformTerrainCfg(
+    #                 proportion=1.0,
+    #                 noise_range=(-0.05, 0.05),  # 地面高度變化 ±5 公分
+    #                 noise_step=0.005,           # 最小高度變化量
+    #                 downsampled_scale=0.2,      # 採樣解析度
+    #             ),
+    #         },
+    #     ),
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #     ),
+    # )
+    
+    # -------------------------------------------------------------------------
+    # 【範例 4】混合地形（多種地形組合，取消註解即可使用）
+    # -------------------------------------------------------------------------
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground",
+    #     terrain_type="generator",
+    #     terrain_generator=TerrainGeneratorCfg(
+    #         size=(8.0, 8.0),
+    #         num_rows=8,
+    #         num_cols=8,
+    #         curriculum=True,        # 啟用課程學習：由簡到難
+    #         sub_terrains={
+    #             # 平坦地形佔 20%（最簡單）
+    #             "flat": mesh.MeshPlaneTerrainCfg(
+    #                 proportion=0.2,
+    #             ),
+    #             # 隨機起伏佔 30%（中等難度）
+    #             "rough": hf.HfRandomUniformTerrainCfg(
+    #                 proportion=0.3,
+    #                 noise_range=(-0.03, 0.03),
+    #                 noise_step=0.005,
+    #             ),
+    #             # 金字塔階梯佔 30%（較難）
+    #             "stairs": hf.HfPyramidStairsTerrainCfg(
+    #                 proportion=0.3,
+    #                 step_height_range=(0.05, 0.1),
+    #                 step_width=0.25,
+    #             ),
+    #             # 波浪地形佔 20%（困難）
+    #             "wave": hf.HfWaveTerrainCfg(
+    #                 proportion=0.2,
+    #                 amplitude_range=(0.02, 0.06),
+    #                 num_waves=2,
+    #             ),
+    #         },
+    #     ),
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #     ),
+    # )
+
+    # =========================================================================
+    # 【關節名稱對照表】把關節編號與位置對應起來
+    # =========================================================================
+    # 
+    # 機器人腿的物理佈局（俯視圖）：
+    # 
+    #              前方 (Forward +X)
+    #                   ^
+    #                   |
+    #        ┌─────────────────────┐
+    #        │                     │
+    #   Leg1 ●─────────────────────● Leg4    (前排)
+    #        │                     │
+    #        │      [機身]         │
+    #        │                     │
+    #   Leg2 ●─────────────────────● Leg5    (中排)
+    #        │                     │
+    #        │                     │
+    #        │                     │
+    #   Leg3 ●─────────────────────● Leg6    (後排)
+    #        │                     │
+    #        └─────────────────────┘
+    #       右側                  左側
+    #
+    # 【關節編號對應】
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ 腿編號 │ 位置   │ 主驅動關節  │ ABAD 關節  │ 避震關節  │ Tripod 組 │
+    # ├──────────────────────────────────────────────────────────────────────┤
+    # │ Leg 1  │ 右前   │ Revolute_15 │ Revolute_14│ Revolute_5 │ A 組      │
+    # │ Leg 2  │ 右中   │ Revolute_7  │ Revolute_6 │ Revolute_8 │ B 組      │
+    # │ Leg 3  │ 右後   │ Revolute_12 │ Revolute_11│ Revolute_13│ B 組      │
+    # │ Leg 4  │ 左前   │ Revolute_18 │ Revolute_17│ Revolute_25│ A 組      │
+    # │ Leg 5  │ 左中   │ Revolute_23 │ Revolute_22│ Revolute_26│ B 組      │
+    # │ Leg 6  │ 左後   │ Revolute_24 │ Revolute_21│ Revolute_27│ A 組      │
+    # └──────────────────────────────────────────────────────────────────────┘
+    #
+    # 【Tripod 分組原理】（交替支撐，確保穩定）
+    # - Tripod A: Leg1 + Leg4 + Leg6 = 右前 + 左前 + 左後（三角形支撐）
+    # - Tripod B: Leg2 + Leg3 + Leg5 = 右中 + 右後 + 左中（另一個三角形）
+    # 兩組交替著地，任何時刻都有三點支撐！
+    
+    # -------------------------------------------------------------------------
+    # 主驅動關節名稱列表
+    # -------------------------------------------------------------------------
+    # 順序：[右前, 右中, 右後, 左前, 左中, 左後]
+    # 索引：[  0,    1,    2,    3,    4,    5  ]
     main_drive_joint_names = [
-        "Revolute_15",  # idx 0 - Leg 1 (右前) - Tripod A
-        "Revolute_7",   # idx 1 - Leg 2 (右中) - Tripod B
-        "Revolute_12",  # idx 2 - Leg 3 (右後) - Tripod B
+        "Revolute_15",  # 索引 0 - Leg 1 (右前) - 屬於 Tripod A
+        "Revolute_7",   # 索引 1 - Leg 2 (右中) - 屬於 Tripod B
+        "Revolute_12",  # 索引 2 - Leg 3 (右後) - 屬於 Tripod B
+        "Revolute_18",  # 索引 3 - Leg 4 (左前) - 屬於 Tripod A
+        "Revolute_23",  # 索引 4 - Leg 5 (左中) - 屬於 Tripod B
+        "Revolute_24",  # 索引 5 - Leg 6 (左後) - 屬於 Tripod A
     ]
     
-    # 方向乘數 (前進時的旋轉方向)
-    # 目前 repo-local URDF exposes the right-side active joints.
-    leg_direction_multiplier = [-1.0, -1.0, -1.0]
+    # -------------------------------------------------------------------------
+    # 腿旋轉方向乘數
+    # -------------------------------------------------------------------------
+    # 為什麼需要這個？
+    # 因為左右兩側的腿面對面，要讓機器人往前走：
+    # - 右側腿需要「逆時針」轉（從右邊看）→ 乘數 -1
+    # - 左側腿需要「順時針」轉（從左邊看）→ 乘數 +1
+    leg_direction_multiplier = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
     
-    # ABAD 關節 (位置控制) - 順序對應主驅動
+    # -------------------------------------------------------------------------
+    # ABAD 關節名稱列表（順序對應主驅動關節）
+    # -------------------------------------------------------------------------
     abad_joint_names = [
         "Revolute_14",  # Leg 1 (右前)
         "Revolute_6",   # Leg 2 (右中)
         "Revolute_11",  # Leg 3 (右後)
+        "Revolute_17",  # Leg 4 (左前)
+        "Revolute_22",  # Leg 5 (左中)
+        "Revolute_21",  # Leg 6 (左後)
     ]
     
-    # 避震關節 (被動) - 順序對應主驅動
+    # -------------------------------------------------------------------------
+    # 避震關節名稱列表（順序對應主驅動關節）
+    # -------------------------------------------------------------------------
     damper_joint_names = [
         "Revolute_5",   # Leg 1 (右前)
         "Revolute_8",   # Leg 2 (右中)
         "Revolute_13",  # Leg 3 (右後)
+        "Revolute_25",  # Leg 4 (左前)
+        "Revolute_26",  # Leg 5 (左中)
+        "Revolute_27",  # Leg 6 (左後)
     ]
 
-    # ===================
-    # Tripod Groups (索引到 main_drive_joint_names)
-    # ===================
-    # RHex 交替三足步態：
-    # - Tripod A: 15(idx0), 18(idx3), 24(idx5) = 右前 + 左前 + 左後
-    # - Tripod B: 7(idx1), 12(idx2), 23(idx4) = 右中 + 右後 + 左中
-    # 這樣的分組確保任何時刻都有對角線支撐
-    tripod_a_leg_indices = [0]     # joint 15
-    tripod_b_leg_indices = [1, 2]  # joints 7, 12
+    # =========================================================================
+    # 【Tripod 分組索引】用於步態控制
+    # =========================================================================
+    # RHex 的交替三足步態工作原理：
+    # 1. Tripod A 的三隻腳同時著地、同時離地
+    # 2. Tripod B 的三隻腳同時著地、同時離地
+    # 3. A 和 B 使用「非對稱 duty cycle」交替進行
+    #    ★ 著地相位：時間長（65%）但角度小（60°），腿緩慢轉動
+    #    ★ 擺動相位：時間短（35%）但角度大（300°），腿快速轉動
+    # 
+    # 這樣的好處：
+    # - 因為 duty_cycle > 50%，兩組著地時間有 30% 重疊
+    # - 任何時刻都至少有一組著地，永不騰空！
+    # - 運動效率高（類似昆蟲的走路方式）
     
-    # ===================
-    # Leg Side Groups (for motor direction)
-    # ===================
-    # 基於 main_drive_joint_names 的索引
-    # Right side: idx 0, 1, 2 → joints 15, 7, 12
-    right_leg_indices = [0, 1, 2]  # 右側腿
-    left_leg_indices = []          # 目前 repo-local URDF only includes the right-side active joints
+    # Tripod A 組：索引 0, 3, 5 → 對應關節 15, 18, 24
+    tripod_a_leg_indices = [0, 3, 5]
+    
+    # Tripod B 組：索引 1, 2, 4 → 對應關節 7, 12, 23
+    tripod_b_leg_indices = [1, 2, 4]
+    
+    # =========================================================================
+    # 【左右側分組】用於控制轉向
+    # =========================================================================
+    # 右側腿：索引 0, 1, 2（對應關節 15, 7, 12）
+    right_leg_indices = [0, 1, 2]
+    
+    # 左側腿：索引 3, 4, 5（對應關節 18, 23, 24）
+    left_leg_indices = [3, 4, 5]
 
-    # ===================
-    # Action Scaling
-    # ===================
-    # 主驅動：目標角速度 (rad/s)
-    # 網路輸出 [-1, 1]，乘以 scale 得到目標速度
-    # RHex 腿需要持續旋轉，scale 要足夠大
-    main_drive_vel_scale = 8.0      # ±8 rad/s - 允許快速旋轉 (~1.3 轉/秒)
+    # =========================================================================
+    # 【動作縮放參數】把 AI 輸出轉換成實際的控制值
+    # =========================================================================
+    # AI 神經網路輸出的數值範圍是 [-1, +1]
+    # 我們需要把這些數值縮放成實際有意義的物理量
     
-    # ABAD：目標位置偏移 (rad)
-    abad_pos_scale = 0.3            # ±0.3 rad ≈ ±17° - 增加範圍
+    # 主驅動關節：目標角速度（弧度/秒）
+    # AI 輸出 [-1, +1] × 8.0 = 實際速度 [-8, +8] rad/s
+    # 8 rad/s ≈ 每秒轉 1.3 圈，這讓腿能快速旋轉推進機器人
+    main_drive_vel_scale = 8.0
+    
+    # ABAD 關節：目標位置偏移（弧度）
+    # AI 輸出 [-1, +1] × 0.3 = 實際角度偏移 [-0.3, +0.3] rad ≈ ±17 度
+    # 這是腿可以向外/向內擺動的範圍
+    abad_pos_scale = 0.61096  # 約等於 35 度
 
-    # ===================
-    # Velocity Command Ranges (多方向追蹤)
-    # ===================
-    # 9 個移動方向：前、後、左、右、右前、右後、左前、左後、原地旋轉
-    # 命令會定期隨機切換方向
+    # =========================================================================
+    # 【速度命令範圍】定義機器人可以執行的移動指令
+    # =========================================================================
+    # 在訓練過程中，系統會隨機給機器人下達移動命令
+    # 機器人必須學會追蹤這些命令（往前走、往左走、轉彎等）
     
-    # 線速度範圍 (m/s)
-    lin_vel_x_range = [-0.3, 0.5]   # 前後速度：正值前進，負值後退
-    lin_vel_y_range = [-0.3, 0.3]   # 側向速度：正值向左，負值向右
-    ang_vel_z_range = [-1.0, 1.0]   # 旋轉速度 (rad/s)：正值逆時針，負值順時針
+    # =========================================================================
+    # ★★★ 多技能訓練策略（command-conditioned）★★★
+    # =========================================================================
+    # Stage 1: Forward-only
+    # Stage 2: Lateral-only
+    # Stage 3: Diagonal-only
+    # Stage 4: Yaw-only
+    # Stage 5: Mixed (Forward/Lateral/Diagonal/Yaw)
     
-    # 命令切換設置
-    command_resample_time = 3.0     # 每 3 秒隨機切換一次目標方向（縮短以便觀察）
+    # 前後速度範圍（公尺/秒）
+    lin_vel_x_range = [0.2, 0.45]
     
-    # 離散方向模式（如果啟用，則使用固定方向）
+    # 側向速度範圍（公尺/秒）
+    lin_vel_y_range = [-0.35, 0.35]
+    
+    # 旋轉速度範圍（弧度/秒）
+    ang_vel_z_range = [-1.0, 1.0]
+    
+    # 命令重新採樣時間（秒）
+    command_resample_time = 6.0
+
+    
+    # -------------------------------------------------------------------------
+    # 離散方向模式：使用預定義的移動方向
+    # -------------------------------------------------------------------------
+    # 如果設為 True，系統會從下面的列表中隨機選擇一個方向
+    # 而不是隨機生成連續的速度值
     use_discrete_directions = True
-    # 9 個方向的速度設定 [vx, vy, wz]
-    # 包含原地旋轉（vx=0, vy=0, wz≠0）
+    
+    # 7 個預定義的移動方向 [前後速度, 左右速度, 旋轉速度]
+    # ★★★ 注意：RHex 不適合向後走，所以移除所有後退方向 ★★★
     discrete_directions = [
-        [0.4, 0.0, 0.0],     # 0: 前
-        [-0.3, 0.0, 0.0],    # 1: 後
-        [0.0, 0.3, 0.0],     # 2: 左
-        [0.0, -0.3, 0.0],    # 3: 右
-        [0.3, 0.2, 0.0],     # 4: 左前
-        [0.3, -0.2, 0.0],    # 5: 右前
-        [-0.2, 0.2, 0.0],    # 6: 左後
-        [-0.2, -0.2, 0.0],   # 7: 右後
-        [0.0, 0.0, 0.8],     # 8: 原地逆時針旋轉
-        [0.0, 0.0, -0.8],    # 9: 原地順時針旋轉
+        [0.4, 0.0, 0.0],     # 方向 0: 直走（向前）
+        [0.0, 0.3, 0.0],     # 方向 1: 側移（向左）
+        [0.0, -0.3, 0.0],    # 方向 2: 側移（向右）
+        [0.3, 0.2, 0.0],     # 方向 3: 斜走（左前方）
+        [0.3, -0.2, 0.0],    # 方向 4: 斜走（右前方）
+        [0.0, 0.0, 0.8],     # 方向 5: 原地旋轉（逆時針）
+        [0.0, 0.0, -0.8],    # 方向 6: 原地旋轉（順時針）
     ]
     
-    # 方向名稱（用於調試輸出）
-    direction_names = ["前", "後", "左", "右", "左前", "右前", "左後", "右後", "逆時針旋轉", "順時針旋轉"]
-    
-    # 可視化設置
-    draw_debug_vis = True           # 是否繪製調試箭頭
-    debug_vis_interval = 5          # 每隔幾步更新一次可視化（減少性能開銷）
+    # 方向名稱（用於調試輸出，方便查看機器人正在追蹤什麼命令）
+    direction_names = ["前", "左", "右", "左前", "右前", "逆時針旋轉", "順時針旋轉"]
 
-    # ===================
-    # Gait Parameters
-    # ===================
-    # 基礎步態頻率 - 決定腿的旋轉速度
-    # RHex 腿需要足夠快的旋轉才能產生穩定推進
-    base_gait_frequency = 1.0       # Hz - 每秒 1 圈
-    # 對應的角速度 (更新為匹配新頻率)
+    # -------------------------------------------------------------------------
+    # Curriculum（Hydra 可直接覆寫：stage=1/2/3/4/5）
+    # -------------------------------------------------------------------------
+    curriculum_enable = True
+    stage = 5  # 1:Forward-only, 2:Lateral-only, 3:Diagonal-only, 4:Yaw-only, 5:Mixed-skills
+    curriculum_auto_progress = False
+    curriculum_stage1_steps = 800_000
+    curriculum_stage2_steps = 1_800_000
+    curriculum_stage3_steps = 3_000_000
+    curriculum_stage4_steps = 4_200_000
+    curriculum_stage_scales = [0.05, 0.15, 0.35, 0.60, 1.00]
+
+    # Stage 專屬命令分佈
+    stage1_use_discrete_directions = False
+    stage1_discrete_directions = [[0.4, 0.0, 0.0]]
+    # Stage1 回到穩定版可用的前進速度範圍
+    stage1_forward_vx_range = [0.20, 0.45]
+
+    stage2_use_discrete_directions = False
+    stage2_discrete_directions = [[0.0, 0.44, 0.0], [0.0, -0.44, 0.0]]
+    stage2_lateral_vy_abs_range = [0.32, 0.64]
+
+    # Stage3: Diagonal-only（融合 stage1 前進 + stage2 側移）
+    stage3_use_discrete_directions = True
+    stage3_discrete_directions = [
+        [0.36, 0.30, 0.0],
+        [0.36, -0.30, 0.0],
+        [0.46, 0.36, 0.0],
+        [0.46, -0.36, 0.0],
+        [0.54, 0.42, 0.0],
+        [0.54, -0.42, 0.0],
+    ]
+    stage3_diag_vx_range = [0.34, 0.60]
+    stage3_diag_vy_abs_range = [0.28, 0.48]
+
+    # Stage4: Yaw-only（先把原地旋轉練穩）
+    stage4_use_discrete_directions = True
+    stage4_discrete_directions = [
+        [0.0, 0.0, 0.22],
+        [0.0, 0.0, -0.22],
+        [0.0, 0.0, 0.38],
+        [0.0, 0.0, -0.38],
+        [0.0, 0.0, 0.54],
+        [0.0, 0.0, -0.54],
+    ]
+    stage4_yaw_wz_abs_range = [0.20, 0.62]
+
+    # Stage5: Mixed skills（最終整合）
+    stage5_use_discrete_directions = False
+    stage5_discrete_directions = [
+        [0.40, 0.00, 0.00],
+        [0.00, 0.42, 0.00],
+        [0.00, -0.42, 0.00],
+        [0.40, 0.32, 0.00],
+        [0.40, -0.32, 0.00],
+        [0.00, 0.00, 0.80],
+        [0.00, 0.00, -0.80],
+    ]
+    stage5_mode_probabilities = [0.28, 0.24, 0.24, 0.24]  # [FWD, LAT, DIAG, YAW]
+    stage5_forward_vx_range = [0.22, 0.45]
+    stage5_lateral_vy_abs_range = [0.28, 0.60]
+    stage5_diag_vx_range = [0.32, 0.56]
+    stage5_diag_vy_abs_range = [0.26, 0.44]
+    stage5_yaw_wz_abs_range = [0.28, 0.70]
+
+    # 若設 True，環境會依 command_resample_time 週期重採樣命令
+    command_resample_on_timer = False
+    
+    # -------------------------------------------------------------------------
+    # Command 模式判斷閾值（FWD / LAT / DIAG / YAW）
+    # -------------------------------------------------------------------------
+    mode_lin_zero_thresh = 0.08
+    mode_yaw_zero_thresh = 0.10
+    mode_forward_min_vx = 0.10
+    mode_lateral_min_vy = 0.12
+    mode_diagonal_min = 0.10
+    mode_yaw_min_wz = 0.15
+    
+    # -------------------------------------------------------------------------
+    # 動作 gating（硬限制）
+    # -------------------------------------------------------------------------
+    lock_abad_in_forward = True
+    lock_main_drive_in_lateral = True
+    lateral_soft_lock_enable = True
+    lateral_soft_lock_velocity = 1.8
+    require_stand_before_lateral = True
+    lateral_stand_pos_tol = 0.12
+    lateral_contact_pose_tol = 0.18
+    lateral_min_contact_count = 6.0
+    lateral_go_to_stand_timeout_s = 1.5
+    lateral_timeout_cooldown_steps = 80
+    lateral_abad_base_amplitude = 0.40
+    lateral_abad_max_amplitude = 0.60
+    lateral_abad_policy_blend = 0.05
+    diag_abad_bias_scale = 0.20
+    diag_abad_policy_blend = 0.70
+    yaw_abad_action_scale = 0.55
+    abad_pos_limit = 0.60
+
+    # -------------------------------------------------------------------------
+    # Play 相容保護（舊 checkpoint 在新版控制邏輯下仍可穩定前進）
+    # 僅在 external_control=True（play/eval command override）時生效
+    # -------------------------------------------------------------------------
+    play_forward_compat_enable = True
+    play_forward_compat_only_external = True
+    play_forward_compat_bias_scale = 1.00
+    play_forward_compat_residual_scale = 0.04
+    play_forward_compat_residual_clip = 0.30
+
+    # Reset 穩定性：預設不做大範圍 yaw 隨機化，先確保起步可訓練
+    randomize_initial_yaw = False
+    initial_yaw_range = [-0.20, 0.20]
+    
+    # Forward tripod 相位鎖定（讓步態更接近 alternating tripod）
+    forward_phase_lock_gain = 1.2
+    forward_drive_action_scale = 0.35
+
+    # Main-drive 映射（bias + residual）
+    main_drive_residual_scale = 0.22
+    drive_bias_vx_ref = 0.45
+    drive_bias_wz_ref = 1.00
+    yaw_drive_bias_scale = 2.4
+    yaw_body_pattern_sign = 1.0
+    yaw_stability_tilt_limit = 0.38
+    yaw_safe_min_scale = 0.20
+    forward_residual_cap_ratio = 0.22
+
+    # -------------------------------------------------------------------------
+    # Stage 穩定配置（1..5 對應 Stage1..Stage5）
+    # 目標：每個 stage 都先保命、再追性能，避免「出生即死 / 抽搐」
+    # -------------------------------------------------------------------------
+    # Stage1: 前進穩定優先（強 bias，較低 residual）
+    stage_drive_vel_scale = [8.0, 4.8, 6.2, 5.2, 6.8]
+    stage_main_drive_residual_scale = [0.10, 0.14, 0.18, 0.14, 0.20]
+    stage_forward_bias_scale = [1.00, 0.35, 0.55, 0.35, 0.90]
+    stage_yaw_drive_bias_scale = [0.90, 0.90, 1.20, 1.30, 1.50]
+    stage_yaw_safe_min_scale = [0.18, 0.18, 0.20, 0.10, 0.18]
+    stage_yaw_hard_brake_tilt = [0.58, 0.58, 0.52, 0.42, 0.46]
+    stage_yaw_hard_brake_scale = [0.34, 0.34, 0.26, 0.16, 0.24]
+    stage_lateral_soft_lock_velocity = [1.3, 2.8, 2.0, 1.4, 2.3]
+    stage_lateral_policy_drive_residual_scale = [0.00, 0.42, 0.18, 0.08, 0.30]
+    stage_lateral_abad_base_amplitude = [0.40, 0.66, 0.54, 0.44, 0.58]
+    stage_lateral_abad_max_amplitude = [0.62, 0.95, 0.82, 0.66, 0.86]
+    stage_lateral_abad_policy_blend = [0.05, 0.26, 0.16, 0.10, 0.18]
+    stage_diag_abad_bias_scale = [0.18, 0.20, 0.40, 0.24, 0.32]
+    stage_diag_abad_policy_blend = [0.72, 0.72, 0.48, 0.66, 0.58]
+    stage_yaw_abad_action_scale = [0.38, 0.40, 0.46, 0.36, 0.46]
+    stage_yaw_abad_stance_bias = [0.06, 0.08, 0.10, 0.11, 0.12]
+    stage_yaw_abad_policy_blend = [0.85, 0.78, 0.70, 0.42, 0.56]
+    stage_abad_pos_limit = [0.48, 0.62, 0.58, 0.56, 0.62]
+    # Stage1 暖機不宜過長，避免有效控制長時間被壓小
+    stage_action_warmup_steps = [30, 120, 100, 140, 120]
+    # 防遺忘：Forward 模式下，後續 stage 僅保留小殘差，避免破壞穩定直走
+    stage_forward_policy_drive_residual_scale = [0.10, 0.02, 0.02, 0.02, 0.06]
+    stage_diag_policy_drive_residual_scale = [0.05, 0.08, 0.16, 0.08, 0.20]
+    stage_yaw_policy_drive_residual_scale = [0.05, 0.08, 0.12, 0.10, 0.18]
+    stage_forward_residual_cap_ratio = [0.26, 0.18, 0.18, 0.18, 0.22]
+
+    # Stage 專屬 reward 強化倍率
+    stage_lateral_reward_multiplier = [1.00, 2.20, 1.30, 1.00, 1.55]
+    stage_diag_reward_multiplier = [1.00, 1.00, 2.00, 1.00, 1.45]
+    stage_yaw_reward_multiplier = [1.00, 1.00, 1.10, 2.20, 1.60]
+    # 保留直走能力：在 Stage1 與 Stage5 讓 forward 相關 reward 權重更高，減少遺忘
+    stage_forward_reward_multiplier = [1.20, 0.35, 0.80, 0.45, 1.25]
+    stage_forward_gait_reward_multiplier = [1.45, 0.40, 0.90, 0.55, 1.35]
+    stage_lateral_speed_target_ratio = [0.65, 0.82, 0.78, 0.68, 0.82]
+
+    # -------------------------------------------------------------------------
+    # Forward gait prior（reward shaping 專用）
+    # -------------------------------------------------------------------------
+    # 目標規格：stance 65% / swing 35%，角度配比 60°/300°
+    forward_duty_target = 0.65
+    forward_duty_ema_alpha = 0.05
+    forward_duty_sigma = 0.08
+
+    forward_stance_angle_deg = 60.0
+    forward_swing_angle_deg = 300.0
+    forward_antiphase_sigma = 0.35
+    forward_velocity_ratio_sigma = 2.0
+    forward_velocity_ratio_cap = 20.0
+
+    # 僅在相位切換附近（transition）鼓勵 >=4 腳接觸
+    forward_transition_window = 0.35
+    forward_overlap_contact_target = 4.0
+    forward_overlap_contact_scale = 0.5
+
+    # -------------------------------------------------------------------------
+    # 調試視覺化設定
+    # -------------------------------------------------------------------------
+    # 是否在模擬畫面上繪製調試箭頭（顯示速度方向等）
+    draw_debug_vis = True
+    
+    # 每隔幾個時間步更新一次視覺化（減少效能負擔）
+    # ★★★ 改為 1 讓視覺化即時更新，用於鍵盤控制測試 ★★★
+    debug_vis_interval = 1
+
+    # =========================================================================
+    # 【步態參數】RHex 非對稱 Duty Cycle 步態 - 詳細說明
+    # =========================================================================
+    # 
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    # ★ RHex 真正的步態模式（非簡單 180° 反相！）                          ★
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    # 
+    # 【核心概念】
+    # RHex 的步態不是讓兩組腿簡單地 180° 反相旋轉！
+    # 如果那樣做，會有很大部分時間機器人完全沒有腳撐著地板。
+    # 
+    # 真正的 RHex 步態是：
+    # 1. 一組著地時「慢慢轉」(Stance Phase) - 提供穩定支撐和推進力
+    # 2. 另一組在空中「快速轉一圈」(Swing Phase) - 快速回到準備著地的相位
+    # 3. 當擺動組轉完一圈回到著地相位時，著地組才開始快轉
+    # 4. 這樣確保任何時刻都至少有一組（3隻腳）在地面支撐！
+    # 
+    # =========================================================================
+    # 【時間軸圖解】一個完整週期（T = 1秒，假設 1Hz）
+    # =========================================================================
+    # 
+    # 時間: |----0.0s----|----0.2s----|----0.4s----|----0.6s----|----0.8s----|----1.0s----|
+    #       |            |            |            |            |            |            |
+    # 
+    # Tripod A:
+    #       |████████████████████████████████████████|░░░░░░░░░░░░░░░░░░░░░░|████████...
+    #       |<------- 著地相位 (慢轉 ~65%) -------->|<-- 擺動相位 (快轉) ->|
+    #       |  腿接觸地面，緩慢旋轉推進機身           |  腿離地，快速轉一圈   |
+    #       |  相位: 0° → 234°                       |  相位: 234° → 360°   |
+    #       |  速度: ~3.4 rad/s (慢)                 |  速度: ~11.7 rad/s   |
+    # 
+    # Tripod B:
+    #       |░░░░░░░░░░░░░░░░░░░░░░|████████████████████████████████████████|░░░░░░░...
+    #       |<-- 擺動相位 (快轉) ->|<------- 著地相位 (慢轉 ~65%) -------->|
+    #       |  B組快速轉完一圈     |  B組著地，A組開始快轉                   |
+    # 
+    # 支撐狀態:
+    #       |████████████████████████████████████████|████████████████████████████████...
+    #       |<--------------- A組支撐 ------------->|<------------ B組支撐 ----------->|
+    #       |                                        |
+    #       |                                   交接點：B組剛著地，A組準備離地
+    # 
+    # █ = 著地支撐（Stance）- 緩慢旋轉，提供推力
+    # ░ = 空中擺動（Swing） - 快速旋轉，準備下次著地
+    # 
+    # =========================================================================
+    # 【相位角度定義】（C型腿的旋轉位置）
+    # =========================================================================
+    #
+    #                    0° (著地開始)
+    #                      │
+    #                 ─────┼─────
+    #                /     │     \
+    #               /      │      \
+    #       270°   │   [C型腿]    │   90°
+    #               \      │      /
+    #                \     │     /
+    #                 ─────┼─────
+    #                      │
+    #                   180°
+    #
+    # 相位 0° ~ 234°（約 65% 週期）：著地相位（腿底部接觸地面）
+    # 相位 234° ~ 360°（約 35% 週期）：擺動相位（腿在空中快轉）
+    #
+    # =========================================================================
+    # 【速度計算原理】★★★ 重要：角度 vs 時間 的區別 ★★★
+    # =========================================================================
+    #
+    # 【核心概念】著地時間長，但轉過角度少！
+    #
+    # 因為著地時腿底部要維持在地面（大約在相位 0° 附近），
+    # 所以著地階段轉過的「角度」很少，只是時間拉長。
+    #
+    # 設一個完整週期為 T 秒，設基礎轉速為 ω_base
+    #
+    # 【關鍵洞見】
+    # 著地時：腿底部朝下接觸地面，相位在「著地區間」(例如 -30° ~ +30°)
+    #        在這個小區間內慢慢轉，花費 65% 的時間
+    #
+    # 擺動時：腿要從 +30° 快速轉過 300°，回到 -30° (下一圈的著地位置)
+    #        只花 35% 的時間完成這一大段
+    #
+    # 【數學計算】
+    # 假設著地區間角度 = α_stance (例如 60° = π/3 rad)
+    # 假設擺動區間角度 = α_swing = 360° - α_stance = 300° (例如 5π/3 rad)
+    #
+    # 著地速度 = α_stance / (duty_cycle × T)
+    #          = (π/3) / (0.65 × T)  ← 小角度、長時間 → 很慢
+    #
+    # 擺動速度 = α_swing / ((1-duty_cycle) × T)
+    #          = (5π/3) / (0.35 × T)  ← 大角度、短時間 → 很快！
+    #
+    # 速度比例 = 擺動速度 / 著地速度
+    #          = (5π/3 / 0.35) / (π/3 / 0.65)
+    #          = (5 × 0.65) / (1 × 0.35)
+    #          = 3.25 / 0.35 ≈ 9.3 倍！
+    #
+    # 所以擺動速度應該是著地速度的 ~10 倍左右
+    #
+    # =========================================================================
+    
+    # -------------------------------------------------------------------------
+    # 【基礎頻率參數】
+    # -------------------------------------------------------------------------
+    # 基礎步態頻率（赫茲 Hz）
+    # 1.0 Hz = 機器人每秒完成一個完整的「左右交替」週期
+    base_gait_frequency = 1.0
+    
+    # 基礎角速度（用於計算實際速度）
+    # 這是「平均」概念上的速度，實際會根據相位調整
     base_gait_angular_vel = 2 * math.pi * 1.0  # ≈ 6.28 rad/s
     
-    # Tripod 相位差 (180°)
+    # -------------------------------------------------------------------------
+    # 【非對稱 Duty Cycle 核心參數】
+    # -------------------------------------------------------------------------
+    
+    # stance_duty_cycle: 著地相位佔整個週期的比例
+    # 
+    # 這個值決定了「穩定性 vs 速度」的平衡：
+    # - 0.5 = 各佔一半（不推薦，會有空檔期）
+    # - 0.6 = 著地 60%，擺動 40%
+    # - 0.65 = 著地 65%，擺動 35%（推薦值）
+    # - 0.7 = 著地 70%，擺動 30%（更穩但更慢）
+    #
+    # 設為 0.65 表示：
+    # - 一組腿在地面支撐的時間佔 65%
+    # - 在空中快轉的時間只佔 35%
+    # - 這確保兩組輪換時有足夠的「重疊」時間
+    stance_duty_cycle = 0.65
+    
+    # -------------------------------------------------------------------------
+    # 【速度比例參數】★ 關鍵參數 ★
+    # -------------------------------------------------------------------------
+    #
+    # 這兩個參數決定了著地/擺動時的實際旋轉速度
+    #
+    # 【重要】著地速度很慢，擺動速度很快！
+    #
+    # stance_velocity_ratio: 著地時的速度 = base_vel × 這個值
+    # - 著地時腿底部在地面，只能慢慢轉過一個小角度
+    # - 建議值: 0.1 ~ 0.3（非常慢！）
+    # - 0.15 表示著地時以基礎速度的 15% 旋轉
+    stance_velocity_ratio = 0.15
+
+    # swing_velocity_ratio: 擺動時的速度 = base_vel × 這個值
+    # - 擺動時要快速轉過大部分角度（約 300°）
+    # - 建議值: 1.5 ~ 2.5
+    # - 擺動速度需要約是著地速度的 10 倍！
+    swing_velocity_ratio = 1.5
+
+    # 【速度計算公式】
+    # 著地速度 = base_gait_angular_vel × stance_velocity_ratio
+    #          = 6.28 × 0.15 = 0.94 rad/s (非常慢，一秒轉約 54°)
+    #
+    # 擺動速度 = base_gait_angular_vel × swing_velocity_ratio
+    #          = 6.28 × 1.5 = 9.42 rad/s (快速，一秒轉約 540°)
+    #
+    # 速度比 = 1.5 / 0.15 = 10 倍
+
+    # -------------------------------------------------------------------------
+    # 【相位區間定義】★★★ 這是「角度」不是「時間」！★★★
+    # -------------------------------------------------------------------------
+    #
+    # C型腿的相位角（0 ~ 2π）：
+    # - 0 = 腿的「腳底」正朝下（最佳著地位置）
+    # - π = 腿的「腳底」朝上（在空中最高點）
+    # - 2π = 回到起點
+    #
+    # 【關鍵理解】
+    # 著地相位的「角度區間」很小（腳底要維持朝下接觸地面）
+    # 但著地相位的「時間」很長（65%）
+    # 這意味著在這個小角度區間內慢慢轉
+
+    # 著地相位開始角度（弧度）
+    # 負值表示從「剛要接觸地面」開始
+    # -π/6 ≈ -30° (腳底稍微向前)
+    stance_phase_start = -math.pi / 6
+
+    # 著地相位結束角度（弧度）
+    # +π/6 ≈ +30° (腳底稍微向後)
+    # 著地區間總共只有 60°！（但花 65% 的時間）
+    stance_phase_end = math.pi / 6
+
+    # 擺動相位範圍：+30° → 330°（-30° + 360°）
+    # 這是一個大角度區間（300°），但只花 35% 的時間
+    # 所以擺動時腿要「飛快」地轉過去！
+    
+    # -------------------------------------------------------------------------
+    # 【兩組 Tripod 的相位關係】★ 關鍵理解 ★
+    # -------------------------------------------------------------------------
+    # 
+    # 傳統錯誤理解：A 和 B 相位差 180°
+    # 正確理解：A 和 B 的「著地時間」錯開，確保連續支撐
+    # 
+    # 時序說明：
+    # 1. 時刻 0：A組在著地相位（0°），B組在擺動相位末端（接近360°）
+    # 2. B組快速轉完，進入著地相位
+    # 3. A組繼續慢轉，當A組即將離開著地相位時...
+    # 4. B組已經在著地相位中段，可以接手支撐
+    # 5. A組開始快轉（擺動相位）
+    # 6. A組轉完一圈，回到著地相位，此時B組即將開始擺動
+    # 7. 循環...
+    # 
+    # 關鍵：由於 duty_cycle > 0.5，兩組的著地時間有「重疊」！
+    # 重疊時間 = (2 × duty_cycle - 1) × T = (2×0.65-1) × 1s = 0.3s
+    # 這 0.3 秒是「交接期」，兩組都在地面，超級穩定！
+    
+    # tripod_phase_offset: 兩組之間的初始相位差
+    # 這個值影響兩組的「錯開程度」
+    # π (180°) 是一個合理的初始值，但實際行為由 duty cycle 決定
     tripod_phase_offset = math.pi
+    
+    # -------------------------------------------------------------------------
+    # 【給 AI 的相位觀測】
+    # -------------------------------------------------------------------------
+    # AI 需要知道每組腿現在處於什麼相位，才能做出正確的速度決策
+    # 
+    # 我們提供給 AI 的觀測：
+    # 1. 全局步態時鐘相位 (gait_phase): 0 ~ 2π 循環
+    # 2. 每隻腿的當前相位 (leg_phase): 從關節角度計算
+    # 3. 每隻腿是否在「著地區間」的布林值
+    
+    # -------------------------------------------------------------------------
+    # 【速度指令生成邏輯】（在 env.py 中實現）
+    # -------------------------------------------------------------------------
+    # 對於每隻腿：
+    # 1. 計算當前相位角 θ
+    # 2. 判斷是否在著地區間：stance_phase_start ≤ θ < stance_phase_end
+    # 3. 如果在著地區間：目標速度 = base_vel × stance_velocity_ratio
+    # 4. 如果在擺動區間：目標速度 = base_vel × swing_velocity_ratio
+    # 5. AI 可以微調這個速度（±50%），但不能完全停下來
 
-    # ===================
-    # Reward Scales
-    # ===================
-    # These defaults match the actual training behavior. Set a scale to 0.0 to
-    # disable that reward component. All values can be overridden via reward presets
-    # in the training panel without editing this file.
+    # =========================================================================
+    # 【獎勵函數權重】v3.0 - 參考 ETH Zurich ANYmal + UC Berkeley Cassie
+    # =========================================================================
+    #
+    # 核心原則（來自大學實驗室最佳實踐）：
+    # 1. 速度追蹤是唯一的核心目標，權重要遠大於其他所有項
+    # 2. 懲罰項要輕，讓機器人敢於嘗試和探索
+    # 3. 步態獎勵不要太多，會互相衝突導致消極
+    # 4. 使用 curriculum learning：先學會動，再學精確
+    #
+    # =========================================================================
 
-    # --- Locomotion Goals ---
-    rew_scale_forward_vel       = 3.0   # Forward velocity in commanded direction
-    rew_scale_vel_tracking      = 4.0   # Linear XY velocity tracking (exp loss)
-    rew_scale_ang_vel_tracking  = 2.5   # Angular Z velocity tracking (exp loss)
-    rew_scale_vel_tracking2     = 2.0   # Secondary velocity tracking (L2 error)
-    rew_scale_direction_align   = 1.5   # Velocity direction alignment reward
+    # -------------------------------------------------------------------------
+    # G1: 速度追蹤獎勵（核心目標）★★★ 大幅提高！★★★
+    # -------------------------------------------------------------------------
+    # 參考 legged_gym：tracking 獎勵應該是總獎勵的 60-70%
+    # 線速度追蹤（前後 + 左右）
+    rew_scale_track_lin_vel = 15.0  # ★ 從 5.0 提高到 15.0
 
-    # --- Rotation Mode ---
-    rew_scale_rotation_direction = 3.0  # In-place rotation bonus magnitude
-    rew_scale_smooth_rotation    = 0.0  # Smooth rotation (currently disabled)
+    # 角速度追蹤（旋轉）
+    rew_scale_track_ang_vel = 10.0  # ★ 從 4.0 提高到 10.0
 
-    # --- Leg Motion ---
-    rew_scale_rotation_dir      = 0.3   # Per-leg correct rotation direction
-    rew_scale_all_legs          = 0.2   # All legs active reward
-    rew_scale_min_leg_vel       = 0.3   # Slowest-leg speed reward
-    rew_scale_mean_leg_vel      = 0.2   # Mean leg speed reward
+    # 追蹤獎勵的 sigma 參數（控制容錯範圍）
+    # 較大的 sigma 讓機器人更容易獲得獎勵，鼓勵嘗試
+    tracking_sigma = 0.5  # ★ 從 0.25 放大到 0.5（更寬鬆）
 
-    # --- Stability Penalties (negative = punish) ---
-    rew_scale_orientation       = -0.3  # Body tilt penalty
-    rew_scale_base_height       = -0.3  # Base height deviation penalty
-    rew_scale_lin_vel_z         = -0.15 # Vertical bouncing penalty
-    rew_scale_ang_vel_xy        = -0.1  # Roll/pitch angular velocity penalty
+    # -------------------------------------------------------------------------
+    # G2: 姿態穩定性懲罰 ★★★ 大幅降低！★★★
+    # -------------------------------------------------------------------------
+    # 參考 ANYmal：穩定性懲罰應該很輕，讓機器人敢動
+    
+    # Z軸線速度懲罰（不要上下跳）
+    rew_scale_z_vel = -0.5  # ★ 從 -2.0 降低到 -0.5
 
-    # --- Gait Coordination ---
-    rew_scale_gait_coherence    = 0.15  # Tripod phase coherence (within group)
-    rew_scale_gait_phase_offset = 0.1   # Tripod A vs B antiphase reward
-    rew_scale_continuous_support = 0.15 # At-least-one-leg-on-ground reward
+    # XY軸角速度懲罰（不要翻滾）
+    rew_scale_ang_vel_xy = -0.01  # ★ 從 -0.05 降低到 -0.01
 
-    # --- ABAD Control ---
-    rew_scale_abad_action       = 1.0   # ABAD action reward multiplier (1.0 = full)
-    rew_scale_abad_stability    = 1.0   # ABAD stability reward multiplier (1.0 = full)
+    # 姿態懲罰（保持直立）- 完全移除，讓終止條件處理
+    rew_scale_upright = 0.0
 
-    # --- Survival & Smoothness ---
-    rew_scale_alive             = 0.15  # Alive bonus per step
-    rew_scale_action_rate       = -0.02 # Action change rate penalty
-    rew_scale_drive_acc         = 0.0   # Drive acceleration penalty (disabled)
+    # 基座高度懲罰 - 移除，由其他獎勵間接處理
+    rew_scale_base_height = 0.0
+    
+    # 目標身體高度
+    target_base_height = 0.10  # 降低一點，讓機器人更自由
+    target_base_height_forward = 0.12
+    
+    # 高站姿獎勵 - 降低，不要干擾核心追蹤
+    rew_scale_high_stance = 0.5  # ★ 從 2.0 降低到 0.5
 
-    # --- Collision ---
-    rew_scale_collision         = -1.0  # Body collision penalty (not yet wired)
+    # -------------------------------------------------------------------------
+    # G3: 碰撞懲罰 - 保留但不要太重
+    # -------------------------------------------------------------------------
+    rew_scale_body_contact = -2.0  # ★ 從 -5.0 降低到 -2.0
+    terminate_on_body_contact = True
+    body_contact_height_threshold = 0.08
+    body_contact_tilt_threshold = 1.55
+    # Stage1 放寬觸地高度門檻，降低 reset 瞬態造成的誤判
+    stage1_body_contact_height_threshold = 0.06
+    stage_body_contact_height_threshold = [0.050, 0.050, 0.058, 0.060, 0.062]
+    stage_body_contact_tilt_threshold = [1.80, 1.80, 1.72, 1.68, 1.62]
+    stage_fall_height_threshold = [0.085, 0.085, 0.095, 0.082, 0.088]
+    stage_fall_tilt_threshold = [1.80, 1.80, 1.72, 1.72, 1.64]
 
-    # ===================
-    # Termination Conditions
-    # ===================
-    max_tilt_magnitude = 1.5            # 放寬最大傾斜量（允許更多探索）
-    min_base_height = 0.01              # 降低最低高度 (m)
-    max_base_height = 0.8               # 提高最高高度 (m)
+    # -------------------------------------------------------------------------
+    # G4: 能耗與動作平滑懲罰 ★★★ 大幅降低！★★★
+    # -------------------------------------------------------------------------
+    # 參考 Cassie：能耗懲罰應該很輕，避免機器人學會「省力不動」
+    rew_scale_torque = -0.000001  # ★ 降低 10 倍
+    rew_scale_action_rate = -0.01  # ★ 從 -0.05 降低到 -0.01
+    rew_scale_joint_acc = -1e-8  # ★ 降低 25 倍
+    rew_scale_dof_vel = 0.0
+    rew_scale_abad_action_rate = -0.02  # ★ 從 -0.1 降低到 -0.02
 
-    # ===================
-    # Domain Randomization
-    # ===================
-    randomize_mass = True
-    mass_range = [0.9, 1.1]
+    # -------------------------------------------------------------------------
+    # G5: RHex 步態專用獎勵 ★★★ 簡化！太多獎勵會互相衝突 ★★★
+    # -------------------------------------------------------------------------
+    # 參考 RHex 論文：步態獎勵應該簡單，讓機器人自己發現最佳步態
+    
+    # 組內同步（可選，不要太高）
+    rew_scale_tripod_sync = 0.2  # ★ 從 0.5 降低到 0.2
 
-    randomize_friction = True
-    friction_range = [0.5, 1.25]
+    # 連續支撐獎勵 - 保留但降低
+    rew_scale_tripod_support = 0.5  # ★ 從 1.5 降低到 0.5
 
-    randomize_joint_friction = True
+    # 騰空懲罰 - 大幅降低！這會讓機器人不敢抬腿
+    rew_scale_airborne_penalty = -0.5  # ★ 從 -3.0 降低到 -0.5
+
+    # 速度比例正確性 - 降低，讓機器人自由探索
+    rew_scale_duty_cycle_velocity = 0.3  # ★ 從 1.0 降低到 0.3
+
+    # 相位轉換平滑 - 移除，太細節了
+    rew_scale_phase_transition_smooth = 0.0
+
+    # 步態頻率一致性 - 降低
+    rew_scale_gait_frequency = 0.2  # ★ 從 0.5 降低到 0.2
+
+    # 組間交替 - 降低
+    rew_scale_tripod_alternation = 0.2  # ★ 從 0.5 降低到 0.2
+
+    # 舊版反相獎勵（停用）
+    rew_scale_tripod_antiphase = 0.0
+    
+    # -------------------------------------------------------------------------
+    # G6: ABAD 關節使用策略 ★★★ 簡化 ★★★
+    # -------------------------------------------------------------------------
+    # 核心：讓 AI 自己學習何時使用 ABAD，不要過度約束
+    
+    # 直走時 ABAD 歸零獎勵 - 降低，讓 AI 自己決定
+    rew_scale_abad_zero_forward = 0.5  # ★ 從 3.0 降低到 0.5
+    
+    # 斜向移動時獎勵 ABAD 使用 - 降低
+    rew_scale_abad_diagonal_use = 0.5  # ★ 從 2.0 降低到 0.5
+    
+    # ABAD 聰明使用獎勵 - 降低
+    rew_scale_abad_smart_use = 0.3  # ★ 從 1.0 降低到 0.3
+
+    # ABAD 浪費懲罰 - 大幅降低！這會讓機器人怕用 ABAD
+    rew_scale_abad_waste = -0.1  # ★ 從 -0.5 降低到 -0.1
+
+    # -------------------------------------------------------------------------
+    # G6.5: 純側移步態 ★★★ 簡化，核心是速度追蹤 ★★★
+    # -------------------------------------------------------------------------
+    # 關鍵改變：側移的核心獎勵已經在 G1 線速度追蹤中！
+    # 這裡只保留必要的輔助獎勵
+    
+    # 側移步態頻率
+    lateral_gait_frequency = 0.5  # 稍微加快，讓機器人更積極
+    
+    # 側移時主驅動鎖定
+    lateral_lock_main_drive = True
+    lateral_main_drive_target_pos = 0.0
+    
+    # ABAD 交替獎勵 - 降低，讓追蹤獎勵主導
+    rew_scale_abad_alternation = 1.0  # ★ 從 3.0 降低到 1.0
+    
+    # ABAD 幅度獎勵 - 降低
+    rew_scale_abad_amplitude = 1.0  # ★ 從 3.0 降低到 1.0
+    
+    # 抖動懲罰 ★★★ 大幅降低！這會讓機器人完全凍住 ★★★
+    rew_scale_abad_jitter = -1.0  # ★ 從 -15.0 降低到 -1.0
+    
+    # 同步抖動懲罰 - 大幅降低
+    rew_scale_sync_jitter = -2.0  # ★ 從 -20.0 降低到 -2.0
+    
+    # 側移腳離地獎勵 - 降低
+    rew_scale_lateral_lift = 1.0  # ★ 從 3.0 降低到 1.0
+    
+    # 側移時左右交替著地獎勵 - 降低
+    rew_scale_lateral_alternating_stance = 2.0  # ★ 從 5.0 降低到 2.0
+    
+    # 側移最小擺幅閾值 - 降低，讓機器人更容易達成
+    lateral_min_abad_amplitude = 0.1  # ★ 從 0.2 降低到 0.1
+    
+    # 側移步態相位獎勵 - 降低
+    rew_scale_lateral_gait_phase = 0.5  # ★ 從 2.0 降低到 0.5
+    
+    # 側移時主驅動鎖定獎勵 - 降低
+    rew_scale_lateral_drive_lock = 1.0  # ★ 從 3.0 降低到 1.0
+    
+    # 側移低頻獎勵 - 降低
+    rew_scale_lateral_low_freq = 0.5  # ★ 從 2.0 降低到 0.5
+    
+    # 側移正確方向獎勵 ★★★ 保持高，這是核心 ★★★
+    rew_scale_lateral_correct_dir = 8.0  # ★ 從 5.0 提高到 8.0
+
+    # -------------------------------------------------------------------------
+    # G7: 旋轉專用獎勵
+    # -------------------------------------------------------------------------
+    # 旋轉的核心獎勵已經在 G1 角速度追蹤中！
+    # 這裡只保留輔助獎勵
+    
+    # 旋轉時獎勵 ABAD 輔助 - 降低
+    rew_scale_rotation_abad_assist = 0.5  # ★ 從 2.0 降低到 0.5
+    
+    # 旋轉速度不足懲罰 - 大幅降低！會讓機器人不敢動
+    rew_scale_rotation_slow_penalty = -0.5  # ★ 從 -2.0 降低到 -0.5
+    
+    # -------------------------------------------------------------------------
+    # G8: 額外獎勵 ★★★ 新增存活和移動獎勵 ★★★
+    # -------------------------------------------------------------------------
+    # 存活獎勵 - 小正值讓機器人想活久一點
+    rew_scale_alive = 0.5  # ★ 從 0.0 提高到 0.5
+    
+    # ★★★ 新增：移動獎勵（只要腿在轉就給獎勵）★★★
+    # 這是防止消極的關鍵！
+    rew_scale_leg_moving = 2.0  # 新增：獎勵腿轉動
+
+    # 終止懲罰
+    rew_scale_termination = -0.0
+
+    # -------------------------------------------------------------------------
+    # 獎勵裁剪設定
+    # -------------------------------------------------------------------------
+    only_positive_rewards = True
+
+    # -------------------------------------------------------------------------
+    # 舊版變數（為了相容性保留）
+    # -------------------------------------------------------------------------
+    rew_scale_forward_vel = 1.0
+    rew_scale_vel_tracking = 0.5
+    rew_scale_gait_sync = 0.2
+    rew_scale_smooth_rotation = 0.0
+    rew_scale_rotation_direction = 0.5
+    rew_scale_orientation = -0.0
+    rew_scale_lin_vel_z = -2.0
+    rew_scale_abad_action = 0.0
+    rew_scale_abad_stability = 0.1
+    rew_scale_drive_acc = 0.0
+    rew_scale_collision = -1.0
+
+    # =========================================================================
+    # 【終止條件】定義什麼情況下結束這一回合
+    # =========================================================================
+    # 當機器人狀態太糟糕時，與其繼續浪費時間，不如重新開始
+    
+    # 最大傾斜角度（弧度）
+    # 超過這個角度就視為「翻倒」，結束回合
+    # 收斂到可控範圍，避免「翻倒但不終止」污染訓練資料
+    max_tilt_magnitude = 1.55
+    stage_max_tilt_magnitude = [1.82, 1.82, 1.72, 1.72, 1.64]
+    
+    # 最低高度（公尺）
+    # 機身低於這個高度就視為「趴下」，結束回合
+    # 低於此高度視為機身接地或明顯失衡
+    min_base_height = 0.06
+    # Stage1 進一步放寬，先學會穩定行走再逐步收緊
+    stage1_min_base_height = 0.03
+    stage_min_base_height = [0.02, 0.02, 0.035, 0.04, 0.045]
+    
+    # 最高高度（公尺）
+    # 機身高於這個高度就視為「異常」（可能是 bug），結束回合
+    max_base_height = 0.8
+    
+    # Reset 後前幾步給保護期，避免剛落地瞬態造成「一出生即死亡」
+    termination_grace_steps = 20
+    stage1_termination_grace_steps = 120
+    stage_termination_grace_steps = [140, 160, 150, 180, 140]
+
+    # =========================================================================
+    # 【領域隨機化】讓訓練更強健
+    # =========================================================================
+    # 
+    # 【什麼是領域隨機化？】
+    # 在訓練時故意加入各種隨機變化，讓 AI 見過各種情況
+    # 這樣訓練出來的 AI 更能適應真實世界的不確定性
+    # 
+    # 就像訓練一個廚師：
+    # - 如果只在同一個廚房練習 → 換個廚房就不會做了
+    # - 如果在各種不同的廚房練習 → 到哪都能做菜
+    
+    # -------------------------------------------------------------------------
+    # Domain randomization 主開關
+    # -------------------------------------------------------------------------
+    domain_randomization_enable = True
+
+    # 質量/摩擦隨機化（優先嘗試物理層；不支援時自動退回控制層 proxy）
+    dr_try_physical_material_randomization = False
+    dr_randomize_mass = True
+    dr_mass_range = [0.90, 1.10]
+    dr_randomize_friction = True
+    dr_friction_range = [0.50, 1.25]
+
+    # 致動器強度隨機化（直接作用於控制目標）
+    dr_randomize_actuator_strength = True
+    dr_main_actuator_strength_range = [0.85, 1.15]
+    dr_abad_actuator_strength_range = [0.85, 1.15]
+
+    # 腿級故障/降級隨機化：模擬齒輪退化、電壓不足、單腿受損
+    dr_fault_enable = True
+    dr_fault_probability = 0.12
+    dr_fault_strength_range = [0.15, 0.60]
+    dr_fault_max_legs = 1
+    dr_fault_apply_to_abad = True
+
+    # 觀測延遲與噪音
+    dr_obs_latency_enable = True
+    dr_obs_latency_steps_range = [0, 2]
+    dr_obs_noise_enable = True
+    dr_obs_noise_bias_enable = False
+
+    # 隨機推擠（episode 內）
+    dr_push_enable = True
+    dr_push_interval_s = 12.0
+    dr_push_probability = 0.5
+    dr_push_max_vel_xy = 0.6
+    dr_push_max_vel_z = 0.0
+
+    # 地形課程（若 terrain generator 可用，隨 stage 遞進）
+    terrain_curriculum_enable = True
+    terrain_curriculum_levels = [0.0, 0.08, 0.20, 0.35, 0.55]  # flat -> mild -> medium -> rough
+    stage_push_probability_scale = [0.0, 0.2, 0.4, 0.7, 1.0]
+    stage_fault_probability_scale = [0.0, 0.0, 0.35, 0.70, 1.0]
+
+    # -------------------------------------------------------------------------
+    # 舊版參數別名（向後相容）
+    # -------------------------------------------------------------------------
+    randomize_mass = dr_randomize_mass
+    mass_range = dr_mass_range
+    randomize_friction = dr_randomize_friction
+    friction_range = dr_friction_range
+    randomize_joint_friction = False
     joint_friction_range = [0.0, 0.05]
+    push_robots = dr_push_enable
+    push_interval_s = dr_push_interval_s
+    max_push_vel_xy = dr_push_max_vel_xy
 
-    push_robots = True
-    push_interval_s = 15.0
-    max_push_vel_xy = 0.5
+    # =========================================================================
+    # 【觀測噪音】模擬真實感測器的誤差
+    # =========================================================================
+    # 真實世界的感測器都有誤差，訓練時加入噪音讓 AI 更能適應
+    
+    add_noise = True             # 啟用噪音
+    noise_level = 1.0            # 噪音強度倍數
 
-    # ===================
-    # Noise Settings
-    # ===================
+    # 各種觀測值的噪音大小
+    noise_lin_vel = 0.1          # 線速度噪音
+    noise_ang_vel = 0.2          # 角速度噪音
+    noise_gravity = 0.05         # 重力方向噪音
+    noise_joint_pos = 0.01       # 關節位置噪音
+    noise_joint_vel = 1.5        # 關節速度噪音
+
+    # =========================================================================
+    # 【簡化獎勵配置】★★★ 推薦使用 ★★★
+    # =========================================================================
+    #
+    # 核心原則：只保留 8 項獎勵，讓 AI 自己發現最佳策略
+    # 
+    # 優點：
+    # 1. 避免 50+ 獎勵互相衝突
+    # 2. 減少 reward hacking 機會
+    # 3. Ablation 測試更容易
+    # 4. 訓練更穩定
+    #
+    # =========================================================================
+
+    # 啟用簡化模式（設為 True 後只使用 8 項核心獎勵）
+    use_simplified_rewards = True
+
+    # Ablation 測試開關：每項都可獨立開關，方便逐項測試
+    ablation_flags = {
+        # ★ 核心目標獎勵 ★
+        "track_lin_vel": True,    # 線速度追蹤（最重要！）
+        "track_ang_vel": True,    # 角速度追蹤
+        
+        # ★ 穩定性獎勵 ★
+        "tripod_support": True,   # 確保至少一組 Tripod 著地
+        "body_contact": True,     # 摔倒懲罰
+        
+        # ★ 平滑性獎勵 ★
+        "action_rate": True,      # 動作平滑
+        "torque": True,           # 能耗懲罰
+        
+        # ★ 防消極獎勵 ★
+        "alive": True,            # 存活獎勵
+        "leg_moving": True,       # 腿轉動獎勵
+    }
+
+    # 簡化模式的獎勵權重 v4.0（命令感知獎勵）
+    # 設計原則：不同命令（前進/側移/旋轉/斜向）要有明確分流，不允許「直走偷分」
+    v2_reward_scales = {
+        # 核心追蹤（以穩定版為基礎）
+        "forward_progress": 5.0,
+        "velocity_tracking": 4.0,
+        "mode_specialization": 2.5,
+        "axis_suppression": 1.5,
+        "lateral_drive_soft_penalty": 1.5,
+
+        # 側移/斜向補充 shaping（保守提高，不過度干擾前進）
+        "lateral_speed_deficit_penalty": 2.6,
+        "lateral_speed_target_ratio": 0.70,
+        "lateral_speed_bonus": 2.0,
+        "diag_sign_bonus": 1.2,
+        "diag_wrong_sign_penalty": 1.8,
+        "diag_speed_bonus": 1.8,
+
+        # Forward gait prior
+        "forward_prior_coherence": 1.2,
+        "forward_prior_antiphase": 1.2,
+        "forward_prior_duty": 0.9,
+        "forward_prior_vel_ratio": 0.9,
+        "forward_prior_overlap": 0.7,
+
+        # 穩定與探索
+        "height_maintain": 0.8,
+        "target_base_height": 0.12,
+        "height_sigma": 0.08,
+        "height_low_penalty": 1.2,
+        "leg_moving": 0.5,
+
+        # 負向懲罰
+        "stall_penalty": -2.0,
+        "action_smooth": -0.01,
+        "fall": -8.0,
+        "fall_height_threshold": 0.08,
+        "fall_tilt_threshold": 1.70,
+        "fall_roll_threshold": 1.30,
+        "fall_pitch_threshold": 1.30,
+
+        # Yaw 穩定專項（回到穩定版量級）
+        "yaw_mode_track_bonus": 2.0,
+        "yaw_spin_bonus": 1.6,
+        "yaw_roll_pitch_penalty": 3.0,
+        "yaw_height_penalty": 1.5,
+        "yaw_target_base_height": 0.12,
+        "yaw_slip_penalty": 1.3,
+        "yaw_slip_cap": 2.0,
+        "yaw_cheat_penalty": 4.0,
+        "yaw_cheat_min_wz": 0.4,
+        "yaw_cheat_tilt_thresh": 0.30,
+
+        # 追蹤曲線寬度
+        "lin_tracking_sigma": 0.30,
+        "yaw_tracking_sigma": 0.35,
+
+        # =====================================================================
+        # 節能 reward（Energy-aware rewards）
+        # 設計原則：reward 只看「馬達能耗 / 有效位移」這個最終結果，
+        #          不直接把 spring 吸能/釋能 proxy 寫進 reward。
+        #          若彈簧腳真的有優勢，policy 會自然學出更低的單位位移能耗。
+        # =====================================================================
+        # E1: 單位有效位移能耗 — 每推進一段距離所需的馬達能耗越低越好
+        #     step-wise 形式下：(|τ*ω| * dt) / (progress * dt) = |τ*ω| / progress
+        "power_efficiency": 0.3,
+        "power_efficiency_eps": 0.1,       # 位移/進度分母的 ε，防除零
+        "power_efficiency_tanh_scale": 500.0,
+
+        # E2: 力矩平方懲罰（很輕，只防極端）
+        "torque_penalty": -0.0001,
+        "torque_penalty_abad_weight": 0.5, # ABAD 力矩懲罰的相對權重
+    }
+
+    # =========================================================================
+    # 【彈簧/阻尼器物理常數】用於節能 reward 計算
+    # =========================================================================
+    # 這些值必須與 REDRHEX_CFG.actuators["damper"] 的設定一致
+    damper_stiffness = 200.0    # N·m/rad — 扭轉彈簧剛度
+    damper_damping = 20.0       # N·m·s/rad — 阻尼係數
+    robot_mass_kg = 14.0        # 整機質量（用於 CoT 計算）
+    energy_velocity_yaw_radius = 0.18  # m，將 yaw rate 換算成等效線速度
+    energy_min_command_motion = 0.05   # m/s，低於此值不啟用位移型節能 reward（例如 pure yaw）
+    main_drive_torque_estimate_damping = 50.0
+    main_drive_torque_estimate_limit = 100.0
+    abad_torque_estimate_stiffness = 40.0
+    abad_torque_estimate_damping = 4.0
+    abad_torque_estimate_limit = 8.0
+
+
+@configclass
+class RedrhexForwardFastEnvCfg(RedrhexEnvCfg):
+    """Forward-only fast setup that stays close to the proven stage-1 behavior."""
+
+    # Keep rollout bounded for faster iteration while preserving stage-1 stability.
+    episode_length_s = 30
+    draw_debug_vis = False
+
+    # Force single-skill training path.
+    curriculum_enable = True
+    curriculum_auto_progress = False
+    stage = 1
+    # Reuse stage-1 low-randomization regime from the full curriculum.
+    curriculum_stage_scales = [0.05]
+
+    # Forward-only command distribution.
+    use_discrete_directions = False
+    lin_vel_x_range = [0.22, 0.42]
+    lin_vel_y_range = [0.0, 0.0]
+    ang_vel_z_range = [0.0, 0.0]
+    command_resample_on_timer = False
+    command_resample_time = 6.0
+    stage1_use_discrete_directions = False
+    stage1_forward_vx_range = [0.22, 0.42]
+    stage1_discrete_directions = [
+        [0.35, 0.0, 0.0],
+        [0.42, 0.0, 0.0],
+    ]
+
+    # Keep controller close to the previously successful stage-1 defaults.
+    main_drive_vel_scale = 8.0
+    forward_phase_lock_gain = 1.2
+    forward_drive_action_scale = 0.35
+    main_drive_residual_scale = 0.22
+    forward_residual_cap_ratio = 0.22
+    stage_drive_vel_scale = [8.0]
+    stage_main_drive_residual_scale = [0.10]
+    stage_forward_bias_scale = [1.00]
+    stage_forward_policy_drive_residual_scale = [0.10]
+    stage_forward_residual_cap_ratio = [0.26]
+    stage_action_warmup_steps = [30]
+    stage_forward_reward_multiplier = [1.20]
+    stage_forward_gait_reward_multiplier = [1.45]
+    stage_lateral_reward_multiplier = [0.0]
+    stage_diag_reward_multiplier = [0.0]
+    stage_yaw_reward_multiplier = [0.0]
+
+    # Moderate DR: keep sim-to-real robustness, but don't overburden fast training.
+    domain_randomization_enable = True
+    dr_try_physical_material_randomization = False
+    dr_randomize_mass = True
+    dr_mass_range = [0.97, 1.03]
+    dr_randomize_friction = True
+    dr_friction_range = [0.90, 1.10]
+    dr_randomize_actuator_strength = True
+    dr_main_actuator_strength_range = [0.95, 1.05]
+    dr_abad_actuator_strength_range = [0.95, 1.05]
+    dr_fault_enable = False
+    dr_obs_latency_enable = False
+    dr_obs_latency_steps_range = [0, 0]
+    dr_obs_noise_enable = True
+    dr_push_enable = False
+    terrain_curriculum_enable = False
+    stage_push_probability_scale = [0.0]
+
     add_noise = True
-    noise_level = 1.0
+    noise_level = 0.8
+    noise_lin_vel = 0.03
+    noise_ang_vel = 0.06
+    noise_gravity = 0.02
+    noise_joint_pos = 0.005
+    noise_joint_vel = 0.4
 
-    noise_lin_vel = 0.1
-    noise_ang_vel = 0.2
-    noise_gravity = 0.05
-    noise_joint_pos = 0.01
-    noise_joint_vel = 1.5
+    # Termination thresholds: aligned to stable stage-1 behavior (less premature resets).
+    max_tilt_magnitude = 1.55
+    stage_max_tilt_magnitude = [1.82]
+    min_base_height = 0.06
+    stage1_min_base_height = 0.03
+    stage_min_base_height = [0.03]
+    body_contact_height_threshold = 0.08
+    stage1_body_contact_height_threshold = 0.06
+    stage_body_contact_height_threshold = [0.06]
+    body_contact_tilt_threshold = 1.55
+    stage_body_contact_tilt_threshold = [1.80]
+    stage_fall_height_threshold = [0.085]
+    stage_fall_tilt_threshold = [1.80]
+    termination_grace_steps = 20
+    stage1_termination_grace_steps = 120
+    stage_termination_grace_steps = [120]
+    gate_positive_rewards_when_unhealthy = False
+    reward_gate_min_base_height = 0.105
+    reward_gate_max_body_tilt = 0.70
+
+    # Stage-1-like rewards with slight forward emphasis for faster convergence.
+    v2_reward_scales = {
+        "forward_progress": 5.5,
+        "velocity_tracking": 4.5,
+        "mode_specialization": 0.0,
+        "axis_suppression": 1.3,
+        "lateral_drive_soft_penalty": 0.0,
+        "lateral_speed_deficit_penalty": 0.0,
+        "lateral_speed_target_ratio": 0.70,
+        "lateral_speed_bonus": 0.0,
+        "diag_sign_bonus": 0.0,
+        "diag_wrong_sign_penalty": 0.0,
+        "diag_speed_bonus": 0.0,
+        "forward_prior_coherence": 1.2,
+        "forward_prior_antiphase": 1.2,
+        "forward_prior_duty": 0.9,
+        "forward_prior_vel_ratio": 0.9,
+        "forward_prior_overlap": 0.7,
+        "height_maintain": 0.9,
+        "target_base_height": 0.12,
+        "height_sigma": 0.08,
+        "height_low_penalty": 1.2,
+        "leg_moving": 0.35,
+        "stall_penalty": -2.5,
+        "action_smooth": -0.015,
+        "fall": -8.0,
+        "fall_height_threshold": 0.085,
+        "fall_tilt_threshold": 1.70,
+        "fall_roll_threshold": 1.30,
+        "fall_pitch_threshold": 1.30,
+        "yaw_mode_track_bonus": 0.0,
+        "yaw_spin_bonus": 0.0,
+        "yaw_roll_pitch_penalty": 0.0,
+        "yaw_height_penalty": 0.0,
+        "yaw_target_base_height": 0.12,
+        "yaw_slip_penalty": 0.0,
+        "yaw_slip_cap": 2.0,
+        "yaw_cheat_penalty": 0.0,
+        "yaw_cheat_min_wz": 0.4,
+        "yaw_cheat_tilt_thresh": 0.30,
+        "lin_tracking_sigma": 0.30,
+        "yaw_tracking_sigma": 0.35,
+        # 節能 reward — ForwardFast 先用低權重，穩定後再調高
+        "power_efficiency": 0.15,
+        "power_efficiency_eps": 0.1,
+        "power_efficiency_tanh_scale": 500.0,
+        "torque_penalty": -0.00005,
+        "torque_penalty_abad_weight": 0.5,
+    }

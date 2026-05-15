@@ -33,6 +33,24 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--store_code_state",
+    action="store_true",
+    default=False,
+    help="Store git code-state snapshots in the run folder (disabled by default to avoid unicode git-diff errors).",
+)
+parser.add_argument(
+    "--resume_policy_only",
+    action="store_true",
+    default=False,
+    help="Resume from checkpoint weights only (skip optimizer state and reset learning iteration).",
+)
+parser.add_argument(
+    "--reset_action_std",
+    type=float,
+    default=None,
+    help="Optional action std reset value after loading checkpoint (useful with --resume_policy_only).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -214,13 +232,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    # write git state to logs
-    runner.add_git_repo_to_log(__file__)
+    # write git state to logs (opt-in; some repos contain non-UTF8 filenames that can crash logging)
+    if args_cli.store_code_state:
+        runner.add_git_repo_to_log(__file__)
+    else:
+        runner.git_status_repos = []
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+        if args_cli.resume_policy_only:
+            runner.load(resume_path, load_optimizer=False)
+            runner.current_learning_iteration = 0
+            print("[INFO]: Resume mode = policy-only (optimizer state skipped, iteration reset to 0).")
+            if args_cli.reset_action_std is not None:
+                target_std = max(float(args_cli.reset_action_std), 1e-4)
+                policy_module = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
+                with torch.no_grad():
+                    if hasattr(policy_module, "std"):
+                        policy_module.std.fill_(target_std)
+                        print(f"[INFO]: Reset action std (std) to {target_std:.4f}")
+                    elif hasattr(policy_module, "log_std"):
+                        log_target_std = torch.log(
+                            torch.tensor(target_std, device=policy_module.log_std.device, dtype=policy_module.log_std.dtype)
+                        )
+                        policy_module.log_std.fill_(log_target_std)
+                        print(f"[INFO]: Reset action std (log_std) to log({target_std:.4f})")
+        else:
+            # load previously trained model + optimizer state
+            runner.load(resume_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
