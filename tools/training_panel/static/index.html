@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RedRHex Training Panel</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">R</span>
+        <div>
+          <strong>RedRHex</strong>
+          <span>Training Panel</span>
+        </div>
+      </div>
+      <nav>
+        <button class="nav-button active" data-view="train">Train</button>
+        <button class="nav-button" data-view="rewards">Rewards</button>
+        <button class="nav-button" data-view="history">History</button>
+        <button class="nav-button" data-view="access">Access</button>
+      </nav>
+      <div class="sidebar-release">
+        <span class="release-version">Version 1.0</span>
+        <span>Published by BioRoLa ABAD RHex Team</span>
+        <span>Credits: Jason Liao and Jacob Yang</span>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Train</h1>
+          <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
+        </div>
+        <div class="topbar-actions">
+          <span class="release-chip">Training Panel V1.0</span>
+          <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
+          <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section id="train" class="view active">
+        <form id="train-form" class="panel-grid">
+          <label>
+            Task
+            <input name="task" value="Template-Redrhex-Direct-v0" />
+          </label>
+          <label>
+            Environments
+            <input name="num_envs" type="number" min="1" max="8192" value="4" />
+          </label>
+          <label>
+            Iterations
+            <input name="max_iterations" type="number" min="1" value="1" />
+          </label>
+          <label>
+            Device
+            <input name="device" value="cuda:0" />
+          </label>
+          <label>
+            Seed
+            <input name="seed" type="number" placeholder="optional" />
+          </label>
+          <label>
+            Resume Checkpoint
+            <input name="checkpoint" readonly placeholder="Select Resume on a history run" />
+          </label>
+          <label class="check-row">
+            <input name="headless" type="checkbox" checked />
+            Headless
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="primary-button">Start Training</button>
+            <button type="button" id="smoke-button" class="ghost-button">Use Smoke Defaults</button>
+            <button type="button" id="debug-button" class="ghost-button">Use Debug Defaults</button>
+            <button type="button" id="clear-resume" class="ghost-button">Clear Resume</button>
+          </div>
+          <div class="preset-indicator">
+            <span>Reward Preset:</span>
+            <strong id="train-active-preset-name">baseline</strong>
+            <button type="button" id="train-change-preset" class="ghost-button small-button">Change</button>
+          </div>
+        </form>
+        <div id="train-status" class="status-line"></div>
+      </section>
+
+      <section id="rewards" class="view">
+        <!-- Preset selector -->
+        <div class="preset-section">
+          <div class="preset-section-head">
+            <h2>Reward Presets</h2>
+            <p class="muted-copy">
+              Pick a preset to configure reward weights before training.
+              Built-in presets are read-only — duplicate to create a custom version.
+              The active preset (marked ●) is used when you click Start Training.
+            </p>
+          </div>
+          <div id="preset-list" class="preset-list"></div>
+          <div class="form-actions compact-actions">
+            <button id="new-preset-btn" type="button" class="ghost-button small-button">+ New Preset</button>
+          </div>
+        </div>
+
+        <!-- Reward scale editor -->
+        <div class="reward-editor-section">
+          <div class="reward-editor-header">
+            <div>
+              <h2 id="reward-editor-title">Select a preset above</h2>
+              <p id="reward-editor-desc" class="muted-copy"></p>
+            </div>
+            <div class="reward-editor-actions form-actions">
+              <span id="preset-builtin-badge" class="status-badge muted-pill" hidden>Built-in</span>
+              <button id="preset-activate-btn" type="button" class="ghost-button" disabled>Use for Training</button>
+              <button id="preset-duplicate-btn" type="button" class="ghost-button" disabled>Duplicate</button>
+              <button id="preset-delete-btn" type="button" class="danger-button" disabled>Delete</button>
+              <button id="preset-save-btn" type="button" class="primary-button" disabled>Save Changes</button>
+            </div>
+          </div>
+          <div id="reward-categories" class="reward-categories"></div>
+        </div>
+
+        <!-- Reference files (collapsible) -->
+        <details class="reference-section">
+          <summary>Reference Files &amp; Raw Scale Values</summary>
+          <div class="split" style="margin-top:12px">
+            <div>
+              <h2>Tweakable Files</h2>
+              <div id="tweak-files" class="card-list"></div>
+            </div>
+            <div>
+              <h2>All Reward Scale Values</h2>
+              <div id="reward-scales" class="scale-list"></div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section id="history" class="view">
+        <div class="history-layout">
+          <nav id="folder-sidebar" class="folder-sidebar"></nav>
+          <div class="run-list-col">
+            <div class="history-toolbar">
+              <input id="run-search" type="search" placeholder="Search runs…" autocomplete="off" />
+              <select id="status-filter">
+                <option value="">All statuses</option>
+                <option value="completed">Completed</option>
+                <option value="running">Running</option>
+                <option value="failed">Failed</option>
+                <option value="interrupted">Interrupted</option>
+              </select>
+              <select id="sort-runs">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="status">Status (A–Z)</option>
+                <option value="iters-desc">Most iterations</option>
+                <option value="duration-asc">Shortest first</option>
+              </select>
+              <span id="run-count-badge" class="status-badge muted-pill"></span>
+            </div>
+            <div class="bulk-toolbar">
+              <span id="bulk-selected-count" class="status-badge muted-pill">0 selected</span>
+              <button type="button" id="select-visible-runs" class="ghost-button small-button" data-tooltip="Select visible runs">Select visible</button>
+              <button type="button" id="clear-selected-runs" class="ghost-button small-button" data-tooltip="Clear selection">Clear</button>
+              <div class="bulk-move-group">
+                <select id="bulk-folder-select" aria-label="Folder for selected runs">
+                  <option value="">— Uncategorized —</option>
+                </select>
+                <button type="button" id="move-selected-runs" class="primary-button small-button" data-tooltip="Move selected runs">Move selected</button>
+              </div>
+            </div>
+            <div id="runs" class="run-list"></div>
+          </div><!-- /run-list-col -->
+          <div class="details-panel-wrap">
+          <div class="details-panel">
+
+            <!-- ── Run Header ── -->
+            <div class="run-detail-header">
+              <div>
+                <h2 id="details-title">Run Details</h2>
+                <p id="details-subtitle" class="muted-copy">Select a run from the list to view details.</p>
+              </div>
+            </div>
+
+            <!-- ── Quick Actions (same buttons as card, one place) ── -->
+            <div class="section-header"><h3>Actions</h3></div>
+            <div class="run-actions-panel">
+              <button type="button" id="play-run" class="ghost-button" data-tooltip="Run the checkpoint in Isaac Sim for visualization (no training)">Play</button>
+              <button type="button" id="tensorboard-run" class="ghost-button" data-tooltip="Open TensorBoard to visualize training metrics and reward curves">TensorBoard</button>
+              <button type="button" id="resume-run" class="ghost-button" data-tooltip="Start a new training run resuming from this checkpoint">Resume to Train</button>
+              <button type="button" id="open-run-folder" class="ghost-button" data-tooltip="Open the training log folder in the file manager (local only)">Open Folder</button>
+              <button type="button" id="delete-run" class="danger-button" data-tooltip="Permanently delete this run entry and its log files from disk">Delete</button>
+            </div>
+            <div id="run-info-block" style="display:none">
+              <div class="section-header"><h3>Run Info</h3></div>
+              <div id="run-info-grid" class="run-info-grid"></div>
+            </div>
+
+            <!-- ── Rename ── -->
+            <div class="section-header"><h3>Display Name</h3></div>
+            <div class="form-actions compact-actions" style="gap:8px">
+              <input id="run-name" placeholder="Rename this run…" style="flex:1;min-width:0" />
+              <button type="button" id="save-name" class="primary-button small-button" data-tooltip="Save the display name for this run">Save</button>
+            </div>
+
+            <!-- ── Folder (populated by Module 3) ── -->
+            <div class="section-header"><h3>Folder</h3></div>
+            <div class="form-actions compact-actions" style="gap:8px">
+              <select id="run-folder-select" style="flex:1;min-width:0;padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--surface);color:var(--text);font:inherit">
+                <option value="">— Uncategorized —</option>
+              </select>
+            </div>
+
+            <!-- ── Notes ── -->
+            <div class="section-header"><h3>Notes</h3></div>
+            <textarea id="notes-editor" placeholder="Add observations, hyperparameter rationale, or results…"></textarea>
+            <div class="form-actions compact-actions">
+              <button type="button" id="save-notes" class="primary-button small-button" data-tooltip="Save your notes for this run">Save Notes</button>
+            </div>
+
+            <!-- ── Reward Config (Module D) ── -->
+            <section id="reward-config-panel" class="reward-config-panel" hidden>
+              <div class="section-header"><h3>Reward Config</h3></div>
+              <div id="reward-config-content"></div>
+            </section>
+
+            <!-- ── Video ── -->
+            <section id="video-panel" class="video-panel" hidden>
+              <div class="section-header">
+                <h3>Recorded Video</h3>
+                <span id="video-state" class="status-badge muted-pill">No Video</span>
+              </div>
+              <div class="form-actions compact-actions" style="margin-bottom:10px">
+                <button type="button" id="record-video" class="primary-button small-button" data-tooltip="Run the checkpoint headlessly and save a video file">Record Video</button>
+                <button type="button" id="stop-recording" class="ghost-button small-button" hidden data-tooltip="Stop the video recording process">Stop Recording</button>
+                <button type="button" id="open-video-folder" class="ghost-button small-button" hidden data-tooltip="Open the folder containing recorded videos (local only)">Open Folder</button>
+                <button type="button" id="copy-video-path" class="ghost-button small-button" hidden data-tooltip="Copy the video file path to clipboard">Copy Path</button>
+              </div>
+              <video id="result-video" controls preload="metadata"></video>
+              <p id="video-message" class="muted-copy"></p>
+            </section>
+
+            <!-- ── Process Console ── -->
+            <div class="section-header debug-heading">
+              <h3>Process Console</h3>
+              <span id="debug-live" class="status-badge muted-pill">Idle</span>
+            </div>
+            <div class="form-actions compact-actions">
+              <button type="button" id="debug-refresh" class="ghost-button small-button" data-tooltip="Refresh output">Refresh</button>
+              <button type="button" id="copy-debug" class="ghost-button small-button" data-tooltip="Copy console output">Copy Output</button>
+              <button type="button" id="copy-attach" class="ghost-button small-button" hidden data-tooltip="Copy tmux attach command">Copy Attach</button>
+              <button type="button" id="terminal-view" class="ghost-button small-button" data-tooltip="Pop out console">Pop Out</button>
+              <button type="button" id="open-process-log-folder" class="ghost-button small-button" data-tooltip="Open the folder containing process log files (local only)">Log Folder</button>
+              <button type="button" id="stop-process" class="ghost-button small-button" data-tooltip="Stop selected console process">Stop Process</button>
+            </div>
+            <div id="debug-status" class="debug-status"></div>
+            <pre id="debug-command"></pre>
+            <pre id="debug-log"></pre>
+            <div id="notes-status" class="status-line"></div>
+          </div>
+          </div><!-- /details-panel-wrap -->
+        </div>
+      </section>
+
+      <section id="access" class="view">
+        <div class="access-grid">
+          <article>
+            <h2>Local</h2>
+            <code>python -m tools.training_panel --host 127.0.0.1 --port 8080</code>
+          </article>
+          <article>
+            <h2>LAN</h2>
+            <code>python -m tools.training_panel --host 0.0.0.0 --port 8080</code>
+          </article>
+          <article>
+            <h2>SSH Tunnel</h2>
+            <code>ssh -L 8080:127.0.0.1:8080 user@host</code>
+          </article>
+        </div>
+        <pre id="system-info"></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

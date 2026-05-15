@@ -1,411 +1,405 @@
-# RedRhex 訓練指令大全
+# RedRHex 新 Ubuntu 操作指令
 
-## 專案根目錄
-```
-/home/jasonliao/RedRhex/RedRhex
-```
+更新日期：2026-04-25
 
-## 目錄
-- [重要檔案位置](#重要檔案位置)
-- [環境設置](#環境設置)
-- [訓練指令](#訓練指令)
-- [播放/測試指令](#播放測試指令)
-- [TensorBoard 監控](#tensorboard-監控)
-- [Git 版本控制](#git-版本控制)
-- [常用參數說明](#常用參數說明)
-- [完整範例](#完整範例)
+這份文件記錄這台 Ubuntu 上 RedRHex + Isaac Sim + Isaac Lab 的實際操作流程。這台機器的路徑和舊電腦不同，請以本文件為準。
 
----
+## 1. 這台機器的固定路徑
 
-## 重要檔案位置
+| 項目 | 路徑 / 名稱 |
+|---|---|
+| RedRHex repo | `/home/lab_user1/Py/RedRHex` |
+| Isaac Lab | `/home/lab_user1/isaac_lab_ws/IsaacLab` |
+| Isaac Lab launcher | `/home/lab_user1/isaac_lab_ws/IsaacLab/isaaclab.sh` |
+| Isaac Sim | `/home/lab_user1/isaacsim` |
+| 正確 conda env | `env_isaaclab_bin` |
+| 不要用的 env | `base`, `env_isaaclab` |
+| 任務名稱 | `Template-Redrhex-Direct-v0` |
+| RSL-RL train script | `scripts/rsl_rl/train.py` |
+| RSL-RL play script | `scripts/rsl_rl/play.py` |
+| 訓練輸出 | `logs/rsl_rl/redrhex_wheg/<timestamp>_wheg_locomotion/` |
 
-### 核心程式碼
-| 檔案 | 路徑 | 說明 |
-|------|------|------|
-| 環境定義 | `/home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py` | 獎勵函數、動作應用、觀測 |
-| 環境配置 | `/home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py` | 超參數、機器人配置 |
-| 訓練腳本 | `/home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/train.py` | 啟動訓練 |
-| 播放腳本 | `/home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/play.py` | 測試模型 |
-| CLI 參數 | `/home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/cli_args.py` | 命令行參數定義 |
+目前版本：
 
-### 訓練輸出
-| 檔案類型 | 路徑 | 說明 |
-|----------|------|------|
-| 訓練日誌目錄 | `/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/` | 所有訓練記錄 |
-| 模型檔案 | `/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_*/YYYY-MM-DD_HH-MM-SS_*/model_*.pt` | 保存的模型權重 |
-| TensorBoard 日誌 | `/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_*/YYYY-MM-DD_HH-MM-SS_*/events.*` | 訓練曲線數據 |
-| Hydra 輸出 | `/home/jasonliao/RedRhex/RedRhex/outputs/YYYY-MM-DD/HH-MM-SS/` | 配置快照 |
+- Isaac Lab repo version: `2.3.2`
+- Isaac Sim version: `5.1.0-rc.19`
+- Python env: `/home/lab_user1/miniconda3/envs/env_isaaclab_bin`
+- GPU: NVIDIA GeForce RTX 5080, 16 GB VRAM
 
-### 機器人資源
-| 檔案 | 路徑 | 說明 |
-|------|------|------|
-| URDF/USD 模型 | `/home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/assets/` | 機器人 3D 模型 |
-| 機器人配置 | `/home/jasonliao/RedRhex/RedRhex/source/RedRhex/config/` | 機器人參數配置 |
+## 2. 每次開新終端機先做這段
 
-### 文檔
-| 檔案 | 路徑 | 說明 |
-|------|------|------|
-| 本指令文檔 | `/home/jasonliao/RedRhex/RedRhex/docs/COMMANDS.md` | 訓練指令大全 |
-| 專案說明 | `/home/jasonliao/RedRhex/RedRhex/README.md` | 專案介紹 |
-| RedRhex 說明 | `/home/jasonliao/RedRhex/RedRhex/README_REDRHEX.md` | RedRhex 專案說明 |
-
----
-
-## 環境設置
-
-### 啟動 Conda 虛擬環境
 ```bash
-conda activate env_isaaclab
+export REDRHEX_ROOT=/home/lab_user1/Py/RedRHex
+export ISAACLAB_ROOT=/home/lab_user1/isaac_lab_ws/IsaacLab
+export ISAACSIM_ROOT=/home/lab_user1/isaacsim
+
+source /home/lab_user1/miniconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab_bin
+
+# 有些非互動終端會出現 "tabs: terminal type 'dumb' cannot reset tabs"，加這行可避免。
+export TERM=xterm
+
+cd "$REDRHEX_ROOT"
 ```
 
-### 退出虛擬環境
+重點：請從 RedRHex repo 根目錄執行 train/play。這樣 log 會存在 `RedRHex/logs/...`，不會跑去 IsaacLab repo 裡。
+
+## 3. 第一次 setup 或換機器後要做
+
+### 3.1 安裝 RedRHex package
+
 ```bash
-conda deactivate
+cd /home/lab_user1/Py/RedRHex
+python -m pip install -e source/RedRhex
 ```
 
-### 查看已安裝的環境
+這一步會讓 `import RedRhex.tasks` 成功，Isaac Lab 才能註冊 `Template-Redrhex-Direct-v0`。
+
+### 3.2 安裝並拉 Git LFS 資源
+
+這個 repo 的 `RedRhex.usd`、產生出的 robot USD、以及 STL mesh 資源走 Git LFS。若沒有拉 LFS，檔案會只有 pointer 內容，Isaac Sim 會打不開。
+
 ```bash
-conda env list
+conda install -n env_isaaclab_bin -c conda-forge git-lfs -y
+conda activate env_isaaclab_bin
+
+cd /home/lab_user1/Py/RedRHex
+git lfs install --local
+git lfs pull
 ```
 
-### 安裝專案依賴（首次設置）
+確認 `RedRhex.usd` 和 repo-local robot USD 是真檔案：
+
 ```bash
-cd /home/jasonliao/RedRhex/RedRhex
-pip install -e source/RedRhex
+ls -lh RedRhex.usd
+file RedRhex.usd
+ls -lh test_7_description/test_7_description/urdf/test_7/test_7.usd
 ```
 
----
+正常應該看到大約 `19K`，而且 `file` 顯示 `USD crate`。
 
-## 訓練指令
+## 4. 驗證環境是否接好
 
-### 基本訓練指令
+### 4.1 確認 Isaac Lab launcher 使用正確 Python
+
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py --help
 ```
 
-### 常用訓練參數組合
+輸出裡應該看到：
 
-#### 無頭模式訓練（推薦，速度最快）
+```text
+[INFO] Using python from: /home/lab_user1/miniconda3/envs/env_isaaclab_bin/bin/python
+```
+
+### 4.2 列出 RedRHex task
+
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --num_envs=4096 --max_iterations=5000 --headless
+$ISAACLAB_ROOT/isaaclab.sh -p -u scripts/list_envs.py
 ```
 
-#### 有 GUI 訓練（可視化訓練過程）
+應該看到：
+
+```text
+Template-Redrhex-Direct-v0
+```
+
+注意：不要用單純的 `python scripts/rsl_rl/train.py` 當標準指令。這版 binary Isaac Sim 需要透過 `isaaclab.sh -p` 接好 Isaac Sim / USD / pxr 的 Python 路徑。
+
+## 5. 開始 train
+
+### 5.1 最小 smoke test
+
+先用 4 個環境、1 次 iteration 測試程式能不能建場景：
+
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --num_envs=256
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 4 \
+  --max_iterations 1 \
+  --headless \
+  --device cuda:0
 ```
 
-#### 少量環境快速測試
+### 5.2 小規模 debug train
+
+用來看 reward、動作、觀測有沒有明顯錯誤：
+
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --num_envs=64 --max_iterations=100
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 64 \
+  --max_iterations 100 \
+  --headless \
+  --device cuda:0
 ```
 
-#### 從 checkpoint 繼續訓練
+### 5.3 正式 train
+
+這台 GPU 是 RTX 5080 16 GB，建議先從 `1024` 或 `2048` 開始。若 VRAM 還夠，再提高到 `4096`。
+
 ```bash
-python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --num_envs=4096 --max_iterations=10000 --headless --resume --checkpoint=/path/to/model.pt
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 2048 \
+  --max_iterations 2000 \
+  --headless \
+  --device cuda:0
 ```
 
----
+如果要開 GUI 看畫面，不加 `--headless`，並把環境數降小：
 
-## 播放/測試指令
-
-### 基本播放指令
 ```bash
-python scripts/rsl_rl/play.py --task=Template-Redrhex-Direct-v0 --checkpoint=/path/to/model.pt
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 64 \
+  --max_iterations 100 \
+  --device cuda:0
 ```
 
-### 單環境播放（推薦觀察）
+## 6. 從 checkpoint 繼續 train
+
+先找最近的 run：
+
 ```bash
-python scripts/rsl_rl/play.py --task=Template-Redrhex-Direct-v0 --num_envs=1 --checkpoint=/path/to/model.pt
+ls -td logs/rsl_rl/redrhex_wheg/* | head
 ```
 
-### 播放最新訓練的模型
+找某個 run 裡的模型：
+
 ```bash
-# 找到最新的 log 目錄
-ls -lt /home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_*/
-
-# 播放該目錄中的模型（範例）
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/play.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=1 \
-    --checkpoint=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_wheg/2026-02-02_17-46-42_wheg_locomotion/model_3800.pt
+ls -lh logs/rsl_rl/redrhex_wheg/<run_name>/model_*.pt
 ```
 
-### 多環境播放
+接著繼續訓練：
+
 ```bash
-python scripts/rsl_rl/play.py --task=Template-Redrhex-Direct-v0 --num_envs=16 --checkpoint=/path/to/model.pt
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 2048 \
+  --max_iterations 2000 \
+  --headless \
+  --device cuda:0 \
+  --resume \
+  --checkpoint logs/rsl_rl/redrhex_wheg/<run_name>/model_<iteration>.pt
 ```
 
----
+範例：
 
-## TensorBoard 監控
-
-### 啟動 TensorBoard
 ```bash
-# 監控特定訓練
-tensorboard --logdir=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_wheg/2026-02-02_17-46-42_wheg_locomotion
-
-# 監控所有訓練
-tensorboard --logdir=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/
-
-# 指定端口
-tensorboard --logdir=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/ --port=6006
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 2048 \
+  --max_iterations 2000 \
+  --headless \
+  --device cuda:0 \
+  --resume \
+  --checkpoint logs/rsl_rl/redrhex_wheg/2026-04-25_12-00-00_wheg_locomotion/model_1000.pt
 ```
 
-### 在瀏覽器中打開
+## 7. 開始 play
+
+### 7.1 GUI 播放單一模型
+
+```bash
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 1 \
+  --device cuda:0 \
+  --checkpoint logs/rsl_rl/redrhex_wheg/<run_name>/model_<iteration>.pt
 ```
+
+### 7.2 播放最新 run 的最新 checkpoint
+
+```bash
+RUN=$(ls -td logs/rsl_rl/redrhex_wheg/* | head -1)
+CKPT=$(find "$RUN" -maxdepth 1 -name 'model_*.pt' | sort -V | tail -1)
+echo "$CKPT"
+
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 1 \
+  --device cuda:0 \
+  --checkpoint "$CKPT"
+```
+
+`play.py` 會自動把 policy 匯出到 checkpoint 同一個 run 底下：
+
+```text
+logs/rsl_rl/redrhex_wheg/<run_name>/exported/policy.pt
+logs/rsl_rl/redrhex_wheg/<run_name>/exported/policy.onnx
+```
+
+### 7.3 Headless 錄影播放
+
+```bash
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/play.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 1 \
+  --headless \
+  --video \
+  --video_length 1200 \
+  --video_width 1920 \
+  --video_height 1080 \
+  --video_fps 30 \
+  --rendering_mode quality \
+  --device cuda:0 \
+  --checkpoint logs/rsl_rl/redrhex_wheg/<run_name>/model_<iteration>.pt
+```
+
+影片會輸出到：
+
+```text
+logs/rsl_rl/redrhex_wheg/<run_name>/videos/play/
+```
+
+Training Panel 會在 panel 啟動的訓練成功完成後，自動用最新 checkpoint 執行同樣的 headless 錄影流程，預設使用 High quality：1920x1080、1200 steps、30 FPS、quality rendering。錄影完成後可以在 History 詳細頁直接播放 MP4。
+
+## 8. TensorBoard
+
+```bash
+cd /home/lab_user1/Py/RedRHex
+tensorboard --logdir logs/rsl_rl --port 6006
+```
+
+瀏覽器打開：
+
+```text
 http://localhost:6006
 ```
 
----
+如果是遠端機器，請用 SSH port forwarding 或遠端桌面開瀏覽器。
 
-## Git 版本控制
+## 8.1 Training Panel
 
-### 查看狀態
-```bash
-git status
-git branch
-git remote -v
-```
+這個 branch 有一個本機 training panel，可以用表單啟動 train、查看 reward/tweakable files、整理 training history notes，並從每個 history run 一鍵啟動 TensorBoard / play checkpoint / resume。
 
-### 創建新分支並推送
-```bash
-# 創建並切換到新分支
-git checkout -b feature/your-feature-name
-
-# 添加修改的文件
-git add /home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py
-git add /home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py
-
-# 提交
-git commit -m "feat: Your commit message"
-
-# 推送到遠端
-git push -u origin feature/your-feature-name
-```
-
-### GitHub 倉庫位置
-```
-https://github.com/JasonLiaoJCS/RedRHex.git
-```
-
-### 切換分支
-```bash
-git checkout main
-git checkout feature/velocity-tracking-visualization
-```
-
-### 拉取最新代碼
-```bash
-git pull origin main
-```
-
----
-
-## 常用參數說明
-
-### 訓練參數 (train.py)
-
-| 參數 | 說明 | 預設值 | 範例 |
-|------|------|--------|------|
-| `--task` | 任務名稱 | 必填 | `Template-Redrhex-Direct-v0` |
-| `--num_envs` | 並行環境數量 | 配置文件定義 | `4096` |
-| `--max_iterations` | 最大訓練迭代次數 | 配置文件定義 | `5000` |
-| `--headless` | 無頭模式（無 GUI） | False | 直接加上即可 |
-| `--resume` | 從 checkpoint 繼續訓練 | False | 直接加上即可 |
-| `--checkpoint` | checkpoint 文件路徑 | - | `/path/to/model.pt` |
-| `--seed` | 隨機種子 | 配置文件定義 | `42` |
-
-### 播放參數 (play.py)
-
-| 參數 | 說明 | 預設值 | 範例 |
-|------|------|--------|------|
-| `--task` | 任務名稱 | 必填 | `Template-Redrhex-Direct-v0` |
-| `--num_envs` | 環境數量 | 1 | `1` |
-| `--checkpoint` | 模型文件路徑 | 必填 | `/path/to/model.pt` |
-
-### 環境數量建議
-
-| 用途 | 建議 num_envs | 說明 |
-|------|---------------|------|
-| 快速測試 | 64-256 | 驗證代碼正確性 |
-| 正式訓練 | 2048-4096 | 最佳訓練效率 |
-| 播放觀察 | 1-4 | 方便觀察單個機器人 |
-| 批量評估 | 16-64 | 統計多個機器人表現 |
-
----
-
-## 完整範例
-
-### 範例 1：完整訓練流程
-```bash
-# 1. 啟動虛擬環境
-conda activate env_isaaclab
-
-# 2. 進入專案目錄
-cd /home/jasonliao/RedRhex/RedRhex
-
-# 3. 開始訓練（無頭模式）
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/train.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=4096 \
-    --max_iterations=5000 \
-    --headless
-
-# 4. 另開終端，啟動 TensorBoard 監控
-tensorboard --logdir=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/
-
-# 5. 訓練完成後播放測試（替換 YYYY-MM-DD_HH-MM-SS 為實際時間戳）
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/play.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=1 \
-    --checkpoint=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_wheg/YYYY-MM-DD_HH-MM-SS_wheg_locomotion/model_5000.pt
-```
-
-### 範例 2：快速迭代測試
-```bash
-# 快速測試代碼修改是否有效（少量環境、少量迭代）
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/train.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=256 \
-    --max_iterations=100
-```
-
-### 範例 3：長時間訓練
-```bash
-# 使用 nohup 在背景運行（即使關閉終端也繼續）
-cd /home/jasonliao/RedRhex/RedRhex
-nohup python scripts/rsl_rl/train.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=4096 \
-    --max_iterations=10000 \
-    --headless > train.log 2>&1 &
-
-# 查看訓練日誌
-tail -f /home/jasonliao/RedRhex/RedRhex/train.log
-```
-
-### 範例 4：Git 工作流
-```bash
-cd /home/jasonliao/RedRhex/RedRhex
-
-# 修改代碼後推送
-git checkout -b feature/new-reward-function
-git add source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py
-git commit -m "feat: Add new reward function for lateral movement"
-git push -u origin feature/new-reward-function
-```
-
----
-
-## 目錄結構
-
-```
-/home/jasonliao/RedRhex/RedRhex/
-│
-├── docs/
-│   └── COMMANDS.md                    # 本指令文檔
-│
-├── logs/
-│   └── rsl_rl/
-│       └── redrhex_*/                 # 訓練日誌和模型
-│           └── YYYY-MM-DD_HH-MM-SS_*/
-│               ├── model_*.pt         # 保存的模型權重
-│               └── events.*           # TensorBoard 日誌
-│
-├── outputs/
-│   └── YYYY-MM-DD/
-│       └── HH-MM-SS/                  # Hydra 配置輸出
-│
-├── scripts/
-│   └── rsl_rl/
-│       ├── train.py                   # 訓練腳本
-│       ├── play.py                    # 播放腳本
-│       └── cli_args.py                # CLI 參數定義
-│
-└── source/
-    └── RedRhex/
-        ├── pyproject.toml             # 專案配置
-        ├── setup.py                   # 安裝腳本
-        ├── config/                    # 機器人配置
-        └── RedRhex/
-            ├── assets/                # 機器人 URDF/USD 模型
-            └── tasks/
-                └── direct/
-                    └── redrhex/
-                        ├── __init__.py
-                        ├── redrhex_env.py      # ⭐ 環境定義（獎勵函數）
-                        └── redrhex_env_cfg.py  # ⭐ 配置文件（超參數）
-```
-
----
-
-## 故障排除
-
-### 常見問題
-
-1. **CUDA out of memory**
-   ```bash
-   # 減少環境數量
-   python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --num_envs=1024 --headless
-   ```
-
-2. **找不到模塊**
-   ```bash
-   # 重新安裝專案
-   pip install -e source/RedRhex
-   ```
-
-3. **渲染問題**
-   ```bash
-   # 使用無頭模式
-   python scripts/rsl_rl/train.py --task=Template-Redrhex-Direct-v0 --headless
-   ```
-
-4. **查看 GPU 使用情況**
-   ```bash
-   nvidia-smi
-   watch -n 1 nvidia-smi  # 每秒更新
-   ```
-
----
-
-## 快速參考卡
+本機使用：
 
 ```bash
-# ============ 常用路徑 ============
-# 專案根目錄
-cd /home/jasonliao/RedRhex/RedRhex
+cd /home/lab_user1/Py/RedRHex
+source /home/lab_user1/miniconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab_bin
+python -m tools.training_panel --host 127.0.0.1 --port 8080
+```
 
-# 環境定義（獎勵函數）
-/home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env.py
+瀏覽器打開：
 
-# 環境配置（超參數）
-/home/jasonliao/RedRhex/RedRhex/source/RedRhex/RedRhex/tasks/direct/redrhex/redrhex_env_cfg.py
+```text
+http://127.0.0.1:8080
+```
 
-# 訓練日誌
-/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/
+LAN 使用：
 
-# ============ 常用指令 ============
-# 虛擬環境
-conda activate env_isaaclab
+```bash
+python -m tools.training_panel --host 0.0.0.0 --port 8080
+```
 
-# 訓練
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/train.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=4096 \
-    --max_iterations=5000 \
-    --headless
+SSH tunnel 使用：
 
-# 播放
-python /home/jasonliao/RedRhex/RedRhex/scripts/rsl_rl/play.py \
-    --task=Template-Redrhex-Direct-v0 \
-    --num_envs=1 \
-    --checkpoint=<MODEL_PATH>
+```bash
+ssh -L 8080:127.0.0.1:8080 user@host
+```
 
-# TensorBoard
-tensorboard --logdir=/home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/
+V1 是 read-only reward/config browser：只顯示檔案、說明、reward scale index，不直接改 source code。
 
-# 查看最新訓練目錄
-ls -lt /home/jasonliao/RedRhex/RedRhex/logs/rsl_rl/redrhex_*/
+History 頁面功能：
+
+- Rename：替 training run 加上好讀名稱。
+- TensorBoard：會先打開一個等待中的分頁，再針對該 run 的 log directory 啟動 TensorBoard，成功後把分頁導到該 port。
+- Play：用該 run 的 latest checkpoint 啟動 `scripts/rsl_rl/play.py`，並把該 process 選到 Process Console。
+- Recorded Result：嵌入最新 MP4，並用單一 High quality 預設錄影。panel 啟動的 training 成功後，也會自動用 High quality 錄一次。
+- Resume：把該 run 的 latest checkpoint 帶回 Train 表單，再由你選擇新的 env / iteration 後繼續 train。
+- Process Console：統一取代原本分散的 Debug / Open Terminal，顯示完整 command、即時 output、診斷文字、process log path。若系統有 `tmux`，panel process 會跑在 detached tmux session，按 `Copy Attach Command` 後可在 SSH 裡貼上並直接用 `Ctrl+C` 停 Isaac。
+- Pop Out：把同一個 Process Console 開在獨立瀏覽器分頁，LAN 或 SSH tunnel 使用時也能看 log。
+- Copy Output / Copy Attach Command：複製目前 output 或真 terminal attach command，方便貼給 Codex 或保存錯誤訊息。
+- Open Run Folder / Open Video Folder / Open Log Folder：只允許 repo log roots 內的路徑；本機會嘗試用 `xdg-open` / `gio open` 打開，遠端使用時仍會回傳可複製的 path / command。
+- Stop Process：對目前 Process Console 指向的 Training / Play / Video / TensorBoard process 送出類似 `Ctrl+C` 的中斷；如果 Isaac Sim 沒關掉，panel 會再升級停止。
+- Delete Run：先列出即將刪除的 repo log / note 路徑，必須輸入完整 run id 才會刪除；若該 run 還有 process 在跑，會先拒絕刪除。
+
+Video default：
+
+- High：1920x1080、1200 steps、30 FPS、quality rendering。
+
+## 9. 目前這台機器已驗證到哪裡
+
+已完成：
+
+- `env_isaaclab_bin` 可 import Isaac Lab / Isaac Sim / Torch CUDA。
+- `python -m pip install -e source/RedRhex` 已完成。
+- `git-lfs` 已裝在 `env_isaaclab_bin`。
+- `RedRhex.usd` 已從 Git LFS 拉成真 USD 檔。
+- `test_7_description/` 已放進 repo，並已用 Isaac Lab URDF converter 產生 repo-local `test_7_description/test_7_description/urdf/test_7/test_7.usd`。
+- `RedRhex.usd` 目前使用 repo-relative reference，不再依賴 `/home/lab_user1/Py/Downloads/b/...`。
+- `scripts/list_envs.py` 可列出 `Template-Redrhex-Direct-v0`。
+- `scripts/rsl_rl/train.py` 已修掉 `omni.log.warn` 在 Isaac Sim 5.1 下的相容性問題。
+- 2026-05-14 已驗證第 5.1 節 smoke test 可完成：4 envs、1 iteration、headless、`cuda:0`。
+
+注意：目前 repo-local `test_7_description` URDF expose 9 個 active joints，因此 RL config 已調整成 3 main drive + 3 ABAD + 3 damper：action space = 6，observation space = 35。若之後換回完整 6 腿/18 joint USD，需要同步恢復 joint mapping、action space、observation space。
+
+## 10. 常見錯誤
+
+### `ModuleNotFoundError: No module named 'isaaclab'`
+
+通常是還在 `base` 或錯 env。重做：
+
+```bash
+source /home/lab_user1/miniconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab_bin
+cd /home/lab_user1/Py/RedRHex
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py --help
+```
+
+### `ModuleNotFoundError: No module named 'pxr'`
+
+不要直接用 `python` 跑 train/play。改用：
+
+```bash
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py ...
+```
+
+### `RedRhex.usd` 打不開或只有 130 bytes
+
+Git LFS 還沒拉：
+
+```bash
+conda activate env_isaaclab_bin
+cd /home/lab_user1/Py/RedRHex
+git lfs pull
+```
+
+### `tabs: terminal type 'dumb' cannot reset tabs`
+
+```bash
+export TERM=xterm
+```
+
+### CUDA out of memory
+
+把 `--num_envs` 降低，例如：
+
+```bash
+--num_envs 2048
+--num_envs 1024
+--num_envs 512
+```
+
+## 11. 最短版每日流程
+
+```bash
+export REDRHEX_ROOT=/home/lab_user1/Py/RedRHex
+export ISAACLAB_ROOT=/home/lab_user1/isaac_lab_ws/IsaacLab
+source /home/lab_user1/miniconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab_bin
+export TERM=xterm
+cd "$REDRHEX_ROOT"
+
+$ISAACLAB_ROOT/isaaclab.sh -p -u scripts/list_envs.py
+
+$ISAACLAB_ROOT/isaaclab.sh -p scripts/rsl_rl/train.py \
+  --task Template-Redrhex-Direct-v0 \
+  --num_envs 2048 \
+  --max_iterations 2000 \
+  --headless \
+  --device cuda:0
 ```

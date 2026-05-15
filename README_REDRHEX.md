@@ -2,6 +2,8 @@
 
 A complete reinforcement learning training environment for the RedRhex hexapod robot, built on NVIDIA Isaac Lab and IsaacSim.
 
+> For the current Ubuntu machine setup and exact train/play commands, see [`docs/COMMANDS.md`](docs/COMMANDS.md).
+
 ## Overview
 
 RedRhex is a 6-legged hexapod robot with 18 degrees of freedom (3 joints per leg). This project implements:

@@ -15,6 +15,9 @@
 **/*.usdz
 # Allow main robot model
 !/RedRhex.usd
+# Allow repo-local converted RedRHex dependency USDs
+!/test_7_description/test_7_description/urdf/test_7/**/*.usd
+!/test_7_description/test_7_description/urdf/test_7/*.usd
 
 # Python
 .DS_Store
@@ -44,6 +47,7 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+tools/training_panel/active_reward_override.json
 
 # Doc Outputs
 **/docs/_build/*
@@ -68,6 +72,8 @@ _build
 
 # Tests
 tests/
+!/tools/training_panel/tests/
+!/tools/training_panel/tests/*.py
 
 # Docker history
 .isaac-lab-docker-history
