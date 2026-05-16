@@ -34,6 +34,7 @@ const state = {
   activePresetOverrides: {},
   selectedPresetId: null,
   rewardDefaults: {},
+  remoteStatus: null,
   // Comparison (Module 6)
   comparisonRun: null,
   comparisonMode: false,
@@ -180,7 +181,7 @@ function setView(name) {
     train: ["Train", "Start a controlled RSL-RL run with the repo defaults."],
     rewards: ["Rewards", "Tune reward weights with presets and see which settings each run used."],
     history: ["History", "Review runs, notes, checkpoints, TensorBoard, and playbacks."],
-    access: ["Control Center", "Manage local access, V2.0 remote worker status, and remote launch acceptance."],
+    access: ["Control Center", "Manage local access, V2.1 remote worker status, and remote launch acceptance."],
   };
   $("#view-title").textContent = titles[name][0];
   $("#view-subtitle").textContent = titles[name][1];
@@ -211,33 +212,125 @@ function renderKvGrid(selector, rows) {
     .join("");
 }
 
+function remoteStatusPill(label, className) {
+  return `<span class="status-badge ${className}">${escapeHtml(label)}</span>`;
+}
+
 async function loadRemoteStatus() {
   const status = await api("/api/remote/status");
+  state.remoteStatus = status;
   const badge = $("#remote-config-badge");
   if (badge) {
     badge.textContent = status.configured ? "Configured" : "Needs Setup";
     badge.className = status.configured ? "status-badge status-completed" : "status-badge status-interrupted";
   }
-  const accept = $("#remote-accept-status");
-  if (accept) {
-    accept.textContent = status.accept_jobs
-      ? "Remote queued jobs are accepted by this machine."
-      : "Remote queued jobs are paused on this machine.";
+
+  const strip = $("#remote-status-strip");
+  if (strip) {
+    strip.innerHTML = [
+      remoteStatusPill(status.configured ? "Configured" : "Needs Setup", status.configured ? "status-completed" : "status-interrupted"),
+      remoteStatusPill(status.worker_running ? "Worker Running" : "Worker Stopped", status.worker_running ? "status-running" : "muted-pill"),
+      remoteStatusPill(status.accept_jobs ? "Accepting Jobs" : "Paused", status.accept_jobs ? "status-completed" : "status-interrupted"),
+      remoteStatusPill(status.active_isaac_process_count ? "GPU Busy" : "GPU Free", status.active_isaac_process_count ? "status-running" : "status-completed"),
+    ].join("");
   }
-  const workerCommand = $("#remote-worker-command");
-  if (workerCommand) workerCommand.textContent = status.worker_command;
-  const tunnelCommand = $("#remote-tunnel-command");
-  if (tunnelCommand) tunnelCommand.textContent = status.cloudflare_tunnel_command;
-  renderKvGrid("#remote-machine-grid", [
-    ["Machine ID", status.machine_id || "-"],
-    ["Version", status.version || "-"],
-    ["Accept Jobs", status.accept_jobs ? "enabled" : "disabled"],
-    ["Active Processes", status.active_process_count || 0],
-    ["Isaac/GPU Lock", status.active_isaac_process_count ? "busy" : "free"],
+
+  const workerBadge = $("#remote-worker-badge");
+  if (workerBadge) {
+    workerBadge.textContent = status.worker_running ? "Running" : "Stopped";
+    workerBadge.className = status.worker_running ? "status-badge status-running" : "status-badge muted-pill";
+  }
+  const workerSummary = $("#remote-worker-summary");
+  if (workerSummary) {
+    const mode = status.worker_runtime_mode || status.worker_mode || "tmux";
+    if (!status.configured) {
+      workerSummary.textContent = "Set REDRHEX_SUPABASE_URL and REDRHEX_SUPABASE_MACHINE_TOKEN in your .env to enable remote access.";
+    } else if (status.worker_running && status.accept_jobs) {
+      workerSummary.textContent = `Online in ${mode} mode — accepting jobs from the phone web shell.`;
+    } else if (status.worker_running && !status.accept_jobs) {
+      workerSummary.textContent = `Running in ${mode} mode but not accepting new jobs. Click Accept Jobs to resume.`;
+    } else {
+      workerSummary.textContent = "Worker is not running. Click Start Worker to begin accepting remote jobs.";
+    }
+  }
+  document.querySelectorAll(".segment-button[data-mode]").forEach((button) => {
+    const active = button.dataset.mode === status.worker_mode;
+    button.classList.toggle("active", active);
+    button.disabled = false;
+  });
+  const autostart = $("#remote-autostart");
+  if (autostart) autostart.checked = Boolean(status.worker_autostart);
+  const startButton = $("#remote-worker-start");
+  if (startButton) startButton.disabled = status.worker_running || !status.configured;
+  const stopButton = $("#remote-worker-stop");
+  if (stopButton) stopButton.disabled = !status.worker_running;
+  const restartButton = $("#remote-worker-restart");
+  if (restartButton) restartButton.disabled = !status.configured;
+  const enableButton = $("#remote-enable");
+  if (enableButton) enableButton.disabled = Boolean(status.accept_jobs);
+  const disableButton = $("#remote-disable");
+  if (disableButton) disableButton.disabled = !status.accept_jobs;
+
+  const modeNote = $("#remote-mode-note");
+  if (modeNote) {
+    const MODE_NOTES = {
+      tmux:  "tmux mode: the worker persists in a detached session — it keeps running even if you close this browser tab or restart the panel.",
+      child: "Child mode: the worker stops when you close the training panel. Good for quick testing.",
+    };
+    const currentMode = status.worker_mode || "tmux";
+    modeNote.textContent = status.worker_running
+      ? `Mode changes are saved but apply on the next restart. ${MODE_NOTES[currentMode] || ""}`
+      : MODE_NOTES[currentMode] || "";
+  }
+  renderKvGrid("#remote-worker-grid", [
+    ["Saved Mode", status.worker_mode || "tmux"],
+    ["Runtime Mode", status.worker_runtime_mode || "-"],
+    ["Auto-start", status.worker_autostart ? "enabled" : "disabled"],
+    ["PID", status.worker_pid || "-"],
+    ["tmux Session", status.worker_tmux_session || "-"],
+    ["Log File", status.worker_log_file || "-"],
+    ["Last Error", status.worker_last_error || "-"],
   ]);
-  renderKvGrid("#remote-integrations-grid", [
+  const attachWrap = $("#remote-worker-attach-wrap");
+  const attach = $("#remote-worker-attach");
+  if (attachWrap && attach) {
+    attachWrap.hidden = !status.worker_attach_command;
+    attach.textContent = status.worker_attach_command || "";
+  }
+  const output = $("#remote-worker-output");
+  if (output) output.textContent = status.worker_output_tail || "No worker output yet.";
+
+  const setup = $("#remote-setup-list");
+  if (setup) {
+    setup.innerHTML = (status.setup_checks || [])
+      .map(
+        (check) => `
+          <div class="setup-row ${check.ok ? "ok" : "missing"}">
+            <span>${check.ok ? "OK" : "Missing"}</span>
+            <strong>${escapeHtml(check.label)}</strong>
+            <small>${escapeHtml(check.detail || "")}</small>
+          </div>
+        `
+      )
+      .join("");
+  }
+  const envPath = $("#remote-env-path");
+  if (envPath) envPath.textContent = status.env_file_path || "~/.redrhex_remote.env";
+
+  renderKvGrid("#remote-access-grid", [
+    ["Phone Page", status.remote_web_url || "-"],
+    ["Machine ID", status.machine_id || "-"],
     ["Supabase", status.configured ? status.supabase_url : "not configured"],
     ["Cloudflare", status.cloudflare_tunnel_host || "not configured"],
+  ]);
+  const phoneUrl = $("#remote-phone-url");
+  if (phoneUrl) phoneUrl.textContent = status.remote_web_url || "";
+  const tunnelCommand = $("#remote-tunnel-command");
+  if (tunnelCommand) tunnelCommand.textContent = status.cloudflare_tunnel_command;
+  renderKvGrid("#remote-integrations-grid", [
+    ["Panel Version", status.version || "-"],
+    ["Active Processes", status.active_process_count || 0],
+    ["Isaac/GPU Lock", status.active_isaac_process_count ? "busy" : "free"],
     ["Discord", status.discord_configured ? "configured" : "not configured"],
     ["Email", status.email_configured ? "configured" : "not configured"],
   ]);
@@ -252,6 +345,73 @@ async function saveRemoteAcceptance(acceptJobs) {
   });
   await loadRemoteStatus();
   setStatus(data.status.accept_jobs ? "Remote queued jobs enabled." : "Remote queued jobs disabled.");
+}
+
+async function saveRemoteSettings(updates) {
+  const data = await api("/api/remote/settings", {
+    method: "POST",
+    body: JSON.stringify(updates),
+  });
+  await loadRemoteStatus();
+  return data;
+}
+
+async function setRemoteWorkerMode(mode) {
+  await saveRemoteSettings({ worker_mode: mode });
+  setStatus(`Remote worker mode saved: ${mode}. Restart worker to apply if it is running.`);
+}
+
+async function setRemoteAutostart(enabled) {
+  await saveRemoteSettings({ worker_autostart: enabled });
+  setStatus(enabled ? "Remote worker auto-start enabled." : "Remote worker auto-start disabled.");
+}
+
+async function startRemoteWorker() {
+  const mode = state.remoteStatus?.worker_mode || "tmux";
+  await api("/api/remote/worker/start", {
+    method: "POST",
+    body: JSON.stringify({ mode }),
+  });
+  await loadRemoteStatus();
+  setStatus("Remote worker started.");
+}
+
+async function stopRemoteWorker() {
+  await api("/api/remote/worker/stop", { method: "POST", body: JSON.stringify({}) });
+  await loadRemoteStatus();
+  setStatus("Remote worker stop requested.");
+}
+
+async function restartRemoteWorker() {
+  const mode = state.remoteStatus?.worker_mode || "tmux";
+  await api("/api/remote/worker/restart", {
+    method: "POST",
+    body: JSON.stringify({ mode }),
+  });
+  await loadRemoteStatus();
+  setStatus("Remote worker restarted.");
+}
+
+async function copyWorkerAttach() {
+  const command = state.remoteStatus?.worker_attach_command || "";
+  await copyText(command);
+  setStatus("Worker attach command copied.");
+}
+
+async function copyWorkerOutput() {
+  const output = state.remoteStatus?.worker_output_tail || "";
+  await copyText(output);
+  setStatus("Worker output copied.");
+}
+
+async function copyRemoteEnvPath() {
+  await copyText(state.remoteStatus?.env_file_path || "~/.redrhex_remote.env");
+  setStatus("Remote env file path copied.");
+}
+
+async function copyRemotePhoneUrl() {
+  await copyText(state.remoteStatus?.remote_web_url || "");
+  setStatus("Phone page URL copied.");
 }
 
 async function loadTweaks() {
@@ -699,6 +859,8 @@ function renderRunDetails() {
     rows.push(["ONNX", onnxText]);
     if (run.reward_preset_id && run.reward_preset_id !== "baseline")
       rows.push(["Reward preset", run.reward_preset_id]);
+    if (run.convergence_detected)
+      rows.push(["Converged", `iter ${run.convergence_iteration} (Δ ${run.convergence_improvement_pct?.toFixed(1)}%)`]);
     infoGrid.innerHTML = rows
       .map(([k, v]) => `<span class="info-key">${escapeHtml(k)}</span><span class="info-val">${escapeHtml(String(v))}</span>`)
       .join("");
@@ -1954,10 +2116,84 @@ async function promptCreateFolder() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadSystem(), loadRemoteStatus(), loadRewardsPage()]);
+  await Promise.all([loadSystem(), loadRemoteStatus(), loadConvergenceSettings(), loadRewardsPage()]);
   await loadRuns();
   await loadFolders();
   if (state.selectedRun) setDebugTarget({ type: "run", id: state.selectedRun.id });
+}
+
+// ---------------------------------------------------------------------------
+// Convergence Detection
+// ---------------------------------------------------------------------------
+
+const CONVERGENCE_PRESET_HINTS = {
+  loose:   "Window: 100 iters · Threshold: 5% — triggers earlier, may be a short plateau",
+  default: "Window: 200 iters · Threshold: 2% — balanced, good for most runs",
+  strict:  "Window: 400 iters · Threshold: 1% — very conservative, fewer false positives",
+  custom:  "Set your own window size and improvement threshold below",
+};
+
+async function loadConvergenceSettings() {
+  try {
+    const data = await api("/api/convergence/settings");
+    renderConvergenceCard(data.config, data.presets);
+  } catch (_) {
+    // convergence API unavailable — leave card in default state
+  }
+}
+
+function renderConvergenceCard(config, presets) {
+  const enabledEl = $("#convergence-enabled");
+  if (enabledEl) enabledEl.checked = Boolean(config.enabled);
+
+  // Preset buttons
+  document.querySelectorAll("#convergence-presets .segment-button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.preset === config.preset);
+  });
+
+  const hint = $("#convergence-preset-hint");
+  if (hint) hint.textContent = CONVERGENCE_PRESET_HINTS[config.preset] || "";
+
+  const customDiv = $("#convergence-custom-inputs");
+  if (customDiv) customDiv.style.display = config.preset === "custom" ? "" : "none";
+
+  const windowEl = $("#convergence-window");
+  if (windowEl) windowEl.value = config.window_iterations;
+  const threshEl = $("#convergence-threshold");
+  if (threshEl) threshEl.value = config.min_improvement_pct;
+
+  const autoRecEl = $("#convergence-auto-record");
+  if (autoRecEl) autoRecEl.checked = Boolean(config.auto_record_video);
+
+  const badge = $("#convergence-badge");
+  if (badge) {
+    if (!config.enabled) {
+      badge.textContent = "Off";
+      badge.className = "status-badge muted-pill";
+    } else {
+      badge.textContent = config.preset.charAt(0).toUpperCase() + config.preset.slice(1);
+      badge.className = "status-badge info-pill";
+    }
+  }
+}
+
+async function saveConvergenceSettings() {
+  const enabled = Boolean($("#convergence-enabled")?.checked);
+  const preset = document.querySelector("#convergence-presets .segment-button.active")?.dataset.preset || "default";
+  const updates = { enabled, preset, auto_record_video: Boolean($("#convergence-auto-record")?.checked) };
+  if (preset === "custom") {
+    const w = parseInt($("#convergence-window")?.value || "200", 10);
+    const t = parseFloat($("#convergence-threshold")?.value || "2.0");
+    if (!Number.isNaN(w)) updates.window_iterations = w;
+    if (!Number.isNaN(t)) updates.min_improvement_pct = t;
+  }
+  const data = await api("/api/convergence/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+  renderConvergenceCard(data.config, data.presets);
+  setStatus("Convergence settings saved.");
 }
 
 function formatBytes(bytes) {
@@ -2105,6 +2341,40 @@ const remoteEnable = $("#remote-enable");
 if (remoteEnable) remoteEnable.addEventListener("click", () => saveRemoteAcceptance(true).catch(handleActionError));
 const remoteDisable = $("#remote-disable");
 if (remoteDisable) remoteDisable.addEventListener("click", () => saveRemoteAcceptance(false).catch(handleActionError));
+const remoteWorkerStart = $("#remote-worker-start");
+if (remoteWorkerStart) remoteWorkerStart.addEventListener("click", () => startRemoteWorker().catch(handleActionError));
+const remoteWorkerStop = $("#remote-worker-stop");
+if (remoteWorkerStop) remoteWorkerStop.addEventListener("click", () => stopRemoteWorker().catch(handleActionError));
+const remoteWorkerRestart = $("#remote-worker-restart");
+if (remoteWorkerRestart) remoteWorkerRestart.addEventListener("click", () => restartRemoteWorker().catch(handleActionError));
+const remoteModeTmux = $("#remote-mode-tmux");
+if (remoteModeTmux) remoteModeTmux.addEventListener("click", () => setRemoteWorkerMode("tmux").catch(handleActionError));
+const remoteModeChild = $("#remote-mode-child");
+if (remoteModeChild) remoteModeChild.addEventListener("click", () => setRemoteWorkerMode("child").catch(handleActionError));
+const remoteAutostart = $("#remote-autostart");
+if (remoteAutostart) remoteAutostart.addEventListener("change", () => setRemoteAutostart(remoteAutostart.checked).catch(handleActionError));
+const copyWorkerAttachBtn = $("#copy-worker-attach");
+if (copyWorkerAttachBtn) copyWorkerAttachBtn.addEventListener("click", () => copyWorkerAttach().catch(handleActionError));
+const copyWorkerOutputBtn = $("#copy-worker-output");
+if (copyWorkerOutputBtn) copyWorkerOutputBtn.addEventListener("click", () => copyWorkerOutput().catch(handleActionError));
+const copyEnvPathBtn = $("#copy-env-path");
+if (copyEnvPathBtn) copyEnvPathBtn.addEventListener("click", () => copyRemoteEnvPath().catch(handleActionError));
+const copyPhoneUrlBtn = $("#copy-phone-url");
+if (copyPhoneUrlBtn) copyPhoneUrlBtn.addEventListener("click", () => copyRemotePhoneUrl().catch(handleActionError));
+
+// Convergence card
+const convergenceSaveBtn = $("#convergence-save");
+if (convergenceSaveBtn) convergenceSaveBtn.addEventListener("click", () => saveConvergenceSettings().catch(handleActionError));
+document.querySelectorAll("#convergence-presets .segment-button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#convergence-presets .segment-button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const customDiv = $("#convergence-custom-inputs");
+    if (customDiv) customDiv.style.display = btn.dataset.preset === "custom" ? "" : "none";
+    const hint = $("#convergence-preset-hint");
+    if (hint) hint.textContent = CONVERGENCE_PRESET_HINTS[btn.dataset.preset] || "";
+  });
+});
 
 loadNotificationState();
 renderNotificationBadges();

@@ -968,27 +968,80 @@ class ProcessRegistry:
         raise ProcessStartError(f"{label} exited while starting. Open Console or check the process log.", debug)
 
     def _monitor_training(self, run_id: str, proc: subprocess.Popen, started_at_epoch: float) -> None:
+        import time
+        from .convergence import ConvergenceChecker, load_convergence_config
+        from .notifications import send_convergence_notification
+        from .remote_config import RemoteConfig
+
+        checker = ConvergenceChecker()
+        convergence_detected = False
+        convergence_notified_at: float | None = None
+        log_dir: str | None = None
+        poll_interval = 60  # seconds between TensorBoard reads
+
+        # Poll while training is running, checking for convergence each cycle.
+        while proc.poll() is None:
+            time.sleep(poll_interval)
+            if not log_dir:
+                log_dir = self.history.find_latest_log_after(started_at_epoch)
+            if log_dir and not convergence_detected:
+                try:
+                    cfg = load_convergence_config(self.paths.convergence_config_file)
+                    if cfg.enabled:
+                        cooled = (
+                            convergence_notified_at is None
+                            or (time.time() - convergence_notified_at) > cfg.cooldown_minutes * 60
+                        )
+                        if cooled:
+                            result = checker.check(Path(log_dir), cfg)
+                            if result.detected:
+                                convergence_detected = True
+                                convergence_notified_at = time.time()
+                                self.history.update_run(
+                                    run_id,
+                                    convergence_detected=True,
+                                    convergence_iteration=result.iteration,
+                                    convergence_improvement_pct=round(result.improvement_pct, 2),
+                                )
+                                if cfg.auto_record_video:
+                                    self.history.update_run(run_id, queue_video_on_completion=True)
+                                remote_cfg = RemoteConfig.from_env()
+                                run = self.history.get_run(run_id) or {}
+                                send_convergence_notification(
+                                    run, result,
+                                    discord_webhook=remote_cfg.discord_webhook_url,
+                                    resend_key=remote_cfg.resend_api_key,
+                                )
+                except Exception:
+                    pass  # never let convergence logic crash the monitor thread
+
         returncode = proc.wait()
         status = "completed" if returncode == 0 else "failed"
-        log_dir = self.history.find_latest_log_after(started_at_epoch)
+        if not log_dir:
+            log_dir = self.history.find_latest_log_after(started_at_epoch)
         self.history.update_run(run_id, status=status, returncode=returncode, log_dir=log_dir)
-        if returncode != 0 or not log_dir:
-            return
-        checkpoint = latest_checkpoint(Path(log_dir))
-        if not checkpoint:
-            self.history.update_run(run_id, video_status="missing_checkpoint")
-            return
-        try:
-            run = self.history.get_run(run_id) or {}
-            params = run.get("params") or {}
-            self.start_video_recording(
-                run_id=run_id,
-                checkpoint=checkpoint,
-                device=str(params.get("device") or "cuda:0"),
-                video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
-            )
-        except Exception as exc:
-            self.history.update_run(run_id, video_status="failed", video_error=str(exc))
+
+        # Record video when: training succeeded normally, OR convergence was detected and
+        # auto_record_video was requested (even if training was stopped early).
+        run = self.history.get_run(run_id) or {}
+        force_video = bool(run.get("queue_video_on_completion")) and convergence_detected
+        if (returncode == 0 or force_video) and log_dir:
+            checkpoint = latest_checkpoint(Path(log_dir))
+            if not checkpoint:
+                self.history.update_run(run_id, video_status="missing_checkpoint")
+                return
+            try:
+                params = run.get("params") or {}
+                self.start_video_recording(
+                    run_id=run_id,
+                    checkpoint=checkpoint,
+                    device=str(params.get("device") or "cuda:0"),
+                    video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
+                )
+            except Exception as exc:
+                self.history.update_run(run_id, video_status="failed", video_error=str(exc))
+        elif not log_dir:
+            pass  # no log dir found — nothing to record
 
     def _monitor_video(self, source_run_id: str, video_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()

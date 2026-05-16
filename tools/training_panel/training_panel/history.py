@@ -244,6 +244,7 @@ class HistoryStore:
         self.paths.ensure_dirs()
         path = self._note_path(run_id)
         path.write_text(text, encoding="utf-8")
+        self.patch_run_metadata(run_id, notes=text)
 
     def discover_rsl_runs(self) -> list[dict]:
         if not self.paths.rsl_rl_log_root.exists():
@@ -298,7 +299,9 @@ class HistoryStore:
         defaults = reward_defaults(self.paths.repo_root)
         for record in merged:
             run_id = record.get("id", "")
-            record["has_notes"] = bool(self.get_note(run_id))
+            note_text = self.get_note(run_id)
+            record["notes"] = note_text
+            record["has_notes"] = bool(note_text)
             log_dir = Path(record["log_dir"]) if record.get("log_dir") else None
             if log_dir and log_dir.exists():
                 record["latest_checkpoint"] = latest_checkpoint(log_dir)

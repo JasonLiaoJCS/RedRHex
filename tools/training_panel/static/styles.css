@@ -1048,6 +1048,161 @@ html[data-theme="dark"] .comparison-diff {
   padding: 16px;
 }
 
+.control-center-head,
+.card-head,
+.compact-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.control-center-head {
+  margin-bottom: 14px;
+}
+
+.control-center-head h2,
+.control-card h2 {
+  margin: 0 0 6px;
+}
+
+.remote-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.control-center-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.35fr) minmax(260px, 0.9fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.control-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.worker-card {
+  grid-row: span 3;
+}
+
+.segmented-control {
+  display: inline-flex;
+  padding: 3px;
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.segment-button {
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+}
+
+.segment-button.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.segment-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--text);
+  font-weight: 650;
+}
+
+.copy-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  margin-top: 10px;
+}
+
+.copy-row code {
+  margin: 0;
+}
+
+.setup-list {
+  display: grid;
+  gap: 8px;
+}
+
+.setup-row {
+  display: grid;
+  grid-template-columns: auto minmax(110px, 0.8fr) minmax(0, 1.2fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.setup-row span {
+  min-width: 58px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.setup-row.ok span {
+  color: var(--green);
+}
+
+.setup-row.missing span {
+  color: var(--red-dark);
+}
+
+.setup-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+#remote-worker-output {
+  max-height: 280px;
+  overflow: auto;
+}
+
+.advanced-panel {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.advanced-panel summary {
+  cursor: pointer;
+  font-weight: 800;
+  color: var(--text);
+}
+
 code,
 pre {
   display: block;
@@ -1071,7 +1226,17 @@ pre {
   .panel-grid,
   .split,
   .access-grid,
-  .remote-status-grid {
+  .remote-status-grid,
+  .control-center-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-card {
+    grid-row: auto;
+  }
+
+  .copy-row,
+  .setup-row {
     grid-template-columns: 1fr;
   }
 

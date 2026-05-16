@@ -52,7 +52,8 @@ class RemoteConfig:
     cloudflare_tunnel_host: str = ""
     discord_webhook_url: str = ""
     resend_api_key: str = ""
-    poll_interval_seconds: float = 5.0
+    poll_interval_seconds: float = 2.0
+    sync_interval_seconds: float = 5.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RemoteConfig":
@@ -67,12 +68,26 @@ class RemoteConfig:
             cloudflare_tunnel_host=source.get("REDRHEX_CLOUDFLARE_TUNNEL_HOST", "").rstrip("/"),
             discord_webhook_url=source.get("REDRHEX_DISCORD_WEBHOOK_URL", ""),
             resend_api_key=source.get("REDRHEX_RESEND_API_KEY", ""),
-            poll_interval_seconds=float(source.get("REDRHEX_REMOTE_POLL_SECONDS", "5")),
+            poll_interval_seconds=float(source.get("REDRHEX_REMOTE_POLL_SECONDS", "2")),
+            sync_interval_seconds=float(source.get("REDRHEX_REMOTE_SYNC_SECONDS", "5")),
         )
 
     @property
     def configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_anon_key and self.machine_token and self.machine_id)
+
+    @property
+    def missing_required_env(self) -> list[str]:
+        missing = []
+        if not self.supabase_url:
+            missing.append("REDRHEX_SUPABASE_URL")
+        if not self.supabase_anon_key:
+            missing.append("REDRHEX_SUPABASE_ANON_KEY")
+        if not self.machine_token:
+            missing.append("REDRHEX_SUPABASE_MACHINE_TOKEN")
+        if not self.machine_id:
+            missing.append("REDRHEX_MACHINE_ID")
+        return missing
 
     def public_status(self, paths: PanelPaths, state: "RemoteStateStore | None" = None) -> dict:
         accept_jobs = state.effective_accept_jobs(self) if state else self.accept_jobs

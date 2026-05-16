@@ -3,64 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RedRHex Remote Training</title>
+    <title>RedRHex To Go</title>
     <link rel="stylesheet" href="./remote_styles.css" />
   </head>
   <body>
-    <main class="remote-shell">
-      <header>
-        <div>
-          <p class="eyebrow">BioRoLa ABAD RHex Team</p>
-          <h1>RedRHex Remote Training V2.0</h1>
-          <p>Queue training jobs, inspect run status, and open live proxy links from anywhere.</p>
-        </div>
-        <span id="session-status" class="badge">Signed out</span>
-      </header>
-
-      <section class="panel-grid">
-        <article>
-          <h2>Supabase Login</h2>
-          <label>Supabase URL <input id="supabase-url" placeholder="https://project.supabase.co" /></label>
-          <label>Anon Key <input id="supabase-anon-key" placeholder="public anon key" /></label>
-          <label>Email <input id="login-email" type="email" /></label>
-          <label>Password <input id="login-password" type="password" /></label>
-          <button id="save-config">Save Config</button>
-          <button id="login">Login</button>
-        </article>
-
-        <article>
-          <h2>Queue Training</h2>
-          <label>Machine ID <input id="machine-id" placeholder="biorolapc2-ubuntu" /></label>
-          <label>Task <input id="task" value="Template-Redrhex-Direct-v0" /></label>
-          <label>Environments <input id="num-envs" type="number" value="4" min="1" /></label>
-          <label>Iterations <input id="max-iterations" type="number" value="8" min="1" /></label>
-          <label>Device <input id="device" value="cuda:0" /></label>
-          <button id="queue-training">Queue Training</button>
-        </article>
+    <main id="app" class="remote-shell">
+      <section class="panel loading-panel">
+        <p class="eyebrow">BioRoLa ABAD RHex Team</p>
+        <h1>RedRHex To Go</h1>
+        <p>Loading the team training workspace.</p>
       </section>
-
-      <section class="panel-grid">
-        <article>
-          <div class="section-head">
-            <h2>Machines</h2>
-            <button id="refresh">Refresh</button>
-          </div>
-          <div id="machines" class="list"></div>
-        </article>
-        <article>
-          <h2>Jobs</h2>
-          <div id="jobs" class="list"></div>
-        </article>
-      </section>
-
-      <section>
-        <h2>Runs</h2>
-        <div id="runs" class="list wide"></div>
-      </section>
-
-      <pre id="status"></pre>
     </main>
-
-    <script src="./remote_app.js"></script>
+    <script type="module" src="./remote_app.js"></script>
   </body>
 </html>

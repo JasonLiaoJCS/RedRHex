@@ -22,7 +22,7 @@
         <button class="nav-button" data-view="access">Control Center</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 2.0</span>
+        <span class="release-version">Version 2.1</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -35,7 +35,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V2.0</span>
+          <span class="release-chip">Training Panel V2.1</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -283,56 +283,153 @@
       </section>
 
       <section id="access" class="view">
-        <div class="section-header">
-          <h2>Remote Control Center</h2>
+        <div class="control-center-head">
+          <div>
+            <h2>Remote Control Center</h2>
+            <p class="muted-copy">Control how this machine connects to the outside world. Start here if you want to monitor or trigger training remotely from a phone or browser.</p>
+          </div>
           <span id="remote-config-badge" class="status-badge muted-pill">Checking</span>
         </div>
-        <div class="access-grid remote-grid">
-          <article>
-            <h2>Remote Worker</h2>
-            <p class="muted-copy">Runs on this training PC and executes queued Supabase jobs.</p>
-            <code id="remote-worker-command">python -m tools.training_panel.remote_worker</code>
-          </article>
-          <article>
-            <h2>Remote Launch</h2>
-            <p id="remote-accept-status" class="muted-copy">Remote job acceptance is unknown.</p>
+
+        <div id="remote-status-strip" class="remote-status-strip"></div>
+
+        <div class="control-center-grid">
+          <article class="control-card worker-card">
+            <div class="card-head">
+              <div>
+                <h2>Remote Worker</h2>
+                <p id="remote-worker-summary" class="muted-copy">Checking worker state...</p>
+              </div>
+              <span id="remote-worker-badge" class="status-badge muted-pill">Unknown</span>
+            </div>
+
+            <div class="segmented-control" aria-label="Remote worker launch mode">
+              <button type="button" id="remote-mode-tmux" class="segment-button active" data-mode="tmux"
+                data-tooltip="Recommended. The worker keeps running in a background terminal session (tmux) even if you close the browser tab.">Persist in tmux</button>
+              <button type="button" id="remote-mode-child" class="segment-button" data-mode="child"
+                data-tooltip="The worker runs as a child of this panel. It stops when you close the panel. Useful for quick testing.">Child process</button>
+            </div>
+            <label class="toggle-row">
+              <input type="checkbox" id="remote-autostart" />
+              <span>Auto-start worker when the local panel starts</span>
+            </label>
+
             <div class="form-actions compact-actions">
-              <button type="button" id="remote-enable" class="primary-button small-button">Enable</button>
-              <button type="button" id="remote-disable" class="danger-button small-button">Disable</button>
+              <button type="button" id="remote-worker-start" class="primary-button small-button"
+                data-tooltip="Launch the remote worker so this machine can receive jobs from the phone web shell.">Start Worker</button>
+              <button type="button" id="remote-worker-stop" class="danger-button small-button"
+                data-tooltip="Gracefully stop the worker. Any in-flight job finishes first before it exits.">Stop Worker</button>
+              <button type="button" id="remote-worker-restart" class="ghost-button small-button"
+                data-tooltip="Stop the worker and immediately start it again. Useful after changing environment variables.">Restart</button>
+              <button type="button" id="remote-enable" class="primary-button small-button"
+                data-tooltip="Allow the phone web shell to queue training, video, and export jobs on this machine.">Accept Jobs</button>
+              <button type="button" id="remote-disable" class="ghost-button small-button"
+                data-tooltip="Stop accepting new remote jobs. Any job currently running will finish normally.">Pause Jobs</button>
+            </div>
+
+            <p id="remote-mode-note" class="muted-copy"></p>
+            <div id="remote-worker-grid" class="run-info-grid"></div>
+            <div id="remote-worker-attach-wrap" class="copy-row" hidden>
+              <code id="remote-worker-attach"></code>
+              <button type="button" id="copy-worker-attach" class="ghost-button small-button"
+                data-tooltip="Copy a tmux command you can paste in a terminal to watch worker output in real time.">Copy Attach</button>
+            </div>
+            <div class="section-header compact-section-header">
+              <h3>Worker Output</h3>
+              <button type="button" id="copy-worker-output" class="ghost-button small-button"
+                data-tooltip="Copy the recent worker log text to clipboard.">Copy Output</button>
+            </div>
+            <pre id="remote-worker-output"></pre>
+          </article>
+
+          <article class="control-card">
+            <h2>Setup Checklist</h2>
+            <p class="muted-copy">One-time setup steps to enable remote access. Items turn green when complete.</p>
+            <div id="remote-setup-list" class="setup-list"></div>
+            <div class="copy-row">
+              <code id="remote-env-path"></code>
+              <button type="button" id="copy-env-path" class="ghost-button small-button"
+                data-tooltip="Copy the path to the .env file where you set REDRHEX_* environment variables.">Copy Path</button>
             </div>
           </article>
-          <article>
-            <h2>Cloudflare Tunnel</h2>
-            <p class="muted-copy">Use this for secure live console and TensorBoard links.</p>
-            <code id="remote-tunnel-command">cloudflared tunnel --url http://127.0.0.1:8080</code>
+
+          <article class="control-card">
+            <h2>Remote Access</h2>
+            <p class="muted-copy">URLs and commands to reach the panel from your phone, another computer, or over the internet.</p>
+            <div id="remote-access-grid" class="run-info-grid"></div>
+            <div class="copy-row">
+              <code id="remote-phone-url"></code>
+              <button type="button" id="copy-phone-url" class="ghost-button small-button"
+                data-tooltip="Copy the LAN URL. Works on any device connected to the same Wi-Fi network.">Copy URL</button>
+            </div>
+            <div class="copy-row"
+              data-tooltip="Run this command on the training PC to expose the panel over the internet via Cloudflare Tunnel.">
+              <code id="remote-tunnel-command">cloudflared tunnel --url http://127.0.0.1:8080</code>
+            </div>
           </article>
-        </div>
-        <div class="remote-status-grid">
-          <article>
-            <h2>Machine</h2>
-            <div id="remote-machine-grid" class="run-info-grid"></div>
-          </article>
-          <article>
+
+          <article class="control-card">
             <h2>Integrations</h2>
+            <p class="muted-copy">Optional services for notifications and remote access. Configure with environment variables (see Setup Checklist).</p>
             <div id="remote-integrations-grid" class="run-info-grid"></div>
           </article>
+
+          <article class="control-card" id="convergence-card">
+            <div class="card-head">
+              <div>
+                <h2>Convergence Detection</h2>
+                <p class="muted-copy">Automatically notify you when training reward stops improving — no need to watch TensorBoard manually.</p>
+              </div>
+              <span id="convergence-badge" class="status-badge muted-pill">Off</span>
+            </div>
+
+            <label class="toggle-row">
+              <input type="checkbox" id="convergence-enabled" />
+              <span>Enable convergence detection</span>
+            </label>
+
+            <div class="segmented-control" aria-label="Convergence sensitivity preset" id="convergence-presets">
+              <button type="button" class="segment-button" data-preset="loose"
+                data-tooltip="Triggers after 100 stable iterations at 5% threshold. Fast but may fire on a short plateau.">Loose</button>
+              <button type="button" class="segment-button active" data-preset="default"
+                data-tooltip="Triggers after 200 stable iterations at 2% threshold. Good for most runs.">Default</button>
+              <button type="button" class="segment-button" data-preset="strict"
+                data-tooltip="Triggers after 400 stable iterations at 1% threshold. Conservative — fewer false positives.">Strict</button>
+              <button type="button" class="segment-button" data-preset="custom"
+                data-tooltip="Set your own window size and improvement threshold below.">Custom</button>
+            </div>
+            <p id="convergence-preset-hint" class="muted-copy"></p>
+
+            <div id="convergence-custom-inputs" style="display:none">
+              <div class="form-row">
+                <label for="convergence-window">Window (iterations)</label>
+                <input type="number" id="convergence-window" min="50" max="2000" step="10" value="200" />
+              </div>
+              <div class="form-row">
+                <label for="convergence-threshold">Max improvement %</label>
+                <input type="number" id="convergence-threshold" min="0.1" max="20" step="0.1" value="2.0" />
+              </div>
+            </div>
+
+            <label class="toggle-row"
+              data-tooltip="When convergence is detected, a video recording is queued automatically once training finishes.">
+              <input type="checkbox" id="convergence-auto-record" checked />
+              <span>Auto-record video when training ends after convergence</span>
+            </label>
+
+            <div class="form-actions compact-actions">
+              <button type="button" id="convergence-save" class="primary-button small-button"
+                data-tooltip="Save convergence detection settings to disk. Takes effect on the next training run.">Save</button>
+            </div>
+            <div id="convergence-info-grid" class="run-info-grid"></div>
+          </article>
         </div>
-        <div class="access-grid">
-          <article>
-            <h2>Local</h2>
-            <code>python -m tools.training_panel --host 127.0.0.1 --port 8080</code>
-          </article>
-          <article>
-            <h2>LAN</h2>
-            <code>python -m tools.training_panel --host 0.0.0.0 --port 8080</code>
-          </article>
-          <article>
-            <h2>SSH Tunnel</h2>
-            <code>ssh -L 8080:127.0.0.1:8080 user@host</code>
-          </article>
-        </div>
-        <pre id="system-info"></pre>
-        <pre id="remote-status-raw"></pre>
+
+        <details class="advanced-panel">
+          <summary>Advanced Status</summary>
+          <pre id="system-info"></pre>
+          <pre id="remote-status-raw"></pre>
+        </details>
       </section>
     </main>
 

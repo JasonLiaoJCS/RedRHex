@@ -1,8 +1,8 @@
 # RedRHex Training Panel
 
-Local admin panel and V2.0 remote-control foundation for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
+Local admin panel and V2.1 remote-control system for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
 
-**Version:** 2.0.0
+**Version:** 2.1.0
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
@@ -32,9 +32,16 @@ Then open:
 http://127.0.0.1:8080
 ```
 
-## V2.0 Remote Team Mode
+## V2.1 Remote Team Mode
 
-V2.0 keeps this local panel as the admin/control-center experience and adds a remote worker architecture for team use outside the lab network.
+V2.1 keeps this local panel as the admin/control-center experience and adds a remote worker architecture for team use outside the lab network.
+
+V2.1 highlights:
+
+- `RedRHex To Go`, the phone-friendly child GitHub Pages UI for dashboard, training launch, reward tuning, history, notes/folders, safe remote actions, and signed team video playback.
+- Local Control Center worker management: start, stop, restart, tmux/child mode, auto-start, accept/pause jobs, status tail, and setup checks.
+- Faster, safer worker sync with heartbeat polling, metadata convergence between mother and child, non-fatal artifact sync, and private video upload records.
+- Child auto-update without full-page rebuilds, so video playback, scrolling, and in-progress edits stay stable.
 
 Remote architecture:
 
@@ -63,11 +70,131 @@ export REDRHEX_DISCORD_WEBHOOK_URL="<discord-webhook>"
 export REDRHEX_RESEND_API_KEY="<resend-key>"
 ```
 
+### Start The Remote Worker
+
+Use this on the training PC when you want the GitHub Pages remote UI to see this machine and launch jobs.
+
+Preferred flow:
+
+```bash
+python -m tools.training_panel --host 127.0.0.1 --port 8080
+```
+
+Open the local panel, go to `Control Center`, then use:
+
+- `Start Worker` / `Stop Worker` / `Restart`
+- `Persist in tmux` for a worker that survives local panel restarts
+- `Child process` for a worker owned by the current panel session
+- `Auto-start worker when the local panel starts` to launch it automatically next time
+- `Accept Jobs` / `Pause Jobs` to control whether remote queued jobs are executed
+
+The panel reads secrets from `~/.redrhex_remote.env` and never shows the machine token in the browser.
+
+Manual fallback:
+
+1. Create a private environment file once:
+
+```bash
+nano ~/.redrhex_remote.env
+```
+
+Paste the remote settings:
+
+```bash
+export REDRHEX_SUPABASE_URL="https://<project>.supabase.co"
+export REDRHEX_SUPABASE_ANON_KEY="<anon-or-publishable-key>"
+export REDRHEX_SUPABASE_MACHINE_TOKEN="<service-role-key>"
+export REDRHEX_MACHINE_ID="biorolapc2-ubuntu"
+export REDRHEX_REMOTE_ACCEPT_JOBS="true"
+export REDRHEX_CLOUDFLARE_TUNNEL_HOST=""
+export REDRHEX_DISCORD_WEBHOOK_URL=""
+export REDRHEX_RESEND_API_KEY=""
+```
+
+Save it, then lock down the file:
+
+```bash
+chmod 600 ~/.redrhex_remote.env
+```
+
+Do not commit this file or paste the service-role key into GitHub Pages. The service-role key belongs only on the training PC.
+
+2. Test the Supabase connection once:
+
+```bash
+cd /home/lab_user1/Py/RedRHex
+source ~/.redrhex_remote.env
+python -m tools.training_panel.remote_worker --once
+```
+
+Expected output should include:
+
+```text
+'machine_id': 'biorolapc2-ubuntu'
+'online': True
+```
+
+If it says `status: disabled`, set `REDRHEX_REMOTE_ACCEPT_JOBS="true"` in `~/.redrhex_remote.env` when you are ready to accept remote jobs.
+
+3. Run the worker continuously in `tmux`:
+
+```bash
+cd /home/lab_user1/Py/RedRHex
+tmux new-session -d -s redrhex_remote_worker 'source ~/.redrhex_remote.env && python -m tools.training_panel.remote_worker'
+```
+
+Check it:
+
+```bash
+tmux ls
+tmux attach -t redrhex_remote_worker
+```
+
+Detach without stopping it:
+
+```text
+Ctrl+B, then D
+```
+
+Stop it:
+
+```bash
+tmux send-keys -t redrhex_remote_worker C-c
+```
+
+If `tmux` is not installed, use a log file instead:
+
+```bash
+cd /home/lab_user1/Py/RedRHex
+mkdir -p logs/training_panel
+nohup bash -lc 'source ~/.redrhex_remote.env && python -m tools.training_panel.remote_worker' \
+  > logs/training_panel/remote_worker.log 2>&1 &
+tail -f logs/training_panel/remote_worker.log
+```
+
+Verify from Supabase:
+
+```text
+Supabase -> Table Editor -> machines -> biorolapc2-ubuntu
+```
+
+The row should show `online = true`, `accept_jobs = true`, and a fresh `heartbeat_at`.
+
+Phone page:
+
+```text
+https://popcorn-volcano.github.io/redrhex-training-remote/
+```
+
+The phone page is the **child** panel: a simplified, team-friendly version of the local **mother** panel. It supports Dashboard, Train, Rewards, History, and Connection views. Team members can check worker health, queue training, tune shared reward presets, review history, edit notes/folders, request video/ONNX jobs, and play private uploaded result videos. Terminal, tmux attach, local file opening, compaction, deletion, and worker administration stay mother-only.
+
 Apply the Supabase schema from:
 
 ```text
 tools/training_panel/supabase/schema.sql
 ```
+
+Re-apply the schema after pulling V2.1 updates. It adds `reward_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
 
 Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .commands import DEFAULT_VIDEO_PRESET, TrainingParams, VideoParams
@@ -17,6 +19,14 @@ from .remote_config import (
 )
 from .supabase_client import SupabaseClient
 
+VIDEO_BUCKET = "redrhex-videos"
+GPU_JOB_TYPES = {"start_training", "record_video", "export_onnx"}
+
+
+def _storage_safe(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return safe or "run"
+
 
 def run_artifacts(run: dict) -> list[dict]:
     artifacts = []
@@ -28,8 +38,38 @@ def run_artifacts(run: dict) -> list[dict]:
     }
     for kind, path in mapping.items():
         if path:
-            artifacts.append({"kind": kind, "path": str(path), "run_id": run.get("id")})
+            local_path = str(path)
+            artifact = {
+                "kind": kind,
+                "path": local_path,
+                "local_path": local_path,
+                "run_id": run.get("id"),
+            }
+            try:
+                file_path = Path(local_path)
+                if file_path.is_file():
+                    artifact["bytes"] = file_path.stat().st_size
+            except OSError:
+                pass
+            artifacts.append(artifact)
     return artifacts
+
+
+def _parse_time(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -61,6 +101,8 @@ class RemoteJobExecutor:
         payload = job.get("payload") or {}
         if not role_allows(actor_role, job_type):
             raise PermissionError(f"Role '{actor_role}' cannot run remote job '{job_type}'")
+        if job_type in GPU_JOB_TYPES and self.gpu_locked():
+            raise RuntimeError("Another Isaac/GPU action is already running")
 
         if job_type == "start_training":
             params = TrainingParams.from_dict(payload)
@@ -71,12 +113,14 @@ class RemoteJobExecutor:
             process_id = str(payload.get("process_id") or payload.get("run_id") or "")
             if not process_id:
                 raise ValueError("process_id is required")
-            stopped = self.processes.stop(process_id)
-            return RemoteJobResult(process_id=process_id, payload={"stopped": stopped})
+            stopped_ids = []
+            if self.processes.stop(process_id):
+                stopped_ids.append(process_id)
+            else:
+                stopped_ids = self.processes.stop_all_for_run(process_id)
+            return RemoteJobResult(process_id=process_id, payload={"stopped": bool(stopped_ids), "stopped_ids": stopped_ids})
 
         if job_type in {"record_video", "export_onnx"}:
-            if self.gpu_locked():
-                raise RuntimeError("Another Isaac/GPU action is already running")
             run = self._run_with_checkpoint(str(payload.get("run_id") or ""))
             if job_type == "record_video":
                 result = self.processes.start_video_recording(
@@ -126,6 +170,8 @@ class RemoteJobExecutor:
                 "id": run.get("id"),
                 "status": run.get("status"),
                 "display_name": run.get("display_name"),
+                "folder": run.get("folder"),
+                "notes": self.history.get_note(str(run.get("id") or "")),
                 "created_at": run.get("created_at"),
                 "updated_at": run.get("updated_at"),
                 "log_dir": run.get("log_dir"),
@@ -152,41 +198,160 @@ class RemoteWorker:
         self.paths = paths
         self.client = client
         self.executor = executor or RemoteJobExecutor(paths)
+        self.history = getattr(self.executor, "history", HistoryStore(paths))
         self.state_store = state_store or RemoteStateStore(paths.remote_state_file)
         self.active_job_id: str | None = None
+        self.last_sync_at = 0.0
+        self.last_sync_error = ""
 
-    def send_heartbeat(self, queue_depth: int = 0) -> dict:
+    def send_heartbeat(self, queue_depth: int = 0, gpu_locked: bool | None = None) -> dict:
         accept_jobs = self.state_store.effective_accept_jobs(self.config)
         payload = heartbeat_payload(
             self.config,
             self.paths,
             active_job_id=self.active_job_id,
             queue_depth=queue_depth,
-            gpu_locked=self.executor.gpu_locked(),
+            gpu_locked=self.executor.gpu_locked() if gpu_locked is None else gpu_locked,
             accept_jobs=accept_jobs,
         )
         self.client.heartbeat(payload)
         return payload
 
+    def pull_remote_run_metadata(self) -> int:
+        try:
+            rows = self.client.select(
+                "runs",
+                query={
+                    "machine_id": f"eq.{self.config.machine_id}",
+                    "select": "id,display_name,folder,notes,updated_at",
+                },
+            )
+        except Exception:
+            return 0
+        if not isinstance(rows, list):
+            return 0
+        updated = 0
+        for remote in rows:
+            run_id = str(remote.get("id") or "")
+            if not run_id:
+                continue
+            local = self.history.get_run(run_id) or {}
+            if _parse_time(str(remote.get("updated_at") or "")) <= _parse_time(str(local.get("updated_at") or "")):
+                continue
+            metadata = {
+                key: remote.get(key)
+                for key in ("display_name", "folder")
+                if key in remote
+            }
+            if metadata:
+                self.history.patch_run_metadata(run_id, **metadata)
+            if "notes" in remote and remote.get("notes") is not None:
+                self.history.set_note(run_id, str(remote.get("notes") or ""))
+            updated += 1
+        return updated
+
     def sync_runs(self) -> list[dict]:
+        self.pull_remote_run_metadata()
         runs = []
         artifacts = []
+        artifact_errors = []
         for run in self.executor.sync_runs_payload():
-            artifact_records = run.pop("artifacts", []) or []
-            runs.append({**run, "machine_id": self.config.machine_id})
-            artifacts.extend({**artifact, "machine_id": self.config.machine_id} for artifact in artifact_records)
+            run_record = dict(run)
+            artifact_records = run_record.pop("artifacts", []) or []
+            now = _now_iso()
+            run_record["created_at"] = run_record.get("created_at") or now
+            run_record["updated_at"] = run_record.get("updated_at") or run_record["created_at"]
+            run_record["params"] = run_record.get("params") or {}
+            runs.append({**run_record, "machine_id": self.config.machine_id})
+            for artifact in artifact_records:
+                try:
+                    record = self._remote_artifact_record(artifact)
+                    if record:
+                        artifacts.append(record)
+                except Exception as exc:
+                    artifact_errors.append(str(exc))
         if runs:
             self.client.upsert("runs", runs)
         if artifacts:
             self.client.upsert("artifacts", artifacts, query={"on_conflict": "run_id,kind,local_path"})
+        if artifact_errors:
+            self.last_sync_error = "; ".join(artifact_errors[-3:])
         return runs
+
+    def sync_if_due(self, force: bool = False) -> str:
+        now = time.time()
+        if not force and now - self.last_sync_at < self.config.sync_interval_seconds:
+            return self.last_sync_error
+        self.last_sync_at = now
+        try:
+            self.sync_runs()
+            self.last_sync_error = ""
+        except Exception as exc:
+            self.last_sync_error = str(exc)
+        return self.last_sync_error
+
+    def _remote_artifact_record(self, artifact: dict) -> dict | None:
+        run_id = str(artifact.get("run_id") or "")
+        local_path = str(artifact.get("local_path") or artifact.get("path") or "")
+        kind = str(artifact.get("kind") or "")
+        if not run_id or not local_path or not kind:
+            return None
+        record = {
+            "run_id": run_id,
+            "machine_id": self.config.machine_id,
+            "kind": kind,
+            "local_path": local_path,
+            "storage_path": None,
+            "public_url": None,
+            "bytes": None,
+        }
+        if artifact.get("bytes") is not None:
+            record["bytes"] = int(artifact["bytes"])
+        elif Path(local_path).is_file():
+            record["bytes"] = Path(local_path).stat().st_size
+        if kind == "video":
+            storage_path = self._ensure_video_storage_path(run_id, local_path)
+            if storage_path:
+                record["storage_path"] = storage_path
+        return record
+
+    def _ensure_video_storage_path(self, run_id: str, local_path: str) -> str | None:
+        path = Path(local_path)
+        if not path.is_file():
+            return None
+        existing = self._existing_artifact(run_id, "video", local_path)
+        if existing and existing.get("storage_path"):
+            return str(existing["storage_path"])
+        storage_path = f"runs/{_storage_safe(run_id)}/videos/{_storage_safe(path.name)}"
+        self.client.upload_storage_object(VIDEO_BUCKET, storage_path, path, content_type="video/mp4")
+        return storage_path
+
+    def _existing_artifact(self, run_id: str, kind: str, local_path: str) -> dict | None:
+        try:
+            rows = self.client.select(
+                "artifacts",
+                query={
+                    "run_id": f"eq.{run_id}",
+                    "kind": f"eq.{kind}",
+                    "local_path": f"eq.{local_path}",
+                    "select": "run_id,kind,local_path,storage_path",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return None
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
 
     def poll_once(self) -> dict:
         accept_jobs = self.state_store.effective_accept_jobs(self.config)
-        heartbeat = self.send_heartbeat()
+        gpu_locked = self.executor.gpu_locked()
+        heartbeat = self.send_heartbeat(gpu_locked=gpu_locked)
+        self.sync_if_due()
         if not accept_jobs:
             return {"status": "disabled", "heartbeat": heartbeat}
-        job = self.client.claim_next_job(self.config.machine_id)
+        job = self.client.claim_next_job(self.config.machine_id, gpu_locked=gpu_locked)
         if not job:
             return {"status": "idle", "heartbeat": heartbeat}
 
@@ -194,12 +359,17 @@ class RemoteWorker:
         self.active_job_id = job_id
         try:
             result = self.executor.execute(job).to_dict()
-            self.sync_runs()
+            sync_error = self.sync_if_due(force=True)
+            if sync_error:
+                result.setdefault("payload", {})["sync_error"] = sync_error
             self.client.complete_job(job_id, result)
             return {"status": "completed", "job_id": job_id, "result": result}
         except Exception as exc:
-            self.sync_runs()
-            self.client.fail_job(job_id, str(exc), {"job": job})
+            sync_error = self.sync_if_due(force=True)
+            result = {"job": job}
+            if sync_error:
+                result["sync_error"] = sync_error
+            self.client.fail_job(job_id, str(exc), result)
             return {"status": "failed", "job_id": job_id, "error": str(exc)}
         finally:
             self.active_job_id = None
@@ -207,7 +377,10 @@ class RemoteWorker:
 
     def run_forever(self) -> None:
         while True:
-            self.poll_once()
+            try:
+                self.poll_once()
+            except Exception as exc:
+                print(f"[remote-worker] poll error: {exc}")
             time.sleep(self.config.poll_interval_seconds)
 
 

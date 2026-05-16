@@ -66,6 +66,10 @@ class PanelPaths:
         return self.panel_log_root / "remote_state.json"
 
     @property
+    def convergence_config_file(self) -> Path:
+        return self.panel_log_root / "convergence_config.json"
+
+    @property
     def rsl_rl_log_root(self) -> Path:
         return self.repo_root / "logs" / "rsl_rl" / "redrhex_wheg"
 

@@ -17,7 +17,8 @@ from .config import PanelPaths
 from .history import HistoryStore
 from .presets import PresetStore
 from .processes import ProcessRegistry, ProcessStartError
-from .remote_config import RemoteConfig, RemoteStateStore
+from .remote_config import RemoteStateStore
+from .remote_manager import RemoteWorkerManager
 from .rewards import reward_defaults, reward_file_index
 
 
@@ -31,7 +32,7 @@ def route_id(path: str) -> str:
 
 def route_id2(path: str) -> str:
     """Extract the second path segment ID (index 4), e.g. /api/presets/{id}/delete."""
-    return unquote(path.split("/")[3])
+    return unquote(path.split("/")[4])
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -46,8 +47,9 @@ class PanelState:
         self.history = HistoryStore(paths)
         self.processes = ProcessRegistry(paths, self.history)
         self.presets = PresetStore(_PRESET_FILE)
-        self.remote_config = RemoteConfig.from_env()
         self.remote_state = RemoteStateStore(paths.remote_state_file)
+        self.remote_worker = RemoteWorkerManager(paths, self.remote_state)
+        self.remote_worker.autostart_if_enabled()
 
 
 class PanelHandler(BaseHTTPRequestHandler):
@@ -76,11 +78,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             active_isaac = self.state.processes.running_isaac_processes()
             return self._json(
                 {
-                    **self.state.remote_config.public_status(self.state.paths, self.state.remote_state),
+                    **self.state.remote_worker.status(),
                     "active_process_count": len([p for p in processes if p.get("returncode") is None]),
                     "active_isaac_process_count": len(active_isaac),
                     "active_isaac_processes": active_isaac,
-                    "remote_state": self.state.remote_state.load(),
                 }
             )
         if parsed.path == "/api/training/defaults":
@@ -145,6 +146,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             if not debug:
                 return self._json({"error": "Process not found"}, status=404)
             return self._json(debug)
+        if parsed.path == "/api/convergence/settings":
+            from .convergence import PRESETS, load_convergence_config
+            cfg = load_convergence_config(self.state.paths.convergence_config_file)
+            from dataclasses import asdict
+            return self._json({"config": asdict(cfg), "presets": PRESETS})
         self._not_found()
 
     def do_POST(self) -> None:
@@ -155,19 +161,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                 params = TrainingParams.from_dict(payload)
                 return self._json(self.state.processes.start_training(params), status=201)
             if parsed.path == "/api/remote/settings":
-                updates: dict = {}
-                if "accept_jobs" in payload:
-                    updates["accept_jobs"] = bool(payload["accept_jobs"])
-                if not updates:
-                    return self._json({"error": "No remote setting was provided"}, status=400)
-                state = self.state.remote_state.save(updates)
-                return self._json(
-                    {
-                        "saved": True,
-                        "remote_state": state,
-                        "status": self.state.remote_config.public_status(self.state.paths, self.state.remote_state),
-                    }
-                )
+                state = self.state.remote_worker.save_settings(payload)
+                return self._json({"saved": True, "remote_state": state, "status": self.state.remote_worker.status()})
+            if parsed.path == "/api/remote/worker/start":
+                return self._json(self.state.remote_worker.start(str(payload.get("mode") or "")))
+            if parsed.path == "/api/remote/worker/stop":
+                return self._json(self.state.remote_worker.stop())
+            if parsed.path == "/api/remote/worker/restart":
+                return self._json(self.state.remote_worker.restart(str(payload.get("mode") or "")))
             if parsed.path == "/api/presets":
                 name = str(payload.get("name") or "").strip()
                 description = str(payload.get("description") or "").strip()
@@ -339,6 +340,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     ),
                     status=201,
                 )
+            if parsed.path == "/api/convergence/settings":
+                from dataclasses import asdict
+                from .convergence import PRESETS, apply_settings
+                cfg = apply_settings(payload, self.state.paths.convergence_config_file)
+                return self._json({"saved": True, "config": asdict(cfg), "presets": PRESETS})
         except ProcessStartError as exc:
             return self._json(exc.payload, status=500)
         except ValueError as exc:

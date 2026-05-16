@@ -144,6 +144,9 @@ class ProcessRegistryTests(unittest.TestCase):
 
     def test_successful_training_monitor_starts_video_recording(self):
         class CompletedProcess:
+            def poll(self):
+                return 0  # non-None → while loop body skipped immediately
+
             def wait(self):
                 return 0
 

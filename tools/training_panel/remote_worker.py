@@ -1,4 +1,4 @@
-"""Entry point for the RedRHex V2.0 remote worker."""
+"""Entry point for the RedRHex V2.1 remote worker."""
 
 from .training_panel.remote_worker import main
 
