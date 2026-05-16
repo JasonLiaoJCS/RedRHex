@@ -504,6 +504,9 @@ export function buildRunMetadataPatch({ displayName = "", folder = "", notes = "
 
 export function friendlyErrorMessage(error) {
   const message = error?.message || String(error || "");
+  if (/Requested function was not found|NOT_FOUND/i.test(message)) {
+    return `${message} Deploy the Supabase notify Edge Function, then reload this page.`;
+  }
   if (/schema cache|could not find.*schema|could not find the table/i.test(message)) {
     return `${message} Apply the latest schema.sql in Supabase, then reload the PostgREST schema cache.`;
   }

@@ -42,7 +42,7 @@ import {
   videoArtifactForCheckpoint,
   videoStateForCheckpoint,
   videoStateForRun,
-} from "./core.js";
+} from "./core.js?v=3.0.0-discord-test-feedback";
 
 const PHONE_MEDIA = window.matchMedia
   ? window.matchMedia("(max-width: 720px)")
@@ -1410,9 +1410,11 @@ function notificationChannelResult(result) {
   if (!result) return "";
   const parts = Object.entries(result).map(([channel, value]) => {
     const item = value && typeof value === "object" ? value : {};
-    if (item.skipped) return `${channel}: skipped`;
+    if (item.pending) return `${channel}: sending`;
+    const detail = item.error || item.reason || item.status || "";
+    if (item.skipped) return `${channel}: skipped${detail ? ` (${detail})` : ""}`;
     if (item.ok) return `${channel}: sent`;
-    return `${channel}: failed`;
+    return `${channel}: failed${detail ? ` (${detail})` : ""}`;
   });
   return parts.join(" · ");
 }
@@ -2357,19 +2359,28 @@ async function saveNotificationSettings({ silent = false } = {}) {
 }
 
 async function sendTestNotification() {
-  await saveNotificationSettings({ silent: true });
-  const result = await invokeFunction("notify", {
-    event_type: "test_notification",
-    machine_id: state.machineId,
-    payload: {
-      display_name: "Notification test",
-      task: "Connection page",
-      remote_url: window.location.href,
-    },
-  });
-  state.notificationTestResult = result;
+  state.notificationTestResult = { results: { discord: { pending: true } } };
   patchConnection();
-  setMessage(result?.ok ? "Test notification sent." : "Test notification finished with warnings.");
+  try {
+    await saveNotificationSettings({ silent: true });
+    const result = await invokeFunction("notify", {
+      event_type: "test_notification",
+      machine_id: state.machineId,
+      payload: {
+        display_name: "Notification test",
+        task: "Connection page",
+        remote_url: window.location.href,
+      },
+    });
+    state.notificationTestResult = result;
+    patchConnection();
+    setMessage(result?.ok ? "Test notification sent." : "Test notification finished with warnings.");
+  } catch (error) {
+    const message = friendlyErrorMessage(error);
+    state.notificationTestResult = { ok: false, results: { discord: { ok: false, error: message } } };
+    patchConnection();
+    setMessage(message);
+  }
 }
 
 async function loadVideo(storagePath) {
