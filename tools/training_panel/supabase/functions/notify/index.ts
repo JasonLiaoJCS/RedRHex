@@ -215,7 +215,7 @@ async function existingEvent(eventKey: string): Promise<RunEventRow | null> {
   return rows[0] ?? null;
 }
 
-async function recordEvent(event: NotifyRequest, status: string, results: Record<string, unknown>) {
+async function recordEvent(event: NotifyRequest, status: string, results: Record<string, unknown>, existing: RunEventRow | null = null) {
   const eventKey = event.event_key ?? `${event.event_type}:${event.run_id ?? "no-run"}:${Date.now()}`;
   const now = new Date().toISOString();
   const body = {
@@ -230,14 +230,19 @@ async function recordEvent(event: NotifyRequest, status: string, results: Record
     notified_at: now,
     discord_sent_at: (results.discord as Record<string, unknown> | undefined)?.ok ? now : null,
   };
-  await rest(
-    `/rest/v1/run_events?on_conflict=event_key`,
-    {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+  if (existing?.id) {
+    await rest(`/rest/v1/run_events?id=eq.${encodeURIComponent(existing.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
       body: JSON.stringify(body),
-    },
-  );
+    });
+    return;
+  }
+  await rest("/rest/v1/run_events", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify(body),
+  });
 }
 
 Deno.serve(async (request) => {
@@ -278,19 +283,19 @@ Deno.serve(async (request) => {
   );
 
   const existing = await existingEvent(event.event_key);
-  if (existing?.notified_at) {
+  if (existing?.notified_at && existing.notification_status === "sent") {
     return jsonResponse({ ok: true, deduped: true, results: existing.channel_results ?? {}, status: existing.notification_status });
   }
 
   const settings = await settingsFor(event.requester_id, event.machine_id);
   if (!settings) {
     const results = { discord: { skipped: true, reason: "No notification settings" } };
-    await recordEvent(event, "skipped", results);
+    await recordEvent(event, "skipped", results, existing);
     return jsonResponse({ ok: true, status: "skipped", results });
   }
   if (!eventEnabled(settings, event.event_type)) {
     const results = { discord: { skipped: true, reason: "Event disabled" } };
-    await recordEvent(event, "disabled", results);
+    await recordEvent(event, "disabled", results, existing);
     return jsonResponse({ ok: true, status: "disabled", results });
   }
 
@@ -311,6 +316,6 @@ Deno.serve(async (request) => {
     return item.skipped || item.ok;
   });
   const status = attempted ? (allOk ? "sent" : "partial") : "no_channels";
-  await recordEvent(event, status, results);
+  await recordEvent(event, status, results, existing);
   return jsonResponse({ ok: allOk, status, results });
 });

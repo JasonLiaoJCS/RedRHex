@@ -97,3 +97,18 @@ def test_edge_function_is_discord_only():
     assert "REDRHEX_RESEND_API_KEY" not in source
     assert "REDRHEX_NOTIFICATION_EMAIL_FROM" not in source
     assert "REDRHEX_NOTIFICATION_EMAIL_TO" not in source
+
+
+def test_edge_function_retries_previously_skipped_events():
+    source = Path("tools/training_panel/supabase/functions/notify/index.ts").read_text(encoding="utf-8")
+
+    assert 'existing?.notified_at && existing.notification_status === "sent"' in source
+    assert "existing?.notified_at)" not in source
+
+
+def test_edge_function_records_events_without_postgrest_on_conflict():
+    source = Path("tools/training_panel/supabase/functions/notify/index.ts").read_text(encoding="utf-8")
+
+    assert "on_conflict=event_key" not in source
+    assert 'method: "PATCH"' in source
+    assert 'method: "POST"' in source
