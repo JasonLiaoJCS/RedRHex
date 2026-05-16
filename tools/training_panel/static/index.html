@@ -20,11 +20,12 @@
         <button class="nav-button" data-view="rewards">Rewards</button>
         <button class="nav-button" data-view="terrain">Terrain</button>
         <button class="nav-button" data-view="history">History</button>
+        <button class="nav-button" data-view="convergence">Convergence</button>
         <button class="nav-button" data-view="activity">Activity</button>
         <button class="nav-button" data-view="access">Control Center</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 2.2.0</span>
+        <span class="release-version">Version 3.0.0</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -37,7 +38,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V2.2.0</span>
+          <span class="release-chip">Training Panel V3.0.0</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -370,6 +371,79 @@
         </div>
       </section>
 
+      <section id="convergence" class="view">
+        <div class="convergence-page">
+          <article class="control-card" id="convergence-card">
+            <div class="card-head">
+              <div>
+                <h2>Convergence Detection</h2>
+                <p class="muted-copy">Define when a reward curve is stable enough to inspect or stop tuning manually.</p>
+              </div>
+              <span id="convergence-badge" class="status-badge muted-pill">Off</span>
+            </div>
+
+            <div class="convergence-layout">
+              <div>
+                <label class="toggle-row">
+                  <input type="checkbox" id="convergence-enabled" />
+                  <span>Enable convergence detection</span>
+                </label>
+                <div class="segmented-control" aria-label="Convergence sensitivity preset" id="convergence-presets">
+                  <button type="button" class="segment-button" data-preset="loose"
+                    data-tooltip="Triggers after 100 stable iterations at 5% threshold. Fast but may fire on a short plateau.">Loose</button>
+                  <button type="button" class="segment-button active" data-preset="default"
+                    data-tooltip="Triggers after 200 stable iterations at 2% threshold. Good for most runs.">Default</button>
+                  <button type="button" class="segment-button" data-preset="strict"
+                    data-tooltip="Triggers after 400 stable iterations at 1% threshold. Conservative — fewer false positives.">Strict</button>
+                  <button type="button" class="segment-button" data-preset="custom"
+                    data-tooltip="Set your own window size and improvement threshold below.">Custom</button>
+                </div>
+                <p id="convergence-preset-hint" class="muted-copy"></p>
+              </div>
+
+              <div class="setting-panel">
+                <div id="convergence-custom-inputs" style="display:none">
+                  <div class="form-row">
+                    <label for="convergence-window">Window (iterations)</label>
+                    <input type="number" id="convergence-window" min="50" max="2000" step="10" value="200" />
+                  </div>
+                  <div class="form-row">
+                    <label for="convergence-threshold">Max improvement %</label>
+                    <input type="number" id="convergence-threshold" min="0.1" max="20" step="0.1" value="2.0" />
+                  </div>
+                </div>
+                <label class="toggle-row"
+                  data-tooltip="When convergence is detected, a video recording is queued automatically once training finishes.">
+                  <input type="checkbox" id="convergence-auto-record" checked />
+                  <span>Auto-record video after convergence</span>
+                </label>
+                <div class="form-actions compact-actions">
+                  <button type="button" id="convergence-save" class="primary-button small-button"
+                    data-tooltip="Save convergence detection settings to disk. Takes effect on the next training run.">Save Settings</button>
+                </div>
+              </div>
+            </div>
+            <div id="convergence-info-grid" class="run-info-grid compact-info-grid"></div>
+          </article>
+
+          <aside class="control-card convergence-definitions">
+            <div class="card-head simple-card-head">
+              <div>
+                <h2>Definitions</h2>
+                <p class="muted-copy">These settings stay mother-only so the training PC remains the source of truth.</p>
+              </div>
+            </div>
+            <div class="definition-list">
+              <div><strong>Window</strong><span>How many recent training iterations are compared as one stability slice.</span></div>
+              <div><strong>Threshold</strong><span>Maximum reward improvement inside that window before the run is considered plateaued.</span></div>
+              <div><strong>Cooldown</strong><span>Minimum time before another convergence notification can be considered for the same run.</span></div>
+              <div><strong>Scalar Tag</strong><span>The TensorBoard scalar used for the reward curve, currently loaded from the mother convergence config.</span></div>
+              <div><strong>Auto-record</strong><span>Queues a result video after training finishes when convergence was detected.</span></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
       <section id="activity" class="view">
         <div class="activity-head">
           <div>
@@ -466,59 +540,6 @@
                   </section>
                 </div>
               </details>
-            </article>
-
-            <article class="control-card" id="convergence-card">
-              <div class="card-head">
-                <div>
-                  <h2>Convergence Detection</h2>
-                  <p class="muted-copy">Notify the team when reward stops improving instead of manually watching TensorBoard.</p>
-                </div>
-                <span id="convergence-badge" class="status-badge muted-pill">Off</span>
-              </div>
-
-              <div class="convergence-layout">
-                <div>
-                  <label class="toggle-row">
-                    <input type="checkbox" id="convergence-enabled" />
-                    <span>Enable convergence detection</span>
-                  </label>
-                  <div class="segmented-control" aria-label="Convergence sensitivity preset" id="convergence-presets">
-                    <button type="button" class="segment-button" data-preset="loose"
-                      data-tooltip="Triggers after 100 stable iterations at 5% threshold. Fast but may fire on a short plateau.">Loose</button>
-                    <button type="button" class="segment-button active" data-preset="default"
-                      data-tooltip="Triggers after 200 stable iterations at 2% threshold. Good for most runs.">Default</button>
-                    <button type="button" class="segment-button" data-preset="strict"
-                      data-tooltip="Triggers after 400 stable iterations at 1% threshold. Conservative — fewer false positives.">Strict</button>
-                    <button type="button" class="segment-button" data-preset="custom"
-                      data-tooltip="Set your own window size and improvement threshold below.">Custom</button>
-                  </div>
-                  <p id="convergence-preset-hint" class="muted-copy"></p>
-                </div>
-
-                <div class="setting-panel">
-                  <div id="convergence-custom-inputs" style="display:none">
-                    <div class="form-row">
-                      <label for="convergence-window">Window (iterations)</label>
-                      <input type="number" id="convergence-window" min="50" max="2000" step="10" value="200" />
-                    </div>
-                    <div class="form-row">
-                      <label for="convergence-threshold">Max improvement %</label>
-                      <input type="number" id="convergence-threshold" min="0.1" max="20" step="0.1" value="2.0" />
-                    </div>
-                  </div>
-                  <label class="toggle-row"
-                    data-tooltip="When convergence is detected, a video recording is queued automatically once training finishes.">
-                    <input type="checkbox" id="convergence-auto-record" checked />
-                    <span>Auto-record video after convergence</span>
-                  </label>
-                  <div class="form-actions compact-actions">
-                    <button type="button" id="convergence-save" class="primary-button small-button"
-                      data-tooltip="Save convergence detection settings to disk. Takes effect on the next training run.">Save Settings</button>
-                  </div>
-                </div>
-              </div>
-              <div id="convergence-info-grid" class="run-info-grid compact-info-grid"></div>
             </article>
 
             <details class="advanced-panel">

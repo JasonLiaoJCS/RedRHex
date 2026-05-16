@@ -87,6 +87,20 @@ class SupabaseClient:
             raise RemoteAPIError(str(exc)) from exc
         return json.loads(raw) if raw else None
 
+    def function_request(self, name: str, payload: dict | None = None):
+        url = f"{self.config.supabase_url}/functions/v1/{quote(name.strip('/'), safe='')}"
+        data = json.dumps(payload or {}).encode("utf-8")
+        request = Request(url, data=data, method="POST", headers=self._headers())
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RemoteAPIError(f"HTTP {exc.code} for POST {url}: {detail}") from exc
+        except Exception as exc:
+            raise RemoteAPIError(str(exc)) from exc
+        return json.loads(raw) if raw else None
+
     def upload_storage_object(
         self,
         bucket: str,

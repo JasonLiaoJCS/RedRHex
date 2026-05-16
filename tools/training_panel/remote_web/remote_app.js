@@ -3,6 +3,7 @@ import {
   createSignedVideoUrl,
   currentUser,
   insert,
+  invokeFunction,
   loadRemoteSnapshot,
   remove,
   select,
@@ -50,6 +51,12 @@ const PHONE_MEDIA = window.matchMedia
 const TEXT_AUTOSAVE_DELAY_MS = 350;
 const THEME_KEY = "redrhex_to_go_theme";
 const VIEW_IDS = ["train", "rewards", "terrain", "history", "connection", "dashboard"];
+const NOTIFICATION_EVENTS = [
+  ["notify_training_converged", "Converged", "Reward improvement has flattened."],
+  ["notify_training_completed", "Completed", "Training finished successfully."],
+  ["notify_training_failed", "Failed / Interrupted", "Training failed or was stopped before finishing."],
+  ["notify_video_ready", "Video Ready", "A requested or automatic result video is available."],
+];
 
 function initialView() {
   const stored = localStorage.getItem("redrhex_child_view");
@@ -76,6 +83,7 @@ const state = {
     artifacts: [],
     presets: [],
     terrainPresets: [],
+    notificationSettings: null,
     schema: { artifacts: true, rewardPresets: true, terrainPresets: true, warnings: [] },
   },
   selectedPresetId: localStorage.getItem("redrhex_child_preset") || "baseline",
@@ -108,6 +116,9 @@ const state = {
   terrainPresetMetadataAutosaveTimer: null,
   terrainPresetMetadataSaveInFlight: false,
   terrainPresetMetadataQueued: false,
+  notificationSettings: null,
+  notificationSaveStatus: "saved",
+  notificationTestResult: null,
   message: "",
   loading: false,
   loadError: "",
@@ -123,6 +134,36 @@ document.documentElement.dataset.theme = state.theme;
 
 function role() {
   return state.profile?.role || "viewer";
+}
+
+function defaultNotificationSettings() {
+  return {
+    user_id: state.user?.id || null,
+    machine_id: state.machineId,
+    email_enabled: false,
+    discord_enabled: false,
+    discord_webhook_url: "",
+    notify_training_converged: true,
+    notify_training_completed: true,
+    notify_training_failed: true,
+    notify_video_ready: true,
+  };
+}
+
+function normalizeNotificationSettings(raw = null) {
+  return {
+    ...defaultNotificationSettings(),
+    ...(raw || {}),
+    user_id: raw?.user_id || state.user?.id || null,
+    machine_id: raw?.machine_id || state.machineId,
+    email_enabled: Boolean(raw?.email_enabled),
+    discord_enabled: Boolean(raw?.discord_enabled),
+    discord_webhook_url: String(raw?.discord_webhook_url || ""),
+    notify_training_converged: raw?.notify_training_converged !== false,
+    notify_training_completed: raw?.notify_training_completed !== false,
+    notify_training_failed: raw?.notify_training_failed !== false,
+    notify_video_ready: raw?.notify_video_ready !== false,
+  };
 }
 
 function selectedPreset() {
@@ -305,9 +346,10 @@ async function refresh(options = {}) {
   state.loadError = "";
   if (!silent) render();
   try {
-    state.snapshot = await loadRemoteSnapshot(state.machineId);
+    state.snapshot = await loadRemoteSnapshot(state.machineId, state.user?.id || "");
     state.snapshot.presets = state.snapshot.presets.map(normalizePreset);
     state.snapshot.terrainPresets = (state.snapshot.terrainPresets || []).map(normalizeTerrainPreset);
+    state.notificationSettings = normalizeNotificationSettings(state.snapshot.notificationSettings);
     if (!state.selectedRunId && state.snapshot.runs[0] && !(state.view === "history" && state.isPhone)) {
       state.selectedRunId = state.snapshot.runs[0].id;
     }
@@ -734,7 +776,7 @@ function presetRail(kind, preset, schemaReady) {
         <button class="preset-button ${item.id === preset.id ? "active" : ""} ${item.draft ? "draft-preset" : ""}" data-action="${selectAction}" data-id="${escapeHtml(item.id)}">
           <strong>${escapeHtml(item.name)}</strong>
           <small>${item.draft ? "Unsaved draft" : item.built_in ? "Built-in" : "Team preset"} · ${escapeHtml(formatRelativeTime(item.updated_at))}</small>
-        </button>`).join("") || empty("Apply the V2.1 schema to create presets.")}
+        </button>`).join("") || empty("Apply the latest schema to create presets.")}
       </div>
     </aside>
   `;
@@ -1362,6 +1404,69 @@ function runDetails(run, { context = "desktop" } = {}) {
   `;
 }
 
+function notificationSettingsForView() {
+  return normalizeNotificationSettings(state.notificationSettings);
+}
+
+function notificationChannelResult(result) {
+  if (!result) return "";
+  const parts = Object.entries(result).map(([channel, value]) => {
+    const item = value && typeof value === "object" ? value : {};
+    if (item.skipped) return `${channel}: skipped`;
+    if (item.ok) return `${channel}: sent`;
+    return `${channel}: failed`;
+  });
+  return parts.join(" · ");
+}
+
+function notificationSettingsCard() {
+  const settings = notificationSettingsForView();
+  const email = state.user?.email || state.profile?.email || "";
+  const testText = state.notificationTestResult ? notificationChannelResult(state.notificationTestResult.results || {}) : "";
+  return `
+    <article class="panel span-2 notification-card">
+      <div class="section-head">
+        <div>
+          <h2>Notifications</h2>
+          <p class="muted">Run alerts go only to the person who queued the run.</p>
+        </div>
+        <span class="badge ${state.notificationSaveStatus === "error" ? "bad" : state.notificationSaveStatus === "saving" ? "info" : "good"}">${escapeHtml(state.notificationSaveStatus)}</span>
+      </div>
+      <div class="notification-grid">
+        <section>
+          <label class="switch-row">
+            <input id="notify-email-enabled" type="checkbox" ${settings.email_enabled ? "checked" : ""}>
+            <span>Email</span>
+          </label>
+          <p class="muted">Destination: <strong>${escapeHtml(email || "current Supabase email")}</strong></p>
+          <label class="switch-row">
+            <input id="notify-discord-enabled" type="checkbox" ${settings.discord_enabled ? "checked" : ""}>
+            <span>Discord</span>
+          </label>
+          <label>Discord Webhook
+            <input id="notify-discord-webhook" type="url" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(settings.discord_webhook_url)}">
+          </label>
+        </section>
+        <section>
+          <h3>Events</h3>
+          <div class="notification-events">
+            ${NOTIFICATION_EVENTS.map(([key, label, detail]) => `
+              <label class="switch-row">
+                <input class="notify-event-toggle" data-key="${escapeHtml(key)}" type="checkbox" ${settings[key] ? "checked" : ""}>
+                <span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(detail)}</small></span>
+              </label>`).join("")}
+          </div>
+        </section>
+      </div>
+      <div class="button-row wrap">
+        <button class="primary" data-action="save-notification-settings">Save Notifications</button>
+        <button data-action="send-test-notification">Send Test</button>
+      </div>
+      ${testText ? `<p class="muted">${escapeHtml(testText)}</p>` : ""}
+    </article>
+  `;
+}
+
 function connectionView() {
   const checks = healthChecks();
   return `
@@ -1397,6 +1502,7 @@ function connectionView() {
         <p class="muted">Role: ${escapeHtml(role())}</p>
         <p class="muted">Project: ${escapeHtml(new URL(SUPABASE_URL).host)}</p>
       </article>
+      ${notificationSettingsCard()}
     </section>
   `;
 }
@@ -1643,7 +1749,7 @@ function patchHistory({ forceList = false } = {}) {
 
 function patchConnection() {
   const connectionGrid = document.querySelector(".connection-grid");
-  if (connectionGrid && !["connection-machine-id"].includes(document.activeElement?.id)) {
+  if (connectionGrid && !["connection-machine-id", "notify-discord-webhook"].includes(document.activeElement?.id)) {
     connectionGrid.outerHTML = connectionView();
   }
 }
@@ -2224,6 +2330,57 @@ async function compactSelectedRun() {
   await queueRunAction("compact_run", "Queued run compaction.", { confirmation: run.id });
 }
 
+function collectNotificationSettings() {
+  const settings = notificationSettingsForView();
+  const next = {
+    ...settings,
+    user_id: state.user?.id || settings.user_id,
+    machine_id: state.machineId,
+    email_enabled: Boolean(document.querySelector("#notify-email-enabled")?.checked),
+    discord_enabled: Boolean(document.querySelector("#notify-discord-enabled")?.checked),
+    discord_webhook_url: String(document.querySelector("#notify-discord-webhook")?.value || "").trim(),
+    updated_at: new Date().toISOString(),
+  };
+  document.querySelectorAll(".notify-event-toggle").forEach((input) => {
+    next[input.dataset.key] = Boolean(input.checked);
+  });
+  return next;
+}
+
+async function saveNotificationSettings({ silent = false } = {}) {
+  const payload = collectNotificationSettings();
+  state.notificationSaveStatus = "saving";
+  patchConnection();
+  try {
+    const rows = await upsert("notification_settings", payload, "user_id,machine_id");
+    state.notificationSettings = normalizeNotificationSettings(rows?.[0] || payload);
+    state.notificationSaveStatus = "saved";
+    if (!silent) setMessage("Notification settings saved.");
+    await refresh({ silent: true });
+  } catch (error) {
+    state.notificationSaveStatus = "error";
+    throw error;
+  } finally {
+    patchConnection();
+  }
+}
+
+async function sendTestNotification() {
+  await saveNotificationSettings({ silent: true });
+  const result = await invokeFunction("notify", {
+    event_type: "test_notification",
+    machine_id: state.machineId,
+    payload: {
+      display_name: "Notification test",
+      task: "Connection page",
+      remote_url: window.location.href,
+    },
+  });
+  state.notificationTestResult = result;
+  patchConnection();
+  setMessage(result?.ok ? "Test notification sent." : "Test notification finished with warnings.");
+}
+
 async function loadVideo(storagePath) {
   state.signedVideos[storagePath] = {
     url: await createSignedVideoUrl(storagePath),
@@ -2356,6 +2513,8 @@ document.addEventListener("click", async (event) => {
     if (action === "tweak-run") return tweakFromRun(selectedRun()?.id || "");
     if (action === "job-tensorboard") return await queueTensorBoard();
     if (action === "job-compact-run") return await compactSelectedRun();
+    if (action === "save-notification-settings") return await saveNotificationSettings();
+    if (action === "send-test-notification") return await sendTestNotification();
   } catch (error) {
     setMessage(friendlyErrorMessage(error));
   }
@@ -2406,6 +2565,11 @@ document.addEventListener("change", (event) => {
   if (event.target.classList.contains("terrain-input") && state.draftTerrainPreset) {
     state.draftTerrainPreset.values[event.target.dataset.key] = parseTerrainValue(event.target);
   }
+  if (event.target.id?.startsWith("notify-") || event.target.classList.contains("notify-event-toggle")) {
+    state.notificationSettings = normalizeNotificationSettings(collectNotificationSettings());
+    state.notificationSaveStatus = "dirty";
+    patchConnection();
+  }
 });
 
 document.addEventListener("input", (event) => {
@@ -2452,6 +2616,10 @@ document.addEventListener("input", (event) => {
   }
   if (event.target.classList.contains("terrain-input") && state.draftTerrainPreset) {
     state.draftTerrainPreset.values[event.target.dataset.key] = parseTerrainValue(event.target);
+  }
+  if (event.target.id === "notify-discord-webhook") {
+    state.notificationSettings = normalizeNotificationSettings(collectNotificationSettings());
+    state.notificationSaveStatus = "dirty";
   }
 });
 

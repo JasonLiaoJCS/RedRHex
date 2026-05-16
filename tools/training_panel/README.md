@@ -1,8 +1,8 @@
 # RedRHex Training Panel
 
-Local admin panel and V2.1 remote-control system for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
+Local admin panel and V3.0 remote-control system for launching RSL-RL training runs, tuning rewards/terrain, viewing run history, keeping notes, coordinating team access, and sending requester-scoped notifications.
 
-**Version:** 2.2.0
+**Version:** 3.0.0
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
@@ -32,16 +32,17 @@ Then open:
 http://127.0.0.1:8080
 ```
 
-## V2.1 Remote Team Mode
+## V3.0 Remote Team Mode
 
-V2.1 keeps this local panel as the admin/control-center experience and adds a remote worker architecture for team use outside the lab network.
+V3.0 keeps this local panel as the admin/control-center experience and adds requester-scoped email/Discord notifications to the remote worker architecture.
 
-V2.1 highlights:
+V3.0 highlights:
 
 - `RedRHex To Go`, the phone-friendly child GitHub Pages UI for dashboard, training launch, reward tuning, history, notes/folders, safe remote actions, and signed team video playback.
 - Local Control Center worker management: start, stop, restart, tmux/child mode, auto-start, accept/pause jobs, status tail, and setup checks.
 - Faster, safer worker sync with heartbeat polling, metadata convergence between mother and child, non-fatal artifact sync, and private video upload records.
 - Child auto-update without full-page rebuilds, so video playback, scrolling, and in-progress edits stay stable.
+- Per-user notification settings from the child Connection page, using the Supabase login email plus an optional Discord webhook.
 
 Remote architecture:
 
@@ -49,7 +50,7 @@ Remote architecture:
 - Supabase stores team login, roles, run/job state, artifacts, proxy sessions, and notification events.
 - This training PC runs a worker that polls Supabase and executes queued jobs locally.
 - Cloudflare Tunnel provides secure live console and TensorBoard access.
-- Discord and email notifications are generated from completion/failure events.
+- Requester-only email and Discord notifications are dispatched by the Supabase `notify` Edge Function for convergence, completion, failure/interruption, and video-ready events.
 
 Worker command:
 
@@ -66,8 +67,15 @@ export REDRHEX_SUPABASE_MACHINE_TOKEN="<machine-token>"
 export REDRHEX_MACHINE_ID="biorolapc2-ubuntu"
 export REDRHEX_REMOTE_ACCEPT_JOBS="false"
 export REDRHEX_CLOUDFLARE_TUNNEL_HOST="https://<tunnel-host>"
-export REDRHEX_DISCORD_WEBHOOK_URL="<discord-webhook>"
-export REDRHEX_RESEND_API_KEY="<resend-key>"
+```
+
+Notification delivery secrets live on the Supabase Edge Function, not in the child page:
+
+```bash
+supabase secrets set REDRHEX_RESEND_API_KEY="<resend-key>"
+supabase secrets set REDRHEX_NOTIFICATION_EMAIL_FROM="RedRHex Training <training@example.com>"
+supabase secrets set REDRHEX_SUPABASE_MACHINE_TOKEN="<machine-token-if-not-service-role>"
+supabase functions deploy notify --project-ref <project-ref> --no-verify-jwt
 ```
 
 ### Start The Remote Worker
@@ -107,8 +115,6 @@ export REDRHEX_SUPABASE_MACHINE_TOKEN="<service-role-key>"
 export REDRHEX_MACHINE_ID="biorolapc2-ubuntu"
 export REDRHEX_REMOTE_ACCEPT_JOBS="true"
 export REDRHEX_CLOUDFLARE_TUNNEL_HOST=""
-export REDRHEX_DISCORD_WEBHOOK_URL=""
-export REDRHEX_RESEND_API_KEY=""
 ```
 
 Save it, then lock down the file:
@@ -194,7 +200,7 @@ Apply the Supabase schema from:
 tools/training_panel/supabase/schema.sql
 ```
 
-Re-apply the schema after pulling V2.2.0 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
+Re-apply the schema after pulling V3.0.0 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, requester-scoped notification settings, run event delivery status, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
 
 Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
 

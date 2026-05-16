@@ -99,6 +99,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(params.tweak_source_label, "Baseline trial")
         self.assertNotIn("tweak_source_run_id", " ".join(training_argv(params)))
 
+    def test_training_params_preserve_requester_without_changing_argv(self):
+        params = TrainingParams.from_dict(
+            {
+                "task": "Template-Redrhex-Direct-v0",
+                "num_envs": 4,
+                "max_iterations": 8,
+                "device": "cuda:0",
+                "requester_id": "11111111-1111-4111-8111-111111111111",
+                "requester_label": "Jason",
+            }
+        )
+        self.assertEqual(params.requester_id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(params.requester_label, "Jason")
+        self.assertNotIn("requester_id", " ".join(training_argv(params)))
+
 
 if __name__ == "__main__":
     unittest.main()

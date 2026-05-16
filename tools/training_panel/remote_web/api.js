@@ -42,7 +42,7 @@ async function parseResponse(response) {
     }
   }
   if (!response.ok) {
-    throw new Error(data?.message || data?.error_description || data?.hint || response.statusText);
+    throw new Error(data?.message || data?.error || data?.error_description || data?.hint || response.statusText);
   }
   return data;
 }
@@ -129,6 +129,13 @@ export async function upsert(table, payload, onConflict = "id") {
   });
 }
 
+export async function invokeFunction(name, payload) {
+  return supabaseFetch(`/functions/v1/${encodeURIComponent(name)}`, {
+    method: "POST",
+    body: JSON.stringify(payload || {}),
+  });
+}
+
 export async function createSignedVideoUrl(storagePath, expiresIn = 3600) {
   const encoded = String(storagePath || "")
     .split("/")
@@ -146,9 +153,13 @@ export async function createSignedVideoUrl(storagePath, expiresIn = 3600) {
   return `${SUPABASE_URL}/storage/v1/${signed}`;
 }
 
-export async function loadRemoteSnapshot(machineId) {
+export async function loadRemoteSnapshot(machineId, userId = "") {
   const encodedMachine = encodeURIComponent(machineId);
-  const [machines, jobs, runs, artifactsResult, presetsResult, terrainPresetsResult, profilesResult] = await Promise.all([
+  const encodedUser = encodeURIComponent(userId || "");
+  const notificationQuery = userId
+    ? `user_id=eq.${encodedUser}&machine_id=eq.${encodedMachine}&select=*&limit=1`
+    : "select=*&limit=0";
+  const [machines, jobs, runs, artifactsResult, presetsResult, terrainPresetsResult, profilesResult, notificationResult] = await Promise.all([
     select("machines", `select=*&order=heartbeat_at.desc`),
     select("jobs", `select=*&order=created_at.desc&limit=60`),
     select("runs", `select=*&order=created_at.desc&limit=120`),
@@ -156,6 +167,7 @@ export async function loadRemoteSnapshot(machineId) {
     optionalSelect("reward_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
     optionalSelect("terrain_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
     optionalSelect("profiles", `select=id,email,display_name,role`),
+    optionalSelect("notification_settings", notificationQuery),
   ]);
   const artifacts = artifactsResult.rows;
   const presets = presetsResult.ok ? presetsResult.rows : BUILT_IN_REWARD_PRESETS;
@@ -168,6 +180,7 @@ export async function loadRemoteSnapshot(machineId) {
     runs: runs.filter((run) => !run.machine_id || run.machine_id === machineId || machineId === ""),
     artifacts: artifacts.filter((artifact) => !artifact.machine_id || artifact.machine_id === machineId || machineId === ""),
     profiles: profilesResult.rows,
+    notificationSettings: notificationResult.rows[0] || null,
     presets,
     terrainPresets,
     encodedMachine,
@@ -180,6 +193,7 @@ export async function loadRemoteSnapshot(machineId) {
         presetsResult.ok ? "" : `Reward presets table unavailable: ${presetsResult.error}`,
         terrainPresetsResult.ok ? "" : `Terrain presets table unavailable: ${terrainPresetsResult.error}`,
         profilesResult.ok ? "" : `Profiles table unavailable: ${profilesResult.error}`,
+        notificationResult.ok ? "" : `Notification settings unavailable: ${notificationResult.error}`,
       ].filter(Boolean),
     },
   };

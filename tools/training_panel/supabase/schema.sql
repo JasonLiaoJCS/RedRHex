@@ -1,4 +1,4 @@
--- RedRHex Training Panel V2.2.0 Supabase schema
+-- RedRHex Training Panel V3.0.0 Supabase schema
 -- Apply in the Supabase SQL editor, then configure Row Level Security policies
 -- for your team's auth provider.
 
@@ -57,6 +57,7 @@ create table if not exists public.runs (
 
 alter table public.runs add column if not exists notes text;
 alter table public.runs add column if not exists folder text;
+alter table public.runs add column if not exists created_by uuid references auth.users(id);
 
 create table if not exists public.reward_presets (
   id text primary key,
@@ -132,6 +133,11 @@ create table if not exists public.run_events (
   payload jsonb not null default '{}',
   discord_sent_at timestamptz,
   email_sent_at timestamptz,
+  recipient_id uuid references auth.users(id),
+  event_key text,
+  notification_status text not null default 'pending',
+  channel_results jsonb not null default '{}',
+  notified_at timestamptz,
   created_at timestamptz not null default now()
   -- No unique constraint on (run_id, event_type): a run may complete multiple times
   -- after resume, so multiple events of the same type must be allowed.
@@ -171,6 +177,11 @@ alter table public.artifacts add column if not exists public_url text;
 alter table public.artifacts add column if not exists bytes bigint;
 
 alter table public.run_events drop constraint if exists run_events_run_id_event_type_key;
+alter table public.run_events add column if not exists recipient_id uuid references auth.users(id);
+alter table public.run_events add column if not exists event_key text;
+alter table public.run_events add column if not exists notification_status text not null default 'pending';
+alter table public.run_events add column if not exists channel_results jsonb not null default '{}';
+alter table public.run_events add column if not exists notified_at timestamptz;
 
 -- proxy_sessions: reserved scaffold for future TensorBoard/play proxy auth.
 -- Not yet used by any application code.
@@ -185,18 +196,28 @@ create table if not exists public.proxy_sessions (
   created_at timestamptz not null default now()
 );
 
--- notification_settings: reserved for per-machine notification preferences.
--- TODO: the notify Edge Function currently reads Discord/email config from env vars;
---       wire it to query this table so preferences can be managed per machine.
 create table if not exists public.notification_settings (
   id uuid primary key default gen_random_uuid(),
   machine_id text references public.machines(machine_id),
+  user_id uuid references auth.users(id) on delete cascade,
   discord_enabled boolean not null default false,
+  discord_webhook_url text not null default '',
   email_enabled boolean not null default false,
   email_recipients text[] not null default '{}',
+  notify_training_converged boolean not null default true,
+  notify_training_completed boolean not null default true,
+  notify_training_failed boolean not null default true,
+  notify_video_ready boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.notification_settings add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.notification_settings add column if not exists discord_webhook_url text not null default '';
+alter table public.notification_settings add column if not exists notify_training_converged boolean not null default true;
+alter table public.notification_settings add column if not exists notify_training_completed boolean not null default true;
+alter table public.notification_settings add column if not exists notify_training_failed boolean not null default true;
+alter table public.notification_settings add column if not exists notify_video_ready boolean not null default true;
 
 create or replace function public.set_redrhex_updated_at()
 returns trigger
@@ -231,6 +252,11 @@ create trigger set_terrain_presets_updated_at
 drop trigger if exists set_machines_updated_at on public.machines;
 create trigger set_machines_updated_at
   before update on public.machines
+  for each row execute function public.set_redrhex_updated_at();
+
+drop trigger if exists set_notification_settings_updated_at on public.notification_settings;
+create trigger set_notification_settings_updated_at
+  before update on public.notification_settings
   for each row execute function public.set_redrhex_updated_at();
 
 create or replace function public.claim_next_job_for_machine(p_machine_id text, p_gpu_locked boolean default false)
@@ -298,8 +324,14 @@ drop policy if exists "operators can create terrain presets" on public.terrain_p
 drop policy if exists "operators can update custom terrain presets" on public.terrain_presets;
 drop policy if exists "operators can delete custom terrain presets" on public.terrain_presets;
 drop policy if exists "run_events readable by authenticated users" on public.run_events;
+drop policy if exists "machine can insert run events" on public.run_events;
+drop policy if exists "machine can update own run events" on public.run_events;
 drop policy if exists "team activity readable by authenticated users" on public.team_activity_events;
 drop policy if exists "machine can insert team activity" on public.team_activity_events;
+drop policy if exists "users can read own notification settings" on public.notification_settings;
+drop policy if exists "users can create own notification settings" on public.notification_settings;
+drop policy if exists "users can update own notification settings" on public.notification_settings;
+drop policy if exists "users can delete own notification settings" on public.notification_settings;
 drop policy if exists "machine can upsert own row" on public.machines;
 drop policy if exists "machine can upsert own runs" on public.runs;
 drop policy if exists "machine can upsert own artifacts" on public.artifacts;
@@ -437,11 +469,31 @@ create policy "operators can delete custom terrain presets" on public.terrain_pr
 create policy "run_events readable by authenticated users" on public.run_events
   for select to authenticated using (true);
 
+create policy "machine can insert run events" on public.run_events
+  for insert with check (machine_id = (auth.jwt() ->> 'sub'));
+
+create policy "machine can update own run events" on public.run_events
+  for update using (machine_id = (auth.jwt() ->> 'sub'))
+  with check (machine_id = (auth.jwt() ->> 'sub'));
+
 create policy "team activity readable by authenticated users" on public.team_activity_events
   for select to authenticated using (true);
 
 create policy "machine can insert team activity" on public.team_activity_events
   for insert with check (machine_id = (auth.jwt() ->> 'sub'));
+
+create policy "users can read own notification settings" on public.notification_settings
+  for select to authenticated using (user_id = auth.uid());
+
+create policy "users can create own notification settings" on public.notification_settings
+  for insert to authenticated with check (user_id = auth.uid());
+
+create policy "users can update own notification settings" on public.notification_settings
+  for update to authenticated using (user_id = auth.uid())
+  with check (user_id = auth.uid());
+
+create policy "users can delete own notification settings" on public.notification_settings
+  for delete to authenticated using (user_id = auth.uid());
 
 -- Worker write policies.
 -- The remote worker authenticates with machine_token as the bearer JWT.
@@ -470,7 +522,10 @@ create index if not exists idx_jobs_machine_id      on public.jobs(machine_id);
 create index if not exists idx_jobs_status          on public.jobs(status);
 create index if not exists idx_artifacts_run_id     on public.artifacts(run_id);
 create index if not exists idx_run_events_run_id    on public.run_events(run_id);
+create unique index if not exists idx_run_events_event_key_unique on public.run_events(event_key) where event_key is not null;
+create index if not exists idx_run_events_recipient_id on public.run_events(recipient_id);
 create index if not exists idx_reward_presets_builtin on public.reward_presets(built_in);
+create unique index if not exists idx_notification_settings_user_machine on public.notification_settings(user_id, machine_id);
 create index if not exists idx_team_activity_created_at on public.team_activity_events(created_at desc);
 create index if not exists idx_team_activity_actor_id   on public.team_activity_events(actor_id);
 create index if not exists idx_team_activity_machine_id on public.team_activity_events(machine_id);

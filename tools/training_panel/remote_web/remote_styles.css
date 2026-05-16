@@ -435,6 +435,42 @@ video {
   grid-column: 1 / -1;
 }
 
+.notification-card {
+  align-self: start;
+}
+
+.notification-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 8px 0;
+  font-weight: 800;
+}
+
+.switch-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.switch-row small {
+  display: block;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.notification-events {
+  display: grid;
+  gap: 8px;
+}
+
 .dashboard-stack {
   display: grid;
   gap: 14px;
@@ -1279,6 +1315,7 @@ video {
   .dashboard-status-grid,
   .split-grid,
   .connection-grid,
+  .notification-grid,
   .health-grid,
   .details-grid,
   .reward-row,

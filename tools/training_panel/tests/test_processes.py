@@ -52,6 +52,8 @@ class ProcessRegistryTests(unittest.TestCase):
                     "reward_overrides": {"rew_scale_alive": 0.2},
                     "tweak_source_run_id": "run_one",
                     "tweak_source_label": "Run One",
+                    "requester_id": "11111111-1111-4111-8111-111111111111",
+                    "requester_label": "Jason",
                 }
             )
             with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
@@ -61,6 +63,8 @@ class ProcessRegistryTests(unittest.TestCase):
             record = history.get_run(run["id"])
             self.assertEqual(record["params"]["tweak_source_run_id"], "run_one")
             self.assertEqual(record["params"]["tweak_source_label"], "Run One")
+            self.assertEqual(record["created_by"], "11111111-1111-4111-8111-111111111111")
+            self.assertEqual(record["requester_label"], "Jason")
             self.assertEqual(record["reward_preset_id"], "tweak-run-one")
 
     def test_play_process_debug_streams_log_tail(self):

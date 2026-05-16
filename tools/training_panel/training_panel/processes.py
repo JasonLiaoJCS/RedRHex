@@ -111,6 +111,8 @@ class ProcessRegistry:
             "reward_overrides": params.reward_overrides,
             "terrain_preset_id": params.terrain_preset_id,
             "terrain_overrides": params.terrain_overrides,
+            "created_by": params.requester_id,
+            "requester_label": params.requester_label,
         }
         self.history.add_run(record)
         spawned = self._spawn_shell(run_id, shell, log_file)
@@ -991,8 +993,6 @@ class ProcessRegistry:
     def _monitor_training(self, run_id: str, proc: subprocess.Popen, started_at_epoch: float) -> None:
         import time
         from .convergence import ConvergenceChecker, load_convergence_config
-        from .notifications import send_convergence_notification
-        from .remote_config import RemoteConfig
 
         checker = ConvergenceChecker()
         convergence_detected = False
@@ -1026,13 +1026,6 @@ class ProcessRegistry:
                                 )
                                 if cfg.auto_record_video:
                                     self.history.update_run(run_id, queue_video_on_completion=True)
-                                remote_cfg = RemoteConfig.from_env()
-                                run = self.history.get_run(run_id) or {}
-                                send_convergence_notification(
-                                    run, result,
-                                    discord_webhook=remote_cfg.discord_webhook_url,
-                                    resend_key=remote_cfg.resend_api_key,
-                                )
                 except Exception:
                     pass  # never let convergence logic crash the monitor thread
 

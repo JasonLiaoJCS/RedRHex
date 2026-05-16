@@ -204,8 +204,9 @@ function setView(name) {
     rewards: ["Rewards", "Tune reward weights with presets and see which settings each run used."],
     terrain: ["Terrain", "Tune terrain generator, curriculum, and sub-terrain mix with presets."],
     history: ["History", "Review runs, notes, checkpoints, TensorBoard, and playbacks."],
+    convergence: ["Convergence", "Define reward plateau detection and automatic result-video behavior."],
     activity: ["Activity", "See team run requests, panel actions, and lightweight usage analytics."],
-    access: ["Control Center", "Manage local access, V2.1 remote worker status, and remote launch acceptance."],
+    access: ["Control Center", "Manage local access, V3.0 remote worker status, and remote launch acceptance."],
   };
   $("#view-title").textContent = titles[name][0];
   $("#view-subtitle").textContent = titles[name][1];

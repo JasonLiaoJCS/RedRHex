@@ -42,6 +42,7 @@ class FakeClient:
         self.deletes = []
         self.uploads = []
         self.inserts = []
+        self.function_calls = []
         self.claim_gpu_locked = []
         self.raise_on_artifacts_upsert = False
         self.raise_on_activity_insert = False
@@ -80,6 +81,10 @@ class FakeClient:
     def upload_storage_object(self, bucket, object_path, file_path, **kwargs):
         self.uploads.append((bucket, object_path, file_path, kwargs))
         return {"Key": object_path}
+
+    def function_request(self, name, payload=None):
+        self.function_calls.append((name, payload or {}))
+        return {"ok": True, "status": "sent"}
 
 
 class FakeExecutor:
@@ -321,6 +326,22 @@ class RemoteTests(unittest.TestCase):
             self.assertTrue(executor.processes.start_training.called)
             self.assertEqual(result.local_run_id, "run_new")
 
+    def test_executor_preserves_remote_actor_as_training_requester(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._make_executor(Path(tmp))
+            executor.processes.start_training = MagicMock(return_value={"id": "run_new", "status": "running"})
+            actor_id = "11111111-1111-4111-8111-111111111111"
+
+            executor.execute({
+                "type": "start_training",
+                "actor_role": "operator",
+                "actor_id": actor_id,
+                "payload": {"task": "Template-Redrhex-Direct-v0", "num_envs": 64, "max_iterations": 100, "device": "cuda:0"},
+            })
+
+            params = executor.processes.start_training.call_args.args[0]
+            self.assertEqual(params.requester_id, actor_id)
+
     def test_executor_compact_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             executor = self._make_executor(Path(tmp))
@@ -392,6 +413,36 @@ class RemoteTests(unittest.TestCase):
                 self.assertTrue(run["created_at"])
                 self.assertTrue(run["updated_at"])
 
+    def test_worker_sync_runs_preserves_created_by_and_dispatches_notifications(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "clip.mp4"
+            video.write_bytes(b"mp4-data")
+            paths = self.make_paths(root)
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True, cloudflare_tunnel_host="https://child.example.com")
+            client = FakeClient()
+            actor_id = "11111111-1111-4111-8111-111111111111"
+            executor = FakeExecutor()
+            executor.sync_runs_payload = MagicMock(return_value=[
+                {
+                    "id": "run_one",
+                    "status": "completed",
+                    "created_by": actor_id,
+                    "params": {"task": "Template-Redrhex-Direct-v0", "max_iterations": 10, "requester_id": actor_id},
+                    "latest_video": str(video),
+                    "artifacts": [{"kind": "video", "run_id": "run_one", "local_path": str(video)}],
+                }
+            ])
+            worker = RemoteWorker(config, paths, client, executor=executor)
+            worker.sync_runs()
+
+            runs_upsert = next(u for u in client.upserts if u[0] == "runs")
+            self.assertEqual(runs_upsert[1][0]["created_by"], actor_id)
+            event_types = [call[1]["event_type"] for call in client.function_calls]
+            self.assertIn("training_completed", event_types)
+            self.assertIn("video_ready", event_types)
+            self.assertTrue(all(call[1]["requester_id"] == actor_id for call in client.function_calls))
+
     def test_worker_passes_gpu_lock_to_job_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -460,7 +511,13 @@ class RemoteTests(unittest.TestCase):
                 {"id": "run_one", "status": "completed", "updated_at": "2026-05-16T00:00:00+00:00", "artifacts": []}
             ])
             history = executor.history = RemoteJobExecutor(paths).history
-            history.patch_run_metadata("run_one", display_name="old", folder=None, notes="old note")
+            history.add_run({
+                "id": "run_one",
+                "display_name": "old",
+                "folder": None,
+                "notes": "old note",
+                "updated_at": "2026-05-16T00:00:00+00:00",
+            })
             config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
             client = FakeClient()
             client.select_rows = [{

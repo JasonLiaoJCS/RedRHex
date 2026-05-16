@@ -12,6 +12,7 @@ from .activity import category_for_job_type, outcome_for_status, score_activity_
 from .commands import DEFAULT_VIDEO_PRESET, TrainingParams, VideoParams
 from .config import PanelPaths
 from .history import HistoryStore, checkpoint_inventory
+from .notifications import notification_events_for_run
 from .processes import ProcessRegistry
 from .remote_config import (
     RemoteConfig,
@@ -141,6 +142,10 @@ class RemoteJobExecutor:
 
         if job_type == "start_training":
             params = TrainingParams.from_dict(payload)
+            actor_id = _uuid_or_none(str(job.get("actor_id") or ""))
+            if actor_id:
+                params.requester_id = actor_id
+                params.requester_label = str(job.get("actor_name") or job.get("actor_role") or "Remote member")
             result = self.processes.start_training(params)
             return RemoteJobResult(local_run_id=result.get("id"), process_id=result.get("id"), payload=result)
 
@@ -260,6 +265,7 @@ class RemoteJobExecutor:
                 "latest_checkpoint": run.get("latest_checkpoint"),
                 "latest_video": run.get("latest_video"),
                 "onnx_path": run.get("onnx_path"),
+                "created_by": run.get("created_by") or (run.get("params") or {}).get("requester_id"),
                 "artifacts": run_artifacts(run),
             }
             for run in runs
@@ -356,9 +362,35 @@ class RemoteWorker:
             self.client.upsert("runs", runs)
         if artifacts:
             self.client.upsert("artifacts", artifacts, query={"on_conflict": "run_id,kind,local_path"})
+        notification_errors = self._dispatch_notification_events(runs, artifacts)
+        if notification_errors:
+            artifact_errors.extend(notification_errors)
         if artifact_errors:
             self.last_sync_error = "; ".join(artifact_errors[-3:])
         return runs
+
+    def _dispatch_notification_events(self, runs: list[dict], artifacts: list[dict]) -> list[str]:
+        errors: list[str] = []
+        artifacts_by_run: dict[str, list[dict]] = {}
+        for artifact in artifacts:
+            run_id = str(artifact.get("run_id") or "")
+            if run_id:
+                artifacts_by_run.setdefault(run_id, []).append(artifact)
+        for run in runs:
+            run_id = str(run.get("id") or "")
+            events = notification_events_for_run(
+                run,
+                machine_id=self.config.machine_id,
+                artifacts=artifacts_by_run.get(run_id, []),
+                remote_url=self.config.cloudflare_tunnel_host,
+                require_video_storage=True,
+            )
+            for event in events:
+                try:
+                    self.client.function_request("notify", event)
+                except Exception as exc:
+                    errors.append(f"notify {event.get('event_type')} {run_id}: {exc}")
+        return errors
 
     def sync_deleted_runs(self) -> int:
         deleted_count = 0

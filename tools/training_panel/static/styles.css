@@ -1434,6 +1434,42 @@ html[data-theme="dark"] .comparison-diff {
   margin-bottom: 18px;
 }
 
+.convergence-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.convergence-definitions {
+  display: grid;
+  gap: 12px;
+}
+
+.definition-list {
+  display: grid;
+  gap: 10px;
+}
+
+.definition-list div {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.definition-list strong {
+  font-size: 13px;
+}
+
+.definition-list span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .remote-grid {
   align-items: stretch;
 }
@@ -1774,6 +1810,7 @@ pre {
   .panel-grid,
   .split,
   .access-grid,
+  .convergence-page,
   .activity-controls,
   .activity-analytics,
   .activity-mission,
