@@ -399,7 +399,6 @@ async function loadRemoteStatus() {
     ["Active Processes", status.active_process_count || 0],
     ["Isaac/GPU Lock", status.active_isaac_process_count ? "busy" : "free"],
     ["Discord", status.discord_configured ? "configured" : "not configured"],
-    ["Email", status.email_configured ? "configured" : "not configured"],
   ]);
   const raw = $("#remote-status-raw");
   if (raw) raw.textContent = JSON.stringify(status, null, 2);

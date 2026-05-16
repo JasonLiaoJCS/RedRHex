@@ -20,6 +20,8 @@ def test_notification_settings_support_per_machine_upsert_and_event_toggles():
     assert "notify_training_completed boolean" in SCHEMA
     assert "notify_training_failed boolean" in SCHEMA
     assert "notify_video_ready boolean" in SCHEMA
+    assert "email_enabled boolean" not in SCHEMA
+    assert "email_recipients text[]" not in SCHEMA
 
 
 def test_run_events_have_idempotency_and_dispatch_status_fields():
@@ -29,6 +31,7 @@ def test_run_events_have_idempotency_and_dispatch_status_fields():
     assert "notification_status text" in SCHEMA
     assert "channel_results jsonb" in SCHEMA
     assert "notified_at timestamptz" in SCHEMA
+    assert "email_sent_at timestamptz" not in SCHEMA
 
 
 def test_worker_or_service_role_can_record_run_event_status():

@@ -54,28 +54,6 @@ def discord_message(event: dict) -> dict:
     }
 
 
-def email_message(event: dict, to_email: str) -> dict:
-    payload = event.get("payload") or {}
-    subject = f"RedRHex {event.get('status')}: {event.get('display_name') or event.get('run_id')}"
-    lines = [
-        subject,
-        "",
-        f"Run: {event.get('run_id')}",
-        f"Task: {payload.get('task') or '-'}",
-        f"Iterations: {payload.get('max_iterations') or '-'}",
-        f"Return code: {payload.get('returncode')}",
-        f"Checkpoint: {payload.get('latest_checkpoint') or '-'}",
-        f"Video: {payload.get('latest_video') or '-'}",
-        f"ONNX: {payload.get('onnx_path') or '-'}",
-        f"Remote: {payload.get('remote_url') or '-'}",
-    ]
-    return {
-        "to": to_email,
-        "subject": subject,
-        "text": "\n".join(lines),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Edge function payloads
 # ---------------------------------------------------------------------------
@@ -244,8 +222,8 @@ def notification_events_for_run(
     return events
 
 
-def build_test_notification_edge_event(*, requester_id: str, machine_id: str, email: str = "") -> dict:
-    payload = {"recipient_id": requester_id, "email": email, "display_name": "Notification test"}
+def build_test_notification_edge_event(*, requester_id: str, machine_id: str) -> dict:
+    payload = {"recipient_id": requester_id, "display_name": "Notification test"}
     return edge_event_payload(
         "test_notification",
         {"id": "notification-test", "created_by": requester_id, "machine_id": machine_id},
@@ -298,45 +276,20 @@ def _convergence_discord_message(event: dict) -> dict:
     }
 
 
-def _convergence_email_message(event: dict, to_email: str) -> dict:
-    payload = event.get("payload") or {}
-    label = str(event.get("display_name") or event.get("run_id") or "-")
-    subject = f"RedRHex converged: {label}"
-    lines = [
-        subject,
-        "",
-        f"Run: {event.get('run_id')}",
-        f"Task: {payload.get('task') or '-'}",
-        f"Converged at iteration: {payload.get('iteration') or '-'}",
-        f"Improvement over window: {payload.get('improvement_pct', 0):.1f}%",
-        f"Reward range: {payload.get('window_min', 0):.3f} – {payload.get('window_max', 0):.3f}",
-        "",
-        "Training is still running. A video will be recorded when it ends.",
-        f"Remote: {payload.get('remote_url') or '-'}",
-    ]
-    return {"to": to_email, "subject": subject, "text": "\n".join(lines)}
-
-
 def send_convergence_notification(
     run: dict,
     result: "ConvergenceResult",
     discord_webhook: str = "",
-    resend_key: str = "",
-    email_to: str = "",
-    email_from: str = "",
     remote_url: str = "",
 ) -> dict:
     """
-    Send Discord and/or email notification for a convergence event.
-    Returns {"discord": {ok, status}, "email": {ok, status}} for each channel attempted.
+    Send a Discord notification for a convergence event.
+    Returns {"discord": {ok, status}} when a webhook is configured.
     Network errors are caught — never raises.
     """
     import os
     # Fall back to env vars if callers didn't supply values
     discord_webhook = discord_webhook or os.environ.get("REDRHEX_DISCORD_WEBHOOK_URL", "")
-    resend_key = resend_key or os.environ.get("REDRHEX_RESEND_API_KEY", "")
-    email_to = email_to or os.environ.get("REDRHEX_NOTIFICATION_EMAIL_TO", "")
-    email_from = email_from or os.environ.get("REDRHEX_NOTIFICATION_EMAIL_FROM", "")
 
     event = convergence_event(run, result, remote_url=remote_url)
     results: dict = {}
@@ -350,20 +303,5 @@ def send_convergence_notification(
                 results["discord"] = {"ok": resp.status < 300, "status": resp.status}
         except Exception as exc:
             results["discord"] = {"ok": False, "error": str(exc)}
-
-    if resend_key and email_to and email_from:
-        try:
-            msg = _convergence_email_message(event, email_to)
-            body = json.dumps({
-                "from": email_from, "to": [email_to],
-                "subject": msg["subject"], "text": msg["text"],
-            }).encode()
-            req = Request("https://api.resend.com/emails", data=body, method="POST",
-                          headers={"Authorization": f"Bearer {resend_key}",
-                                   "Content-Type": "application/json"})
-            with urlopen(req, timeout=10) as resp:
-                results["email"] = {"ok": resp.status < 300, "status": resp.status}
-        except Exception as exc:
-            results["email"] = {"ok": False, "error": str(exc)}
 
     return results

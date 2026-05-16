@@ -52,7 +52,6 @@ class RemoteConfig:
     accept_jobs: bool = False
     cloudflare_tunnel_host: str = ""
     discord_webhook_url: str = ""
-    resend_api_key: str = ""
     poll_interval_seconds: float = 2.0
     sync_interval_seconds: float = 5.0
 
@@ -68,7 +67,6 @@ class RemoteConfig:
             accept_jobs=parse_bool(source.get("REDRHEX_REMOTE_ACCEPT_JOBS"), default=False),
             cloudflare_tunnel_host=source.get("REDRHEX_CLOUDFLARE_TUNNEL_HOST", "").rstrip("/"),
             discord_webhook_url=source.get("REDRHEX_DISCORD_WEBHOOK_URL", ""),
-            resend_api_key=source.get("REDRHEX_RESEND_API_KEY", ""),
             poll_interval_seconds=float(source.get("REDRHEX_REMOTE_POLL_SECONDS", "2")),
             sync_interval_seconds=float(source.get("REDRHEX_REMOTE_SYNC_SECONDS", "5")),
         )
@@ -102,7 +100,6 @@ class RemoteConfig:
             "machine_token_configured": bool(self.machine_token),
             "cloudflare_tunnel_host": self.cloudflare_tunnel_host,
             "discord_configured": bool(self.discord_webhook_url),
-            "email_configured": bool(self.resend_api_key),
             "worker_command": "python -m tools.training_panel.remote_worker",
             "cloudflare_tunnel_command": self.tunnel_command(),
             "remote_state_file": str(paths.remote_state_file),

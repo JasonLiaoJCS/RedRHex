@@ -132,7 +132,6 @@ create table if not exists public.run_events (
   event_type text not null,
   payload jsonb not null default '{}',
   discord_sent_at timestamptz,
-  email_sent_at timestamptz,
   recipient_id uuid references auth.users(id),
   event_key text,
   notification_status text not null default 'pending',
@@ -182,6 +181,7 @@ alter table public.run_events add column if not exists event_key text;
 alter table public.run_events add column if not exists notification_status text not null default 'pending';
 alter table public.run_events add column if not exists channel_results jsonb not null default '{}';
 alter table public.run_events add column if not exists notified_at timestamptz;
+alter table public.run_events drop column if exists email_sent_at;
 
 -- proxy_sessions: reserved scaffold for future TensorBoard/play proxy auth.
 -- Not yet used by any application code.
@@ -202,8 +202,6 @@ create table if not exists public.notification_settings (
   user_id uuid references auth.users(id) on delete cascade,
   discord_enabled boolean not null default false,
   discord_webhook_url text not null default '',
-  email_enabled boolean not null default false,
-  email_recipients text[] not null default '{}',
   notify_training_converged boolean not null default true,
   notify_training_completed boolean not null default true,
   notify_training_failed boolean not null default true,
@@ -218,6 +216,8 @@ alter table public.notification_settings add column if not exists notify_trainin
 alter table public.notification_settings add column if not exists notify_training_completed boolean not null default true;
 alter table public.notification_settings add column if not exists notify_training_failed boolean not null default true;
 alter table public.notification_settings add column if not exists notify_video_ready boolean not null default true;
+alter table public.notification_settings drop column if exists email_enabled;
+alter table public.notification_settings drop column if exists email_recipients;
 
 create or replace function public.set_redrhex_updated_at()
 returns trigger

@@ -64,7 +64,7 @@ def test_convergence_video_and_test_payload_builders():
         {"kind": "video", "storage_path": "runs/run_one/videos/model_42.mp4", "bytes": 1234},
         machine_id="lab-pc",
     )
-    test = build_test_notification_edge_event(requester_id=REQUESTER_ID, machine_id="lab-pc", email="jason@example.com")
+    test = build_test_notification_edge_event(requester_id=REQUESTER_ID, machine_id="lab-pc")
 
     assert converged["event_type"] == "training_converged"
     assert converged["event_key"] == "run_one:training_converged:42"
@@ -72,7 +72,7 @@ def test_convergence_video_and_test_payload_builders():
     assert video["payload"]["storage_path"] == "runs/run_one/videos/model_42.mp4"
     assert test["event_type"] == "test_notification"
     assert test["requester_id"] == REQUESTER_ID
-    assert test["payload"]["email"] == "jason@example.com"
+    assert "email" not in test["payload"]
 
 
 def test_notification_events_skip_local_mother_runs_without_requester():
@@ -90,8 +90,10 @@ def test_notification_event_keys_dedupe_repeated_worker_syncs():
     assert len({notification_event_key(event["event_type"], run, event["payload"]) for event in first}) == len(first)
 
 
-def test_edge_function_resolves_email_from_supabase_user_not_manual_recipient():
+def test_edge_function_is_discord_only():
     source = Path("tools/training_panel/supabase/functions/notify/index.ts").read_text(encoding="utf-8")
 
-    assert "/auth/v1/admin/users/" in source
+    assert "api.resend.com" not in source
+    assert "REDRHEX_RESEND_API_KEY" not in source
+    assert "REDRHEX_NOTIFICATION_EMAIL_FROM" not in source
     assert "REDRHEX_NOTIFICATION_EMAIL_TO" not in source

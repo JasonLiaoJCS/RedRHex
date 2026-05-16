@@ -19,7 +19,6 @@ type NotificationSettings = {
   id?: string;
   user_id: string;
   machine_id: string;
-  email_enabled: boolean;
   discord_enabled: boolean;
   discord_webhook_url?: string;
   notify_training_converged: boolean;
@@ -97,7 +96,7 @@ async function rest<T>(path: string, options: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
-async function userFromJwt(token: string): Promise<{ id: string; email?: string } | null> {
+async function userFromJwt(token: string): Promise<{ id: string } | null> {
   if (!token || token === env("SUPABASE_SERVICE_ROLE_KEY")) return null;
   const base = env("SUPABASE_URL").replace(/\/$/, "");
   const response = await fetch(`${base}/auth/v1/user`, {
@@ -108,7 +107,7 @@ async function userFromJwt(token: string): Promise<{ id: string; email?: string 
   });
   if (!response.ok) return null;
   const user = await response.json();
-  return user?.id ? { id: user.id, email: user.email } : null;
+  return user?.id ? { id: user.id } : null;
 }
 
 function isWorkerToken(token: string): boolean {
@@ -119,19 +118,6 @@ function isWorkerToken(token: string): boolean {
     env("REDRHEX_NOTIFICATION_WORKER_TOKEN"),
   ].filter(Boolean);
   return allowed.includes(token);
-}
-
-async function requesterEmail(userId: string): Promise<string> {
-  try {
-    const user = await rest<{ email?: string }>(`/auth/v1/admin/users/${encodeURIComponent(userId)}`);
-    if (user?.email) return user.email;
-  } catch {
-    // Fall back to profiles below.
-  }
-  const rows = await rest<Array<{ email?: string }>>(
-    `/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=email&limit=1`,
-  );
-  return rows[0]?.email ?? "";
 }
 
 async function settingsFor(userId: string, machineId: string): Promise<NotificationSettings | null> {
@@ -151,29 +137,6 @@ function eventSubject(event: NotifyRequest): string {
   const payload = event.payload ?? {};
   const label = String(payload.display_name ?? event.run_id ?? "RedRHex");
   return `RedRHex ${EVENT_LABELS[event.event_type]}: ${label}`;
-}
-
-function eventLines(event: NotifyRequest): string[] {
-  const payload = event.payload ?? {};
-  const lines = [
-    eventSubject(event),
-    "",
-    `Run: ${event.run_id ?? "-"}`,
-    `Machine: ${event.machine_id ?? "-"}`,
-    `Status: ${payload.status ?? "-"}`,
-    `Task: ${payload.task ?? "-"}`,
-    `Iterations: ${payload.max_iterations ?? "-"}`,
-  ];
-  if (event.event_type === "training_converged") {
-    lines.push(`Converged at iteration: ${payload.iteration ?? "-"}`);
-    lines.push(`Improvement: ${payload.improvement_pct ?? "-"}%`);
-  }
-  if (event.event_type === "video_ready") {
-    lines.push(`Video: ${payload.storage_path ?? payload.latest_video ?? "-"}`);
-  }
-  if (payload.latest_checkpoint) lines.push(`Checkpoint: ${payload.latest_checkpoint}`);
-  if (payload.remote_url) lines.push(`Remote: ${payload.remote_url}`);
-  return lines;
 }
 
 function discordPayload(event: NotifyRequest) {
@@ -208,28 +171,6 @@ async function sendDiscord(webhook: string, event: NotifyRequest) {
   return { ok: response.ok, status: response.status };
 }
 
-async function sendEmail(to: string, event: NotifyRequest) {
-  const resendKey = env("REDRHEX_RESEND_API_KEY");
-  const emailFrom = env("REDRHEX_NOTIFICATION_EMAIL_FROM");
-  if (!resendKey || !emailFrom) return { ok: false, skipped: true, reason: "Email provider not configured" };
-  if (!to) return { ok: false, skipped: true, reason: "Requester email not found" };
-  const subject = eventSubject(event);
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${resendKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: emailFrom,
-      to: [to],
-      subject,
-      text: eventLines(event).join("\n"),
-    }),
-  });
-  return { ok: response.ok, status: response.status, to };
-}
-
 async function existingEvent(eventKey: string): Promise<RunEventRow | null> {
   if (!eventKey) return null;
   const rows = await rest<RunEventRow[]>(
@@ -252,7 +193,6 @@ async function recordEvent(event: NotifyRequest, status: string, results: Record
     channel_results: results,
     notified_at: now,
     discord_sent_at: (results.discord as Record<string, unknown> | undefined)?.ok ? now : null,
-    email_sent_at: (results.email as Record<string, unknown> | undefined)?.ok ? now : null,
   };
   await rest(
     `/rest/v1/run_events?on_conflict=event_key`,
@@ -287,7 +227,7 @@ Deno.serve(async (request) => {
   if (isTest) {
     if (!user?.id) return jsonResponse({ ok: false, error: "Sign in before sending a test notification" }, 401);
     event.requester_id = user.id;
-    event.payload = { ...(event.payload ?? {}), display_name: "Notification test", email: user.email };
+    event.payload = { ...(event.payload ?? {}), display_name: "Notification test" };
   } else if (!isWorkerToken(token)) {
     return jsonResponse({ ok: false, error: "Worker authorization required" }, 401);
   }
@@ -308,12 +248,12 @@ Deno.serve(async (request) => {
 
   const settings = await settingsFor(event.requester_id, event.machine_id);
   if (!settings) {
-    const results = { email: { skipped: true, reason: "No notification settings" }, discord: { skipped: true, reason: "No notification settings" } };
+    const results = { discord: { skipped: true, reason: "No notification settings" } };
     await recordEvent(event, "skipped", results);
     return jsonResponse({ ok: true, status: "skipped", results });
   }
   if (!eventEnabled(settings, event.event_type)) {
-    const results = { email: { skipped: true, reason: "Event disabled" }, discord: { skipped: true, reason: "Event disabled" } };
+    const results = { discord: { skipped: true, reason: "Event disabled" } };
     await recordEvent(event, "disabled", results);
     return jsonResponse({ ok: true, status: "disabled", results });
   }
@@ -327,17 +267,6 @@ Deno.serve(async (request) => {
     }
   } else {
     results.discord = { skipped: true, reason: "Discord disabled" };
-  }
-
-  if (settings.email_enabled) {
-    try {
-      const testEmail = isTest ? String((event.payload ?? {}).email ?? "") : "";
-      results.email = await sendEmail(testEmail || await requesterEmail(event.requester_id), event);
-    } catch (error) {
-      results.email = { ok: false, error: String(error) };
-    }
-  } else {
-    results.email = { skipped: true, reason: "Email disabled" };
   }
 
   const attempted = Object.values(results).some((result) => !(result as Record<string, unknown>).skipped);

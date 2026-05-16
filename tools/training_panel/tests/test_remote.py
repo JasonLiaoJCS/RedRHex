@@ -9,7 +9,6 @@ from tools.training_panel.training_panel.config import PanelPaths
 from tools.training_panel.training_panel.notifications import (
     completion_event_from_run,
     discord_message,
-    email_message,
 )
 from tools.training_panel.training_panel.remote_config import (
     RemoteConfig,
@@ -153,7 +152,6 @@ class RemoteTests(unittest.TestCase):
                     "REDRHEX_REMOTE_ACCEPT_JOBS": "true",
                     "REDRHEX_CLOUDFLARE_TUNNEL_HOST": "https://redrhex.example.com/",
                     "REDRHEX_DISCORD_WEBHOOK_URL": "discord-secret",
-                    "REDRHEX_RESEND_API_KEY": "resend-secret",
                 }
             )
             status = config.public_status(paths)
@@ -765,21 +763,6 @@ class RemoteTests(unittest.TestCase):
                 status = manager.status()
             self.assertTrue(status["worker_running"])
             self.assertEqual(status["worker_runtime_mode"], "child")
-
-    # ------------------------------------------------------------------
-    # email_message
-    # ------------------------------------------------------------------
-
-    def test_email_message_content(self):
-        event = completion_event_from_run(
-            {"id": "run_two", "status": "failed", "params": {"task": "T", "max_iterations": 5}},
-        )
-        msg = email_message(event, to_email="user@example.com")
-        self.assertEqual(msg["to"], "user@example.com")
-        self.assertIn("failed", msg["subject"])
-        self.assertIn("run_two", msg["text"])
-        self.assertIn("Return code", msg["text"])
-
 
 if __name__ == "__main__":
     unittest.main()

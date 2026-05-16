@@ -34,17 +34,7 @@ npx --yes supabase projects list >/dev/null
 echo "Supabase access OK."
 echo
 
-read -r -s -p "Resend API key (leave blank to keep existing secret): " RESEND_KEY
-echo
-read -r -p "Verified sender, e.g. RedRHex Training <training@yourdomain.com> (blank to keep existing): " EMAIL_FROM
-
 SECRET_ARGS=()
-if [[ -n "$RESEND_KEY" ]]; then
-  SECRET_ARGS+=("REDRHEX_RESEND_API_KEY=$RESEND_KEY")
-fi
-if [[ -n "$EMAIL_FROM" ]]; then
-  SECRET_ARGS+=("REDRHEX_NOTIFICATION_EMAIL_FROM=$EMAIL_FROM")
-fi
 
 read -r -s -p "Machine token (blank if worker uses service-role key or secret already exists): " MACHINE_TOKEN
 echo
@@ -85,4 +75,4 @@ fi
 
 echo
 echo "Done. A 401 saying 'Sign in before sending a test notification' is expected for this curl check."
-echo "Now open the child Connection page, enable Email, Save Notifications, then Send Test."
+echo "Now open the child Connection page, enable Discord, Save Notifications, then Send Test."

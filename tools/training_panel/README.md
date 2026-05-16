@@ -34,7 +34,7 @@ http://127.0.0.1:8080
 
 ## V3.0 Remote Team Mode
 
-V3.0 keeps this local panel as the admin/control-center experience and adds requester-scoped email/Discord notifications to the remote worker architecture.
+V3.0 keeps this local panel as the admin/control-center experience and adds requester-scoped Discord notifications to the remote worker architecture.
 
 V3.0 highlights:
 
@@ -42,7 +42,7 @@ V3.0 highlights:
 - Local Control Center worker management: start, stop, restart, tmux/child mode, auto-start, accept/pause jobs, status tail, and setup checks.
 - Faster, safer worker sync with heartbeat polling, metadata convergence between mother and child, non-fatal artifact sync, and private video upload records.
 - Child auto-update without full-page rebuilds, so video playback, scrolling, and in-progress edits stay stable.
-- Per-user notification settings from the child Connection page, using the Supabase login email plus an optional Discord webhook.
+- Per-user notification settings from the child Connection page, using each requester's Discord webhook.
 
 Remote architecture:
 
@@ -50,7 +50,7 @@ Remote architecture:
 - Supabase stores team login, roles, run/job state, artifacts, proxy sessions, and notification events.
 - This training PC runs a worker that polls Supabase and executes queued jobs locally.
 - Cloudflare Tunnel provides secure live console and TensorBoard access.
-- Requester-only email and Discord notifications are dispatched by the Supabase `notify` Edge Function for convergence, completion, failure/interruption, and video-ready events.
+- Requester-only Discord notifications are dispatched by the Supabase `notify` Edge Function for convergence, completion, failure/interruption, and video-ready events.
 
 Worker command:
 
@@ -72,8 +72,6 @@ export REDRHEX_CLOUDFLARE_TUNNEL_HOST="https://<tunnel-host>"
 Notification delivery secrets live on the Supabase Edge Function, not in the child page:
 
 ```bash
-supabase secrets set REDRHEX_RESEND_API_KEY="<resend-key>"
-supabase secrets set REDRHEX_NOTIFICATION_EMAIL_FROM="RedRHex Training <training@example.com>"
 supabase secrets set REDRHEX_SUPABASE_MACHINE_TOKEN="<machine-token-if-not-service-role>"
 supabase functions deploy notify --project-ref <project-ref> --no-verify-jwt
 ```

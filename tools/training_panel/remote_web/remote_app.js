@@ -140,7 +140,6 @@ function defaultNotificationSettings() {
   return {
     user_id: state.user?.id || null,
     machine_id: state.machineId,
-    email_enabled: false,
     discord_enabled: false,
     discord_webhook_url: "",
     notify_training_converged: true,
@@ -156,7 +155,6 @@ function normalizeNotificationSettings(raw = null) {
     ...(raw || {}),
     user_id: raw?.user_id || state.user?.id || null,
     machine_id: raw?.machine_id || state.machineId,
-    email_enabled: Boolean(raw?.email_enabled),
     discord_enabled: Boolean(raw?.discord_enabled),
     discord_webhook_url: String(raw?.discord_webhook_url || ""),
     notify_training_converged: raw?.notify_training_converged !== false,
@@ -1421,24 +1419,18 @@ function notificationChannelResult(result) {
 
 function notificationSettingsCard() {
   const settings = notificationSettingsForView();
-  const email = state.user?.email || state.profile?.email || "";
   const testText = state.notificationTestResult ? notificationChannelResult(state.notificationTestResult.results || {}) : "";
   return `
     <article class="panel span-2 notification-card">
       <div class="section-head">
         <div>
           <h2>Notifications</h2>
-          <p class="muted">Run alerts go only to the person who queued the run.</p>
+          <p class="muted">Discord run alerts go only to the person who queued the run.</p>
         </div>
         <span class="badge ${state.notificationSaveStatus === "error" ? "bad" : state.notificationSaveStatus === "saving" ? "info" : "good"}">${escapeHtml(state.notificationSaveStatus)}</span>
       </div>
       <div class="notification-grid">
         <section>
-          <label class="switch-row">
-            <input id="notify-email-enabled" type="checkbox" ${settings.email_enabled ? "checked" : ""}>
-            <span>Email</span>
-          </label>
-          <p class="muted">Destination: <strong>${escapeHtml(email || "current Supabase email")}</strong></p>
           <label class="switch-row">
             <input id="notify-discord-enabled" type="checkbox" ${settings.discord_enabled ? "checked" : ""}>
             <span>Discord</span>
@@ -2336,7 +2328,6 @@ function collectNotificationSettings() {
     ...settings,
     user_id: state.user?.id || settings.user_id,
     machine_id: state.machineId,
-    email_enabled: Boolean(document.querySelector("#notify-email-enabled")?.checked),
     discord_enabled: Boolean(document.querySelector("#notify-discord-enabled")?.checked),
     discord_webhook_url: String(document.querySelector("#notify-discord-webhook")?.value || "").trim(),
     updated_at: new Date().toISOString(),
