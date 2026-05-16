@@ -1,8 +1,8 @@
 # RedRHex Training Panel
 
-Local web panel for launching small RSL-RL training runs, finding reward tuning files, viewing run history, and keeping notes.
+Local admin panel and V2.0 remote-control foundation for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
 
-**Version:** 1.1.0
+**Version:** 2.0.0
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
@@ -32,9 +32,48 @@ Then open:
 http://127.0.0.1:8080
 ```
 
+## V2.0 Remote Team Mode
+
+V2.0 keeps this local panel as the admin/control-center experience and adds a remote worker architecture for team use outside the lab network.
+
+Remote architecture:
+
+- GitHub Pages hosts the public static web UI.
+- Supabase stores team login, roles, run/job state, artifacts, proxy sessions, and notification events.
+- This training PC runs a worker that polls Supabase and executes queued jobs locally.
+- Cloudflare Tunnel provides secure live console and TensorBoard access.
+- Discord and email notifications are generated from completion/failure events.
+
+Worker command:
+
+```bash
+python -m tools.training_panel.remote_worker
+```
+
+Required remote environment variables:
+
+```bash
+export REDRHEX_SUPABASE_URL="https://<project>.supabase.co"
+export REDRHEX_SUPABASE_ANON_KEY="<anon-key>"
+export REDRHEX_SUPABASE_MACHINE_TOKEN="<machine-token>"
+export REDRHEX_MACHINE_ID="biorolapc2-ubuntu"
+export REDRHEX_REMOTE_ACCEPT_JOBS="false"
+export REDRHEX_CLOUDFLARE_TUNNEL_HOST="https://<tunnel-host>"
+export REDRHEX_DISCORD_WEBHOOK_URL="<discord-webhook>"
+export REDRHEX_RESEND_API_KEY="<resend-key>"
+```
+
+Apply the Supabase schema from:
+
+```text
+tools/training_panel/supabase/schema.sql
+```
+
+Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
+
 ## Scope
 
-V1 is intentionally read-only for reward/config source files. It shows the main tweakable files and reward scales with path and line information, but does not edit source code.
+The local reward/config source files are still protected by default. The panel shows the main tweakable files and reward scales with path and line information, but does not directly edit source code.
 
 History actions:
 
@@ -51,6 +90,12 @@ History actions:
 - `Open Run Folder`, `Open Video Folder`, and `Open Log Folder` try to open repo-owned paths on the host and always return copyable paths for remote sessions.
 - `Stop Process` sends a Ctrl-C style interrupt to the currently selected training/play/video/TensorBoard process, then escalates if Isaac Sim does not close.
 - `Delete Run` first previews the exact repo-owned log/note paths that will be removed, then requires typing the exact run id. It refuses to delete while a related process is still running.
+
+Remote roles:
+
+- `viewer`: inspect runs, logs, artifacts, and proxy links.
+- `operator`: viewer permissions plus launch, stop, video recording, and ONNX export.
+- `admin`: operator permissions plus delete, compact, access, and settings.
 
 Video default:
 

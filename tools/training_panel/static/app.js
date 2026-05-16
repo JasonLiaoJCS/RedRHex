@@ -180,7 +180,7 @@ function setView(name) {
     train: ["Train", "Start a controlled RSL-RL run with the repo defaults."],
     rewards: ["Rewards", "Tune reward weights with presets and see which settings each run used."],
     history: ["History", "Review runs, notes, checkpoints, TensorBoard, and playbacks."],
-    access: ["Access", "Run locally, expose on LAN, or use SSH tunneling."],
+    access: ["Control Center", "Manage local access, V2.0 remote worker status, and remote launch acceptance."],
   };
   $("#view-title").textContent = titles[name][0];
   $("#view-subtitle").textContent = titles[name][1];
@@ -201,6 +201,57 @@ function formData(form) {
 async function loadSystem() {
   const system = await api("/api/system");
   $("#system-info").textContent = JSON.stringify(system, null, 2);
+}
+
+function renderKvGrid(selector, rows) {
+  const node = $(selector);
+  if (!node) return;
+  node.innerHTML = rows
+    .map(([key, value]) => `<span class="info-key">${escapeHtml(key)}</span><span class="info-val">${escapeHtml(String(value))}</span>`)
+    .join("");
+}
+
+async function loadRemoteStatus() {
+  const status = await api("/api/remote/status");
+  const badge = $("#remote-config-badge");
+  if (badge) {
+    badge.textContent = status.configured ? "Configured" : "Needs Setup";
+    badge.className = status.configured ? "status-badge status-completed" : "status-badge status-interrupted";
+  }
+  const accept = $("#remote-accept-status");
+  if (accept) {
+    accept.textContent = status.accept_jobs
+      ? "Remote queued jobs are accepted by this machine."
+      : "Remote queued jobs are paused on this machine.";
+  }
+  const workerCommand = $("#remote-worker-command");
+  if (workerCommand) workerCommand.textContent = status.worker_command;
+  const tunnelCommand = $("#remote-tunnel-command");
+  if (tunnelCommand) tunnelCommand.textContent = status.cloudflare_tunnel_command;
+  renderKvGrid("#remote-machine-grid", [
+    ["Machine ID", status.machine_id || "-"],
+    ["Version", status.version || "-"],
+    ["Accept Jobs", status.accept_jobs ? "enabled" : "disabled"],
+    ["Active Processes", status.active_process_count || 0],
+    ["Isaac/GPU Lock", status.active_isaac_process_count ? "busy" : "free"],
+  ]);
+  renderKvGrid("#remote-integrations-grid", [
+    ["Supabase", status.configured ? status.supabase_url : "not configured"],
+    ["Cloudflare", status.cloudflare_tunnel_host || "not configured"],
+    ["Discord", status.discord_configured ? "configured" : "not configured"],
+    ["Email", status.email_configured ? "configured" : "not configured"],
+  ]);
+  const raw = $("#remote-status-raw");
+  if (raw) raw.textContent = JSON.stringify(status, null, 2);
+}
+
+async function saveRemoteAcceptance(acceptJobs) {
+  const data = await api("/api/remote/settings", {
+    method: "POST",
+    body: JSON.stringify({ accept_jobs: acceptJobs }),
+  });
+  await loadRemoteStatus();
+  setStatus(data.status.accept_jobs ? "Remote queued jobs enabled." : "Remote queued jobs disabled.");
 }
 
 async function loadTweaks() {
@@ -1903,7 +1954,7 @@ async function promptCreateFolder() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadSystem(), loadRewardsPage()]);
+  await Promise.all([loadSystem(), loadRemoteStatus(), loadRewardsPage()]);
   await loadRuns();
   await loadFolders();
   if (state.selectedRun) setDebugTarget({ type: "run", id: state.selectedRun.id });
@@ -2050,6 +2101,10 @@ const moveSelectedBtn = $("#move-selected-runs");
 if (moveSelectedBtn) moveSelectedBtn.addEventListener("click", () => moveSelectedRunsToFolder().catch(handleActionError));
 const trainChangePreset = $("#train-change-preset");
 if (trainChangePreset) trainChangePreset.addEventListener("click", () => setView("rewards"));
+const remoteEnable = $("#remote-enable");
+if (remoteEnable) remoteEnable.addEventListener("click", () => saveRemoteAcceptance(true).catch(handleActionError));
+const remoteDisable = $("#remote-disable");
+if (remoteDisable) remoteDisable.addEventListener("click", () => saveRemoteAcceptance(false).catch(handleActionError));
 
 loadNotificationState();
 renderNotificationBadges();

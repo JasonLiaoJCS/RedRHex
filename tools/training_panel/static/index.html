@@ -19,10 +19,10 @@
         <button class="nav-button active" data-view="train">Train</button>
         <button class="nav-button" data-view="rewards">Rewards</button>
         <button class="nav-button" data-view="history">History</button>
-        <button class="nav-button" data-view="access">Access</button>
+        <button class="nav-button" data-view="access">Control Center</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 1.1</span>
+        <span class="release-version">Version 2.0</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -35,7 +35,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V1.1</span>
+          <span class="release-chip">Training Panel V2.0</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -186,15 +186,30 @@
             <!-- ── Quick Actions (same buttons as card, one place) ── -->
             <div class="section-header"><h3>Actions</h3></div>
             <div class="run-actions-panel">
-              <button type="button" id="play-run" class="ghost-button" data-tooltip="Run the checkpoint in Isaac Sim for visualization (no training)">Play</button>
-              <button type="button" id="export-onnx" class="ghost-button" data-tooltip="Export the latest checkpoint to exported/policy.onnx">Export ONNX</button>
-              <button type="button" id="copy-onnx-path" class="ghost-button" hidden data-tooltip="Copy exported/policy.onnx path">Copy ONNX Path</button>
-              <button type="button" id="open-onnx-folder" class="ghost-button" hidden data-tooltip="Open the exported policy folder (local only)">Open Export Folder</button>
-              <button type="button" id="tensorboard-run" class="ghost-button" data-tooltip="Open TensorBoard to visualize training metrics and reward curves">TensorBoard</button>
-              <button type="button" id="resume-run" class="ghost-button" data-tooltip="Start a new training run resuming from this checkpoint">Resume to Train</button>
-              <button type="button" id="open-run-folder" class="ghost-button" data-tooltip="Open the training log folder in the file manager (local only)">Open Folder</button>
-              <button type="button" id="compact-run" class="danger-button" data-tooltip="Delete old model_*.pt checkpoints and keep the newest one">Compact Run</button>
-              <button type="button" id="delete-run" class="danger-button" data-tooltip="Permanently delete this run entry and its log files from disk">Delete</button>
+              <div class="action-group primary-action-group">
+                <span class="action-group-label">Run</span>
+                <div class="action-button-grid">
+                  <button type="button" id="play-run" class="ghost-button" data-tooltip="Run the checkpoint in Isaac Sim for visualization (no training)">Play</button>
+                  <button type="button" id="resume-run" class="ghost-button" data-tooltip="Start a new training run resuming from this checkpoint">Resume to Train</button>
+                  <button type="button" id="tensorboard-run" class="ghost-button" data-tooltip="Open TensorBoard to visualize training metrics and reward curves">TensorBoard</button>
+                  <button type="button" id="open-run-folder" class="ghost-button" data-tooltip="Open the training log folder in the file manager (local only)">Open Run Folder</button>
+                </div>
+              </div>
+              <div class="action-group">
+                <span class="action-group-label">Export</span>
+                <div class="action-button-grid">
+                  <button type="button" id="export-onnx" class="ghost-button" data-tooltip="Export the latest checkpoint to exported/policy.onnx">Export ONNX</button>
+                  <button type="button" id="copy-onnx-path" class="ghost-button" hidden data-tooltip="Copy exported/policy.onnx path">Copy ONNX Path</button>
+                  <button type="button" id="open-onnx-folder" class="ghost-button" hidden data-tooltip="Open the exported policy folder (local only)">Open Export Folder</button>
+                </div>
+              </div>
+              <div class="action-group danger-action-group">
+                <span class="action-group-label">Cleanup</span>
+                <div class="action-button-grid">
+                  <button type="button" id="compact-run" class="danger-button" data-tooltip="Delete old model_*.pt checkpoints and keep the newest one">Compact Run</button>
+                  <button type="button" id="delete-run" class="danger-button" data-tooltip="Permanently delete this run entry and its log files from disk">Delete Run</button>
+                </div>
+              </div>
             </div>
             <div id="run-info-block" style="display:none">
               <div class="section-header"><h3>Run Info</h3></div>
@@ -268,6 +283,40 @@
       </section>
 
       <section id="access" class="view">
+        <div class="section-header">
+          <h2>Remote Control Center</h2>
+          <span id="remote-config-badge" class="status-badge muted-pill">Checking</span>
+        </div>
+        <div class="access-grid remote-grid">
+          <article>
+            <h2>Remote Worker</h2>
+            <p class="muted-copy">Runs on this training PC and executes queued Supabase jobs.</p>
+            <code id="remote-worker-command">python -m tools.training_panel.remote_worker</code>
+          </article>
+          <article>
+            <h2>Remote Launch</h2>
+            <p id="remote-accept-status" class="muted-copy">Remote job acceptance is unknown.</p>
+            <div class="form-actions compact-actions">
+              <button type="button" id="remote-enable" class="primary-button small-button">Enable</button>
+              <button type="button" id="remote-disable" class="danger-button small-button">Disable</button>
+            </div>
+          </article>
+          <article>
+            <h2>Cloudflare Tunnel</h2>
+            <p class="muted-copy">Use this for secure live console and TensorBoard links.</p>
+            <code id="remote-tunnel-command">cloudflared tunnel --url http://127.0.0.1:8080</code>
+          </article>
+        </div>
+        <div class="remote-status-grid">
+          <article>
+            <h2>Machine</h2>
+            <div id="remote-machine-grid" class="run-info-grid"></div>
+          </article>
+          <article>
+            <h2>Integrations</h2>
+            <div id="remote-integrations-grid" class="run-info-grid"></div>
+          </article>
+        </div>
         <div class="access-grid">
           <article>
             <h2>Local</h2>
@@ -283,9 +332,11 @@
           </article>
         </div>
         <pre id="system-info"></pre>
+        <pre id="remote-status-raw"></pre>
       </section>
     </main>
 
+    <script src="/static/api_adapters.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

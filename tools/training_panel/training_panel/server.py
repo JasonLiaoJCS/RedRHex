@@ -10,11 +10,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from tools.training_panel import __version__
+
 from .commands import DEFAULT_TASK, DEFAULT_VIDEO_PRESET, VIDEO_PRESETS, TrainingParams, VideoParams
 from .config import PanelPaths
 from .history import HistoryStore
 from .presets import PresetStore
 from .processes import ProcessRegistry, ProcessStartError
+from .remote_config import RemoteConfig, RemoteStateStore
 from .rewards import reward_defaults, reward_file_index
 
 
@@ -43,6 +46,8 @@ class PanelState:
         self.history = HistoryStore(paths)
         self.processes = ProcessRegistry(paths, self.history)
         self.presets = PresetStore(_PRESET_FILE)
+        self.remote_config = RemoteConfig.from_env()
+        self.remote_state = RemoteStateStore(paths.remote_state_file)
 
 
 class PanelHandler(BaseHTTPRequestHandler):
@@ -60,9 +65,22 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "repo_root": str(self.state.paths.repo_root),
                     "rsl_rl_log_root": str(self.state.paths.rsl_rl_log_root),
                     "default_task": DEFAULT_TASK,
+                    "version": __version__,
                     "local_url_hint": "http://127.0.0.1:8080",
                     "lan_hint": "Run with --host 0.0.0.0 and open http://<machine-ip>:8080",
                     "ssh_tunnel_hint": "ssh -L 8080:127.0.0.1:8080 user@host",
+                }
+            )
+        if parsed.path == "/api/remote/status":
+            processes = self.state.processes.list_processes()
+            active_isaac = self.state.processes.running_isaac_processes()
+            return self._json(
+                {
+                    **self.state.remote_config.public_status(self.state.paths, self.state.remote_state),
+                    "active_process_count": len([p for p in processes if p.get("returncode") is None]),
+                    "active_isaac_process_count": len(active_isaac),
+                    "active_isaac_processes": active_isaac,
+                    "remote_state": self.state.remote_state.load(),
                 }
             )
         if parsed.path == "/api/training/defaults":
@@ -136,6 +154,20 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/training/start":
                 params = TrainingParams.from_dict(payload)
                 return self._json(self.state.processes.start_training(params), status=201)
+            if parsed.path == "/api/remote/settings":
+                updates: dict = {}
+                if "accept_jobs" in payload:
+                    updates["accept_jobs"] = bool(payload["accept_jobs"])
+                if not updates:
+                    return self._json({"error": "No remote setting was provided"}, status=400)
+                state = self.state.remote_state.save(updates)
+                return self._json(
+                    {
+                        "saved": True,
+                        "remote_state": state,
+                        "status": self.state.remote_config.public_status(self.state.paths, self.state.remote_state),
+                    }
+                )
             if parsed.path == "/api/presets":
                 name = str(payload.get("name") or "").strip()
                 description = str(payload.get("description") or "").strip()
