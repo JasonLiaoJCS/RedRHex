@@ -525,22 +525,87 @@ class HistoryStore:
             ),
         }
 
-    def get_reward_config_for_run(self, run_id: str) -> dict | None:
-        """Return full reward diff between this run's saved params/env.yaml and current defaults."""
-        run = self.get_run(run_id)
+    def _reward_env_yaml_for_run(self, run: dict) -> Path | None:
         if not run or not run.get("log_dir"):
             return None
-        log_dir = Path(run["log_dir"])
-        env_yaml = log_dir / "params" / "env.yaml"
-        if not env_yaml.exists():
+        env_yaml = Path(str(run["log_dir"])) / "params" / "env.yaml"
+        return env_yaml if env_yaml.exists() else None
+
+    @staticmethod
+    def _run_time_key(run: dict) -> float:
+        try:
+            return datetime.fromisoformat(str(run.get("created_at") or "")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _previous_reward_run(self, run_id: str, run: dict) -> dict | None:
+        current_time = self._run_time_key(run)
+        candidates = []
+        for candidate in self.list_runs():
+            if candidate.get("id") == run_id:
+                continue
+            env_yaml = self._reward_env_yaml_for_run(candidate)
+            if not env_yaml:
+                continue
+            candidate_time = self._run_time_key(candidate)
+            if current_time and candidate_time >= current_time:
+                continue
+            candidates.append((candidate_time, candidate))
+        if not candidates and current_time:
+            for candidate in self.list_runs():
+                if candidate.get("id") == run_id:
+                    continue
+                env_yaml = self._reward_env_yaml_for_run(candidate)
+                if env_yaml:
+                    candidates.append((self._run_time_key(candidate), candidate))
+        if not candidates:
             return None
-        defaults = reward_defaults(self.paths.repo_root)
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def get_reward_config_for_run(self, run_id: str, compare_to: str = "default") -> dict | None:
+        """Return reward diff for this run against defaults or the previous run with saved rewards."""
+        run = self.get_run(run_id)
+        env_yaml = self._reward_env_yaml_for_run(run or {})
+        if not run or not env_yaml:
+            return None
         yaml_scales = read_reward_scales_from_yaml(env_yaml)
+        compare_mode = str(compare_to or "default").strip().lower()
+        if compare_mode in {"previous", "last", "last-run", "last_run"}:
+            previous = self._previous_reward_run(run_id, run)
+            if not previous:
+                return {
+                    "run_id": run_id,
+                    "preset_id": run.get("reward_preset_id"),
+                    "env_yaml": str(env_yaml),
+                    "baseline_kind": "previous",
+                    "baseline_missing": True,
+                    "baseline_label": "previous run",
+                    "changed": [],
+                    "same": [],
+                }
+            baseline_yaml = self._reward_env_yaml_for_run(previous)
+            baseline_scales = read_reward_scales_from_yaml(baseline_yaml) if baseline_yaml else {}
+            diff = reward_diff(yaml_scales, baseline_scales)
+            return {
+                "run_id": run_id,
+                "preset_id": run.get("reward_preset_id"),
+                "env_yaml": str(env_yaml),
+                "baseline_kind": "previous",
+                "baseline_label": previous.get("display_name") or previous.get("id"),
+                "baseline_run_id": previous.get("id"),
+                "baseline_created_at": previous.get("created_at"),
+                "baseline_env_yaml": str(baseline_yaml) if baseline_yaml else None,
+                **diff,
+            }
+
+        defaults = reward_defaults(self.paths.repo_root)
         diff = reward_diff(yaml_scales, defaults)
         return {
             "run_id": run_id,
             "preset_id": run.get("reward_preset_id"),
             "env_yaml": str(env_yaml),
+            "baseline_kind": "default",
+            "baseline_label": "default",
             **diff,
         }
 

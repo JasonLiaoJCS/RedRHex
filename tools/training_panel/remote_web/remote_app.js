@@ -18,13 +18,16 @@ import {
   buildRunMetadataPatch,
   buildActionJob,
   buildTrainingJob,
+  buildTweakDraftFromRun,
   canEditPreset,
   canEditRun,
   canOperate,
+  canBuildTweakFromRun,
   escapeHtml,
   friendlyErrorMessage,
   formatRelativeTime,
   hasActiveRemoteWork,
+  latestFinishedTweakRun,
   jobQueueLabel,
   machineState,
   normalizePreset,
@@ -44,10 +47,26 @@ const PHONE_MEDIA = window.matchMedia
   ? window.matchMedia("(max-width: 720px)")
   : { matches: false, addEventListener: null, addListener: null };
 
+const TEXT_AUTOSAVE_DELAY_MS = 350;
+const THEME_KEY = "redrhex_to_go_theme";
+const VIEW_IDS = ["train", "rewards", "terrain", "history", "connection", "dashboard"];
+
+function initialView() {
+  const stored = localStorage.getItem("redrhex_child_view");
+  if (stored === "dashboard") return "train";
+  return VIEW_IDS.includes(stored) ? stored : "train";
+}
+
+function preferredTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 const state = {
   user: null,
   profile: null,
-  view: localStorage.getItem("redrhex_child_view") || "dashboard",
+  view: initialView(),
   machineId: localStorage.getItem("redrhex_machine_id") || DEFAULT_MACHINE_ID,
   snapshot: {
     machines: [],
@@ -61,14 +80,34 @@ const state = {
   },
   selectedPresetId: localStorage.getItem("redrhex_child_preset") || "baseline",
   draftPreset: null,
+  tweakDraftPreset: null,
   selectedTerrainPresetId: localStorage.getItem("redrhex_child_terrain_preset") || "baseline",
   draftTerrainPreset: null,
+  tweakTerrainPresetId: "",
+  tweakTerrainOverrides: null,
+  trainForm: {
+    task: "Template-Redrhex-Direct-v0",
+    num_envs: 4,
+    max_iterations: 8,
+    device: "cuda:0",
+    seed: "",
+  },
   selectedRunId: "",
   runSearch: "",
   folderFilter: "all",
   signedVideos: {},
   videoCheckpointByRun: {},
   runDrafts: {},
+  runMetadataAutosaveTimer: null,
+  runMetadataSaveInFlight: false,
+  runMetadataQueuedRunId: "",
+  runMetadataSaveStatus: "saved",
+  rewardPresetMetadataAutosaveTimer: null,
+  rewardPresetMetadataSaveInFlight: false,
+  rewardPresetMetadataQueued: false,
+  terrainPresetMetadataAutosaveTimer: null,
+  terrainPresetMetadataSaveInFlight: false,
+  terrainPresetMetadataQueued: false,
   message: "",
   loading: false,
   loadError: "",
@@ -76,17 +115,25 @@ const state = {
   refreshTimer: null,
   refreshing: false,
   isPhone: PHONE_MEDIA.matches,
+  theme: preferredTheme(),
 };
 
 const app = document.querySelector("#app");
+document.documentElement.dataset.theme = state.theme;
 
 function role() {
   return state.profile?.role || "viewer";
 }
 
 function selectedPreset() {
-  const presets = state.snapshot.presets.map(normalizePreset);
+  const presets = rewardPresetsForView();
   return presets.find((preset) => preset.id === state.selectedPresetId) || presets[0] || normalizePreset({ id: "baseline", name: "Baseline" });
+}
+
+function rewardPresetsForView() {
+  const presets = state.snapshot.presets.map(normalizePreset);
+  if (!state.tweakDraftPreset) return presets;
+  return [state.tweakDraftPreset, ...presets.filter((preset) => preset.id !== state.tweakDraftPreset.id)];
 }
 
 function selectedTerrainPreset() {
@@ -94,10 +141,27 @@ function selectedTerrainPreset() {
   return presets.find((preset) => preset.id === state.selectedTerrainPresetId) || presets[0] || normalizeTerrainPreset({ id: "baseline", name: "Baseline" });
 }
 
+function selectedTerrainPresetForTraining() {
+  const preset = selectedTerrainPreset();
+  if (
+    state.tweakDraftPreset
+    && state.selectedPresetId === state.tweakDraftPreset.id
+    && state.tweakTerrainOverrides
+    && state.selectedTerrainPresetId === state.tweakTerrainPresetId
+  ) {
+    return { ...preset, values: state.tweakTerrainOverrides };
+  }
+  return preset;
+}
+
 function selectedRun({ fallback = true } = {}) {
   const selected = state.snapshot.runs.find((run) => run.id === state.selectedRunId);
   if (selected) return selected;
   return fallback ? state.snapshot.runs[0] || null : null;
+}
+
+function runById(runId) {
+  return state.snapshot.runs.find((run) => run.id === runId) || null;
 }
 
 function selectedHistoryRun() {
@@ -112,6 +176,17 @@ function setMessage(message, options = {}) {
   } else {
     patchShellStatus();
   }
+}
+
+function setTheme(theme) {
+  state.theme = theme === "dark" ? "dark" : "light";
+  localStorage.setItem(THEME_KEY, state.theme);
+  document.documentElement.dataset.theme = state.theme;
+  patchShellStatus();
+}
+
+function toggleTheme() {
+  setTheme(state.theme === "dark" ? "light" : "dark");
 }
 
 function setView(view) {
@@ -141,6 +216,51 @@ function scheduleRefresh() {
 function currentRunDraft(run) {
   if (!run) return {};
   return state.runDrafts[run.id] || {};
+}
+
+function normalizeRunMetadata(values = {}) {
+  return {
+    display_name: String(values.display_name ?? values.displayName ?? "").trim(),
+    folder: String(values.folder ?? "").trim(),
+    notes: String(values.notes ?? ""),
+  };
+}
+
+function runMetadataValuesMatch(a = {}, b = {}) {
+  const left = normalizeRunMetadata(a);
+  const right = normalizeRunMetadata(b);
+  return left.display_name === right.display_name
+    && left.folder === right.folder
+    && left.notes === right.notes;
+}
+
+function currentRunMetadata(run) {
+  return normalizeRunMetadata({
+    display_name: run?.display_name || "",
+    folder: run?.folder || "",
+    notes: run?.notes || "",
+  });
+}
+
+function isRunMetadataElement(element) {
+  return ["run-name", "run-folder", "run-notes"].includes(element?.id);
+}
+
+function runMetadataStatusText(status) {
+  if (status === "saving") return "Saving";
+  if (status === "dirty") return "Editing";
+  if (status === "error") return "Save failed";
+  return "Saved";
+}
+
+function setRunMetadataSaveStatus(status, runId = "") {
+  const marker = document.querySelector("#run-autosave-status");
+  const visibleRunId = document.querySelector("#run-name")?.dataset.runId || state.selectedRunId;
+  if (runId && visibleRunId && visibleRunId !== runId) return;
+  state.runMetadataSaveStatus = status;
+  if (!marker) return;
+  marker.dataset.state = status;
+  marker.textContent = runMetadataStatusText(status);
 }
 
 function signedVideoEntry(storagePath) {
@@ -191,8 +311,8 @@ async function refresh(options = {}) {
     if (!state.selectedRunId && state.snapshot.runs[0] && !(state.view === "history" && state.isPhone)) {
       state.selectedRunId = state.snapshot.runs[0].id;
     }
-    if (!state.snapshot.presets.find((preset) => preset.id === state.selectedPresetId) && state.snapshot.presets[0]) {
-        state.selectedPresetId = state.snapshot.presets[0].id;
+    if (!rewardPresetsForView().find((preset) => preset.id === state.selectedPresetId) && state.snapshot.presets[0]) {
+      state.selectedPresetId = state.snapshot.presets[0].id;
     }
     if (!state.snapshot.terrainPresets.find((preset) => preset.id === state.selectedTerrainPresetId) && state.snapshot.terrainPresets[0]) {
       state.selectedTerrainPresetId = state.snapshot.terrainPresets[0].id;
@@ -246,12 +366,12 @@ function healthChecks() {
 
 function shell() {
   const views = [
-    ["dashboard", "Dashboard"],
     ["train", "Train"],
     ["rewards", "Rewards"],
     ["terrain", "Terrain"],
     ["history", "History"],
     ["connection", "Connection"],
+    ["dashboard", "Dashboard"],
   ];
   const machine = state.snapshot.targetMachine || state.snapshot.machine;
   const tone = statusTone(machineState(machine));
@@ -267,6 +387,7 @@ function shell() {
         <span id="role-badge" class="badge">${escapeHtml(role())}</span>
         <span id="last-updated-badge" class="badge">${state.lastUpdated ? `Updated ${escapeHtml(formatRelativeTime(state.lastUpdated))}` : "Not updated yet"}</span>
         <span id="refresh-mode-badge" class="badge ${hasActiveRemoteWork(state.snapshot) ? "info" : ""}">${hasActiveRemoteWork(state.snapshot) ? "Auto-refresh 3s" : "Auto-refresh 15s"}</span>
+        <button class="theme-toggle" data-action="toggle-theme">${state.theme === "dark" ? "Light Mode" : "Dark Mode"}</button>
       </div>
     </header>
     <nav class="nav-tabs">
@@ -275,7 +396,55 @@ function shell() {
     <div id="message-notice" class="notice" ${state.message ? "" : "hidden"}>${escapeHtml(state.message)}</div>
     <div id="schema-warnings">${(state.snapshot.schema?.warnings || []).map((warning) => `<div class="notice warning">${escapeHtml(warning)}</div>`).join("")}</div>
     <div id="load-error-notice" class="notice danger" ${state.loadError ? "" : "hidden"}>${escapeHtml(state.loadError)}</div>
+    ${state.user ? welcomeBanner() : ""}
     ${state.user ? page() : loginPage()}
+  `;
+}
+
+const READY_MESSAGES = [
+  "The whegs are warmed up. Time to teach the robot a new trick.",
+  "Mission board is clear. RedRHex is waiting for its next adventure.",
+  "Mother says all systems are go. Let the little rover cook.",
+  "Training lane is open. Tiny legs, serious science.",
+  "The robot is caffeinated in spirit and ready in silicon.",
+  "Green lights across the board. Pick a reward and send it.",
+  "RedRHex is stretching dramatically. Queue the next run.",
+  "Fresh run energy detected. The lab is ready.",
+];
+
+function readyMessage(seed) {
+  let hash = 0;
+  for (const char of seed) hash = ((hash << 5) - hash + char.charCodeAt(0)) >>> 0;
+  return READY_MESSAGES[hash % READY_MESSAGES.length];
+}
+
+function welcomeBanner() {
+  const machine = state.snapshot.targetMachine || state.snapshot.machine;
+  const displayName = state.profile?.display_name || state.user?.email?.split("@")[0] || "teammate";
+  const machineStatus = machineState(machine);
+  const isWarning = ["missing", "offline", "paused"].includes(machineStatus);
+  const bannerTone = isWarning ? "warning" : machineStatus === "busy" ? "busy" : "ready";
+  const readyText = machineStatus === "ready"
+    ? readyMessage(`${displayName}-${new Date().toDateString()}`)
+    : machineStatus === "busy"
+      ? "Mother is busy right now. You can prepare the next job, but launch may wait for the GPU."
+      : machineStatus === "paused"
+        ? "WARNING: Remote launch is paused in mother. Jobs will not start until mother accepts them."
+        : machineStatus === "offline"
+          ? "WARNING: Mother looks offline. Check the worker before queuing training."
+          : "WARNING: No training machine is connected. Open Connection and verify the worker.";
+  return `
+    <section class="welcome-banner ${bannerTone}">
+      <div>
+        <p class="eyebrow">Welcome</p>
+        <h2>Hi ${escapeHtml(displayName)}, where should RedRHex go next?</h2>
+        <p class="subcopy">${escapeHtml(readyText)}</p>
+      </div>
+      <div class="welcome-actions">
+        <button class="primary" data-action="view" data-view="train">Start Training</button>
+        <button data-action="view" data-view="history">View History</button>
+      </div>
+    </section>
   `;
 }
 
@@ -436,23 +605,25 @@ function jobSummary(jobs) {
 
 function trainView() {
   const preset = selectedPreset();
-  const terrainPreset = selectedTerrainPreset();
+  const terrainPreset = selectedTerrainPresetForTraining();
   const disabled = !canOperate(role());
+  const form = state.trainForm;
   return `
     <section class="split-grid">
       <article class="panel">
         <h2>Launch Training</h2>
         <p class="muted">Queues a job for mother. The worker will run one Isaac/GPU action at a time.</p>
         <label>Machine ID <input id="machine-id" value="${escapeHtml(state.machineId)}"></label>
-        <label>Task <input id="task" value="Template-Redrhex-Direct-v0"></label>
+        <label>Task <input id="task" value="${escapeHtml(form.task)}"></label>
         <div class="input-row">
-          <label>Envs <input id="num-envs" type="number" min="1" max="8192" value="4"></label>
-          <label>Iterations <input id="max-iterations" type="number" min="1" max="100000" value="8"></label>
+          <label>Envs <input id="num-envs" type="number" min="1" max="8192" value="${escapeHtml(form.num_envs)}"></label>
+          <label>Iterations <input id="max-iterations" type="number" min="1" max="100000" value="${escapeHtml(form.max_iterations)}"></label>
         </div>
-        <label>Device <input id="device" value="cuda:0"></label>
+        <label>Device <input id="device" value="${escapeHtml(form.device)}"></label>
+        <label>Seed <input id="seed" type="number" placeholder="optional" value="${escapeHtml(form.seed ?? "")}"></label>
         <label>Reward Preset
           <select id="train-preset">
-            ${state.snapshot.presets.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === preset.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
+            ${rewardPresetsForView().map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === preset.id ? "selected" : ""}>${escapeHtml(item.name)}${item.draft ? " (draft)" : ""}</option>`).join("")}
           </select>
         </label>
         <label>Terrain Preset
@@ -460,7 +631,10 @@ function trainView() {
             ${state.snapshot.terrainPresets.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === terrainPreset.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
           </select>
         </label>
-        <button class="primary wide" data-action="queue-training" ${disabled ? "disabled" : ""}>Queue Training</button>
+        <div class="button-row wrap">
+          <button class="primary" data-action="queue-training" ${disabled ? "disabled" : ""}>Queue Training</button>
+          <button data-action="tweak-last-run" ${disabled ? "disabled" : ""}>Tweak From Last Run</button>
+        </div>
         ${disabled ? `<p class="muted">Viewer accounts can inspect but cannot launch training.</p>` : ""}
       </article>
       <article class="panel">
@@ -499,7 +673,7 @@ function terrainSnapshot(values) {
 function rewardsView() {
   const preset = state.draftPreset || selectedPreset();
   const rewardSchemaReady = Boolean(state.snapshot.schema?.rewardPresets);
-  const editable = rewardSchemaReady && canEditPreset(role()) && !preset.built_in;
+  const editable = (rewardSchemaReady || preset.draft) && canEditPreset(role()) && !preset.built_in;
   return `
     <section class="rewards-page">
       ${presetRail("reward", preset, rewardSchemaReady)}
@@ -540,7 +714,7 @@ function terrainView() {
 
 function presetRail(kind, preset, schemaReady) {
   const isTerrain = kind === "terrain";
-  const presets = isTerrain ? state.snapshot.terrainPresets : state.snapshot.presets;
+  const presets = isTerrain ? state.snapshot.terrainPresets : rewardPresetsForView();
   const title = isTerrain ? "Terrain" : "Presets";
   const subtitle = isTerrain ? "Shared terrain recipes" : "Shared reward recipes";
   const selectAction = isTerrain ? "select-terrain-preset" : "select-preset";
@@ -557,9 +731,9 @@ function presetRail(kind, preset, schemaReady) {
       ${schemaReady ? "" : `<p class="muted">Using built-in fallback presets until Supabase schema is updated.</p>`}
       <div class="preset-scroll">
         ${presets.map((item) => `
-        <button class="preset-button ${item.id === preset.id ? "active" : ""}" data-action="${selectAction}" data-id="${escapeHtml(item.id)}">
+        <button class="preset-button ${item.id === preset.id ? "active" : ""} ${item.draft ? "draft-preset" : ""}" data-action="${selectAction}" data-id="${escapeHtml(item.id)}">
           <strong>${escapeHtml(item.name)}</strong>
-          <small>${item.built_in ? "Built-in" : "Team preset"} · ${escapeHtml(formatRelativeTime(item.updated_at))}</small>
+          <small>${item.draft ? "Unsaved draft" : item.built_in ? "Built-in" : "Team preset"} · ${escapeHtml(formatRelativeTime(item.updated_at))}</small>
         </button>`).join("") || empty("Apply the V2.1 schema to create presets.")}
       </div>
     </aside>
@@ -567,17 +741,18 @@ function presetRail(kind, preset, schemaReady) {
 }
 
 function rewardHeader(preset, rewardSchemaReady, editable) {
+  const summary = preset.draft ? "Unsaved tweak draft. Edit rewards, then queue training or save it as a preset." : preset.built_in ? "Built-in preset. Duplicate it before editing." : editable ? "Editable team preset." : "Read-only preset.";
   return `
     <div class="section-head reward-head">
       <div>
         <h2>Reward Tuning</h2>
-        <p class="muted">${escapeHtml(preset.built_in ? "Built-in preset. Duplicate it before editing." : editable ? "Editable team preset." : "Read-only preset.")}</p>
+        <p class="muted">${escapeHtml(summary)}</p>
       </div>
       <div class="button-row reward-actions">
         <button data-action="toggle-all-groups" data-kind="reward">Collapse All</button>
         <button data-action="duplicate-preset" ${!rewardSchemaReady || !canEditPreset(role()) ? "disabled" : ""}>Duplicate</button>
-        <button class="danger" data-action="delete-preset" ${!editable ? "disabled" : ""}>Delete</button>
-        <button class="primary" data-action="save-preset" ${!editable ? "disabled" : ""}>Save Preset</button>
+        <button class="danger" data-action="delete-preset" ${!editable ? "disabled" : ""}>${preset.draft ? "Discard Draft" : "Delete"}</button>
+        <button class="primary" data-action="save-preset" ${!editable || !rewardSchemaReady ? "disabled" : ""}>${preset.draft ? "Save as Preset" : "Save Preset"}</button>
       </div>
     </div>
   `;
@@ -887,13 +1062,190 @@ function runDetailsGrid(run) {
   const params = run.params || {};
   const rewardOverrides = Object.keys(params.reward_overrides || run.reward_overrides || {}).length;
   const terrainOverrides = Object.keys(params.terrain_overrides || run.terrain_overrides || {}).length;
+  const checkpointIter = checkpointIteration(run.latest_checkpoint);
+  const checkpointLabel = run.latest_checkpoint
+    ? Number.isFinite(checkpointIter) ? `Iteration ${checkpointIter}` : run.latest_checkpoint.split("/").pop()
+    : "Missing";
+  const videoLabel = video.state === "ready"
+    ? "Team video ready"
+    : video.state === "uploading"
+      ? "Uploading to team storage"
+      : video.state === "recordable"
+        ? "Ready to record"
+        : "No checkpoint yet";
+  const rewardPreset = run.reward_preset_id || params.reward_preset_id || "baseline";
+  const terrainPreset = run.terrain_preset_id || params.terrain_preset_id || "baseline";
   return `
-    <div><span>Checkpoint</span><strong>${run.latest_checkpoint ? "ready" : "missing"}</strong></div>
-    <div><span>Video</span><strong>${escapeHtml(video.state)}</strong></div>
-    <div><span>Reward</span><strong>${escapeHtml(run.reward_preset_id || params.reward_preset_id || "baseline")} · ${rewardOverrides}</strong></div>
-    <div><span>Terrain</span><strong>${escapeHtml(run.terrain_preset_id || params.terrain_preset_id || "baseline")} · ${terrainOverrides}</strong></div>
-    <div><span>Updated</span><strong>${escapeHtml(formatRelativeTime(run.updated_at || run.created_at))}</strong></div>
+    <article class="run-info-card">
+      <span>Run State</span>
+      <strong class="${statusTone(run.status)}">${escapeHtml(run.status || "unknown")}</strong>
+      <small>Updated ${escapeHtml(formatRelativeTime(run.updated_at || run.created_at))}</small>
+    </article>
+    <article class="run-info-card">
+      <span>Artifacts</span>
+      <div class="run-info-list">
+        <small>Checkpoint <strong>${escapeHtml(checkpointLabel)}</strong></small>
+        <small>Video <strong>${escapeHtml(videoLabel)}</strong></small>
+      </div>
+    </article>
+    <article class="run-info-card">
+      <span>Training Recipe</span>
+      <div class="run-info-list">
+        <small>Reward <strong>${escapeHtml(rewardPreset)}</strong> <em>${rewardOverrides} override${rewardOverrides === 1 ? "" : "s"}</em></small>
+        <small>Terrain <strong>${escapeHtml(terrainPreset)}</strong> <em>${terrainOverrides} override${terrainOverrides === 1 ? "" : "s"}</em></small>
+      </div>
+    </article>
   `;
+}
+
+function plainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function rewardFieldMeta() {
+  const meta = new Map();
+  for (const group of REWARD_FIELDS) {
+    for (const [key, label, help] of group.fields) {
+      meta.set(key, { key, label, help, group: group.name });
+    }
+  }
+  return meta;
+}
+
+function rewardPresetById(presetId) {
+  const id = String(presetId || "baseline");
+  return state.snapshot.presets.map(normalizePreset).find((preset) => String(preset.id) === id) || null;
+}
+
+function runRewardPresetId(run) {
+  const params = plainObject(run.params);
+  return String(params.reward_preset_id || run.reward_preset_id || "baseline");
+}
+
+function rewardSnapshotForRun(run) {
+  const params = plainObject(run.params);
+  const paramOverrides = plainObject(params.reward_overrides);
+  if (Object.keys(paramOverrides).length) return paramOverrides;
+  const runOverrides = plainObject(run.reward_overrides);
+  if (Object.keys(runOverrides).length) return runOverrides;
+  return plainObject(rewardPresetById(runRewardPresetId(run))?.values);
+}
+
+function rewardBaselineValues() {
+  return plainObject(rewardPresetById("baseline")?.values);
+}
+
+function rewardNumber(value) {
+  const num = Number(value ?? 0);
+  return Number.isFinite(num) ? num : value;
+}
+
+function rewardValuesEqual(left, right) {
+  const leftNum = Number(left ?? 0);
+  const rightNum = Number(right ?? 0);
+  if (Number.isFinite(leftNum) && Number.isFinite(rightNum)) {
+    return Math.abs(leftNum - rightNum) < 1e-9;
+  }
+  return String(left ?? "") === String(right ?? "");
+}
+
+function formatRewardNumber(value) {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num)) return String(value ?? "");
+  if (Number.isInteger(num)) return String(num);
+  return num.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function rewardDeltaLabel(value, baseline) {
+  const valueNum = Number(value ?? 0);
+  const baselineNum = Number(baseline ?? 0);
+  if (!Number.isFinite(valueNum) || !Number.isFinite(baselineNum)) return "";
+  const delta = valueNum - baselineNum;
+  if (Math.abs(delta) < 1e-9) return "same";
+  const pct = Math.abs(baselineNum) > 1e-9 ? ` · ${Math.round((delta / Math.abs(baselineNum)) * 100)}%` : "";
+  return `${delta > 0 ? "+" : ""}${formatRewardNumber(delta)}${pct}`;
+}
+
+function rewardComparisonRows(run) {
+  const meta = rewardFieldMeta();
+  const snapshot = rewardSnapshotForRun(run);
+  const baseline = rewardBaselineValues();
+  const knownKeys = REWARD_FIELDS.flatMap((group) => group.fields.map(([key]) => key));
+  const keys = [...new Set([...knownKeys, ...Object.keys(snapshot), ...Object.keys(baseline)])];
+  return keys
+    .map((key) => {
+      const field = meta.get(key) || { key, label: key, help: "", group: "Other" };
+      const value = rewardNumber(snapshot[key] ?? 0);
+      const base = rewardNumber(baseline[key] ?? 0);
+      const valueNum = Number(value ?? 0);
+      const baseNum = Number(base ?? 0);
+      const delta = Number.isFinite(valueNum) && Number.isFinite(baseNum) ? valueNum - baseNum : null;
+      return { ...field, value, baseline: base, delta };
+    })
+    .filter((row) => !rewardValuesEqual(row.value, row.baseline));
+}
+
+function rewardComparisonSection(run) {
+  const rows = rewardComparisonRows(run);
+  const presetId = runRewardPresetId(run);
+  const preset = rewardPresetById(presetId);
+  const baseline = rewardPresetById("baseline");
+  const groups = REWARD_FIELDS
+    .map((group) => ({ name: group.name, rows: rows.filter((row) => row.group === group.name) }))
+    .filter((group) => group.rows.length);
+  const otherRows = rows.filter((row) => !REWARD_FIELDS.some((group) => group.name === row.group));
+  if (otherRows.length) groups.push({ name: "Other", rows: otherRows });
+  return `
+    <section id="reward-comparison-panel" class="subpanel reward-comparison-panel">
+      <div class="section-head compact">
+        <div>
+          <h3>Reward Comparison</h3>
+          <p class="muted">Run snapshot compared with ${escapeHtml(baseline?.name || "Baseline")}.</p>
+        </div>
+        <span class="badge">${rows.length} changed</span>
+      </div>
+      <div class="reward-compare-summary">
+        <span><strong>Run preset</strong>${escapeHtml(preset?.name || presetId)}</span>
+        <span><strong>Baseline</strong>${escapeHtml(baseline?.name || "Baseline")}</span>
+      </div>
+      ${rows.length ? groups.map((group, index) => `
+        <details class="reward-compare-group" data-group="${escapeHtml(group.name)}" ${index === 0 ? "open" : ""}>
+          <summary><span>${escapeHtml(group.name)}</span><em>${group.rows.length}</em></summary>
+          <div class="reward-compare-list">
+            ${group.rows.map(rewardComparisonRow).join("")}
+          </div>
+        </details>
+      `).join("") : empty("No reward changes are recorded for this run.")}
+    </section>
+  `;
+}
+
+function rewardComparisonRow(row) {
+  const dir = row.delta === null ? "" : row.delta > 0 ? "up" : "down";
+  return `
+    <div class="reward-compare-row">
+      <span class="reward-compare-name">
+        <strong>${escapeHtml(row.label)}</strong>
+        <small>${escapeHtml(row.key)}</small>
+      </span>
+      <span><small>Baseline</small><strong>${escapeHtml(formatRewardNumber(row.baseline))}</strong></span>
+      <span><small>This run</small><strong>${escapeHtml(formatRewardNumber(row.value))}</strong></span>
+      <span class="reward-compare-delta ${dir}">${escapeHtml(rewardDeltaLabel(row.value, row.baseline))}</span>
+    </div>
+  `;
+}
+
+function patchRewardComparison(run) {
+  const panel = document.querySelector("#reward-comparison-panel");
+  if (!panel) return;
+  const openGroups = [...panel.querySelectorAll(".reward-compare-group[open]")]
+    .map((group) => group.dataset.group || "");
+  const hadGroups = Boolean(panel.querySelector(".reward-compare-group"));
+  panel.outerHTML = rewardComparisonSection(run);
+  if (!hadGroups) return;
+  document.querySelectorAll("#reward-comparison-panel .reward-compare-group").forEach((group) => {
+    group.open = openGroups.includes(group.dataset.group || "");
+  });
 }
 
 function relatedJobsForRun(run) {
@@ -936,28 +1288,39 @@ function teamVideoSection(run) {
   const signed = videoArtifact ? signedVideoEntry(videoArtifact.storage_path)?.url || "" : "";
   const runnable = canOperate(role()) && Boolean(checkpoint);
   const storagePath = videoArtifact?.storage_path || "";
+  const selectedIteration = Number.isFinite(selectedOption?.iteration) ? selectedOption.iteration : checkpointIteration(checkpoint);
+  const selectedLabel = Number.isFinite(selectedIteration)
+    ? `Iteration ${selectedIteration}`
+    : selectedOption?.label || "Selected checkpoint";
+  const checkpointName = checkpoint ? checkpoint.split("/").pop() : "";
   return `
     <section id="team-video-panel" class="subpanel" data-video-state="${escapeHtml(video.state)}" data-storage-path="${escapeHtml(storagePath)}">
       <div class="section-head compact">
         <h3>Team Video</h3>
         <span class="badge ${statusTone(video.state)}">${escapeHtml(video.state)}</span>
       </div>
-      <label>Checkpoint
+      <div class="video-context">
+        <span>Video target</span>
+        <strong>${escapeHtml(selectedLabel)}</strong>
+        ${checkpointName ? `<small>${escapeHtml(checkpointName)}</small>` : ""}
+      </div>
+      <label>Choose checkpoint video
         <select id="video-checkpoint-select" ${options.length ? "" : "disabled"}>
           ${options.map((option) => `<option value="${escapeHtml(option.path)}" ${option.path === checkpoint ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
         </select>
       </label>
       ${video.state === "ready" ? `
+        <p class="video-now">Viewing team video for <strong>${escapeHtml(selectedLabel)}</strong>.</p>
         ${signed ? `<video controls src="${escapeHtml(signed)}"></video>` : `<p class="muted">Preparing a signed team-only video link...</p>`}
         <div class="button-row">
-          <button data-action="load-video" data-path="${escapeHtml(videoArtifact.storage_path)}">Load Video</button>
-          <button data-action="check-video" ${runnable ? "" : "disabled"}>Check / Create Video</button>
+          <button data-action="load-video" data-path="${escapeHtml(videoArtifact.storage_path)}">${signed ? "Refresh Secure Link" : "Load Team Video"}</button>
           <button data-action="copy-video-path" data-path="${escapeHtml(videoArtifact.storage_path)}">Copy Storage Path</button>
         </div>` : video.state === "uploading" ? `
-        <p class="muted">Video exists locally for ${escapeHtml(selectedOption?.label || "this checkpoint")} and is uploading to team storage.</p>
+        <p class="muted">Video for ${escapeHtml(selectedLabel)} exists locally and is uploading to team storage.</p>
+        <button data-action="refresh">Refresh Status</button>
       ` : video.state === "recordable" ? `
-        <p class="muted">No team video yet for ${escapeHtml(selectedOption?.label || "this checkpoint")}.</p>
-        <button class="primary" data-action="check-video" ${runnable ? "" : "disabled"}>Create Video</button>
+        <p class="muted">No team video has been recorded for ${escapeHtml(selectedLabel)} yet.</p>
+        <button class="primary" data-action="check-video" ${runnable ? "" : "disabled"}>Record Video for ${escapeHtml(selectedLabel)}</button>
       ` : `<p class="muted">No checkpoint yet, so video recording is not available.</p>`}
     </section>
   `;
@@ -966,7 +1329,7 @@ function teamVideoSection(run) {
 function runDetails(run, { context = "desktop" } = {}) {
   const draft = currentRunDraft(run);
   const editable = canEditRun(role());
-  const runnable = canOperate(role()) && Boolean(selectedVideoCheckpoint(run));
+  const tweakable = canOperate(role()) && canBuildTweakFromRun(run, state.snapshot.presets);
   return `
     <div class="section-head run-detail-head ${context === "inline" ? "inline" : ""}">
       <div>
@@ -978,18 +1341,19 @@ function runDetails(run, { context = "desktop" } = {}) {
     <div id="run-details-grid" class="details-grid">
       ${runDetailsGrid(run)}
     </div>
+    ${rewardComparisonSection(run)}
     <section class="subpanel">
       <h3>Run Metadata</h3>
-      <label>Name <input id="run-name" value="${escapeHtml(draft.display_name ?? run.display_name ?? "")}" ${editable ? "" : "disabled"}></label>
-      <label>Folder <input id="run-folder" value="${escapeHtml(draft.folder ?? run.folder ?? "")}" placeholder="e.g. gait tests" ${editable ? "" : "disabled"}></label>
-      <label>Notes <textarea id="run-notes" ${editable ? "" : "disabled"}>${escapeHtml(draft.notes ?? run.notes ?? "")}</textarea></label>
-      <button data-action="save-run" ${editable ? "" : "disabled"}>Save Notes / Folder</button>
+      <label>Name <input id="run-name" data-run-id="${escapeHtml(run.id)}" value="${escapeHtml(draft.display_name ?? run.display_name ?? "")}" ${editable ? "" : "disabled"}></label>
+      <label>Folder <input id="run-folder" data-run-id="${escapeHtml(run.id)}" value="${escapeHtml(draft.folder ?? run.folder ?? "")}" placeholder="e.g. gait tests" ${editable ? "" : "disabled"}></label>
+      <label>Notes <textarea id="run-notes" data-run-id="${escapeHtml(run.id)}" ${editable ? "" : "disabled"}>${escapeHtml(draft.notes ?? run.notes ?? "")}</textarea></label>
+      ${editable ? `<div class="autosave-row"><span id="run-autosave-status" class="autosave-status" data-state="${escapeHtml(state.runMetadataSaveStatus)}">${escapeHtml(runMetadataStatusText(state.runMetadataSaveStatus))}</span></div>` : ""}
     </section>
     ${teamVideoSection(run)}
     <section class="subpanel">
       <h3>Safe Remote Actions</h3>
       <div class="button-row wrap">
-        <button data-action="check-video" ${runnable ? "" : "disabled"}>Check / Create Video</button>
+        <button data-action="tweak-run" ${tweakable ? "" : "disabled"}>Tweak From This Run</button>
         <button data-action="job-tensorboard" ${canOperate(role()) ? "" : "disabled"}>TensorBoard</button>
         <button data-action="job-compact-run" ${canOperate(role()) ? "" : "disabled"}>Compact Run</button>
       </div>
@@ -1063,6 +1427,8 @@ function patchShellStatus() {
     hasActiveRemoteWork(state.snapshot) ? "Auto-refresh 3s" : "Auto-refresh 15s",
     `badge ${hasActiveRemoteWork(state.snapshot) ? "info" : ""}`.trim(),
   );
+  const themeToggle = document.querySelector(".theme-toggle");
+  if (themeToggle) themeToggle.textContent = state.theme === "dark" ? "Light Mode" : "Dark Mode";
 
   const message = document.querySelector("#message-notice");
   if (message) {
@@ -1158,7 +1524,47 @@ function syncHistoryAccordion(card) {
 }
 
 function isRunMetadataFocused() {
-  return ["run-name", "run-folder", "run-notes"].includes(document.activeElement?.id);
+  return isRunMetadataElement(document.activeElement);
+}
+
+function setRunMetadataInputs(run) {
+  if (!run) return;
+  const draft = currentRunDraft(run);
+  const values = {
+    display_name: draft.display_name ?? run.display_name ?? "",
+    folder: draft.folder ?? run.folder ?? "",
+    notes: draft.notes ?? run.notes ?? "",
+  };
+  const name = document.querySelector("#run-name");
+  const folder = document.querySelector("#run-folder");
+  const notes = document.querySelector("#run-notes");
+  if (name) {
+    name.dataset.runId = run.id;
+    name.value = values.display_name;
+  }
+  if (folder) {
+    folder.dataset.runId = run.id;
+    folder.value = values.folder;
+  }
+  if (notes) {
+    notes.dataset.runId = run.id;
+    notes.value = values.notes;
+  }
+}
+
+function persistActiveRunMetadataDraft({ flush = false } = {}) {
+  const active = document.activeElement;
+  if (!isRunMetadataElement(active)) return "";
+  const runId = active.dataset.runId || state.selectedRunId;
+  if (!runId) return "";
+  updateRunMetadataDraft(runId);
+  if (flush) {
+    flushRunMetadataAutosave(runId).catch((error) => {
+      setRunMetadataSaveStatus("error", runId);
+      setMessage(friendlyErrorMessage(error));
+    });
+  }
+  return runId;
 }
 
 function patchTeamVideo(run) {
@@ -1203,13 +1609,14 @@ function patchSelectedRunDetails() {
   const grid = document.querySelector("#run-details-grid");
   if (grid) grid.innerHTML = runDetailsGrid(run);
 
-  if (!isRunMetadataFocused() && !state.runDrafts[run.id]) {
-    const name = document.querySelector("#run-name");
-    const folder = document.querySelector("#run-folder");
-    const notes = document.querySelector("#run-notes");
-    if (name) name.value = run.display_name || "";
-    if (folder) folder.value = run.folder || "";
-    if (notes) notes.value = run.notes || "";
+  patchRewardComparison(run);
+
+  const metadataRunId = document.querySelector("#run-name")?.dataset.runId || "";
+  if (metadataRunId !== run.id || (!isRunMetadataFocused() && !state.runDrafts[run.id])) {
+    setRunMetadataInputs(run);
+    if (metadataRunId !== run.id && !state.runDrafts[run.id]) {
+      setRunMetadataSaveStatus("saved");
+    }
   }
 
   patchTeamVideo(run);
@@ -1325,24 +1732,214 @@ async function handleLogin() {
 async function queueTraining() {
   state.machineId = document.querySelector("#machine-id")?.value || state.machineId;
   localStorage.setItem("redrhex_machine_id", state.machineId);
+  state.trainForm = {
+    task: document.querySelector("#task")?.value || "Template-Redrhex-Direct-v0",
+    num_envs: Number(document.querySelector("#num-envs")?.value || 4),
+    max_iterations: Number(document.querySelector("#max-iterations")?.value || 8),
+    device: document.querySelector("#device")?.value || "cuda:0",
+    seed: document.querySelector("#seed")?.value || "",
+  };
   const presetId = document.querySelector("#train-preset")?.value || state.selectedPresetId;
   state.selectedPresetId = presetId;
   localStorage.setItem("redrhex_child_preset", presetId);
   const terrainPresetId = document.querySelector("#train-terrain-preset")?.value || state.selectedTerrainPresetId;
   state.selectedTerrainPresetId = terrainPresetId;
   localStorage.setItem("redrhex_child_terrain_preset", terrainPresetId);
+  if (state.tweakDraftPreset && state.selectedPresetId === state.tweakDraftPreset.id) {
+    const values = collectRewardValues();
+    if (Object.keys(values).length) state.tweakDraftPreset.values = values;
+  }
   const preset = selectedPreset();
-  const terrainPreset = selectedTerrainPreset();
+  const terrainPreset = selectedTerrainPresetForTraining();
   const params = {
-    task: document.querySelector("#task")?.value || "Template-Redrhex-Direct-v0",
-    num_envs: Number(document.querySelector("#num-envs")?.value || 4),
-    max_iterations: Number(document.querySelector("#max-iterations")?.value || 8),
-    device: document.querySelector("#device")?.value || "cuda:0",
+    task: state.trainForm.task,
+    num_envs: state.trainForm.num_envs,
+    max_iterations: state.trainForm.max_iterations,
+    device: state.trainForm.device,
   };
+  if (state.trainForm.seed !== "") params.seed = Number(state.trainForm.seed);
+  if (preset.draft) {
+    params.tweak_source_run_id = preset.source_run_id || "";
+    params.tweak_source_label = preset.source_label || preset.source_run_id || "";
+  }
   const job = buildTrainingJob({ machineId: state.machineId, params, preset, terrainPreset, role: role(), userId: state.user?.id });
   await insert("jobs", job);
   await refresh({ silent: true });
   setMessage(`Queued training with ${preset.name} and ${terrainPreset.name}.`);
+}
+
+function applyTweakPayload(payload) {
+  const params = payload.training_params || {};
+  state.trainForm = {
+    task: params.task || "Template-Redrhex-Direct-v0",
+    num_envs: Number(params.num_envs || 4),
+    max_iterations: Number(params.max_iterations || 8),
+    device: params.device || "cuda:0",
+    seed: params.seed ?? "",
+  };
+  state.tweakDraftPreset = normalizePreset({
+    ...payload.reward_preset,
+    draft: true,
+    source_run_id: payload.source_run?.id || params.tweak_source_run_id || payload.reward_preset?.source_run_id || "",
+    source_label: params.tweak_source_label || payload.source_run?.display_name || payload.source_run?.id || "",
+  });
+  state.tweakDraftPreset.draft = true;
+  state.tweakDraftPreset.source_run_id = payload.source_run?.id || params.tweak_source_run_id || "";
+  state.tweakDraftPreset.source_label = params.tweak_source_label || payload.source_run?.display_name || payload.source_run?.id || "";
+  state.draftPreset = null;
+  state.selectedPresetId = state.tweakDraftPreset.id;
+  localStorage.setItem("redrhex_child_preset", state.selectedPresetId);
+  state.selectedTerrainPresetId = params.terrain_preset_id || payload.terrain_preset_id || "baseline";
+  state.tweakTerrainPresetId = state.selectedTerrainPresetId;
+  state.tweakTerrainOverrides = params.terrain_overrides || payload.terrain_overrides || {};
+  localStorage.setItem("redrhex_child_terrain_preset", state.selectedTerrainPresetId);
+  setMessage(payload.message || "Loaded tweak draft.", { forceRender: false });
+  setView("rewards");
+}
+
+function tweakPayloadFromRun(run) {
+  return buildTweakDraftFromRun(run, {
+    presets: state.snapshot.presets,
+    terrainPresets: state.snapshot.terrainPresets,
+  });
+}
+
+function tweakFromRun(runId) {
+  const run = runById(runId);
+  if (!run) return setMessage("Run not found.");
+  try {
+    applyTweakPayload(tweakPayloadFromRun(run));
+  } catch (error) {
+    setMessage(friendlyErrorMessage(error));
+  }
+}
+
+function tweakFromLastRun() {
+  const run = latestFinishedTweakRun(state.snapshot.runs, state.snapshot.presets);
+  if (!run) return setMessage("No finished run with usable tweak data found.");
+  tweakFromRun(run.id);
+}
+
+function presetMetadataStateKeys(kind) {
+  return kind === "terrain"
+    ? {
+      timer: "terrainPresetMetadataAutosaveTimer",
+      saving: "terrainPresetMetadataSaveInFlight",
+      queued: "terrainPresetMetadataQueued",
+    }
+    : {
+      timer: "rewardPresetMetadataAutosaveTimer",
+      saving: "rewardPresetMetadataSaveInFlight",
+      queued: "rewardPresetMetadataQueued",
+    };
+}
+
+function editablePresetForKind(kind) {
+  const isTerrain = kind === "terrain";
+  const preset = isTerrain ? state.draftTerrainPreset || selectedTerrainPreset() : state.draftPreset || selectedPreset();
+  const schemaReady = isTerrain ? Boolean(state.snapshot.schema?.terrainPresets) : Boolean(state.snapshot.schema?.rewardPresets);
+  if (!isTerrain && preset?.draft && !state.draftPreset) return null;
+  if (!preset || preset.built_in || !schemaReady || !canEditPreset(role())) return null;
+  return preset;
+}
+
+function presetMetadataValues(kind, preset) {
+  const nameSelector = kind === "terrain" ? "#terrain-preset-name" : "#preset-name";
+  const descriptionSelector = kind === "terrain" ? "#terrain-preset-description" : "#preset-description";
+  return {
+    name: String(document.querySelector(nameSelector)?.value || preset?.name || "").trim() || preset?.name || "Untitled Preset",
+    description: document.querySelector(descriptionSelector)?.value || "",
+  };
+}
+
+function patchPresetMetadataInSnapshot(kind, presetId, values, updatedAt) {
+  const presets = kind === "terrain" ? state.snapshot.terrainPresets : state.snapshot.presets;
+  const preset = presets.find((item) => item.id === presetId);
+  if (!preset) return;
+  preset.name = values.name;
+  preset.description = values.description;
+  preset.updated_at = updatedAt;
+}
+
+function schedulePresetMetadataAutosave(kind) {
+  const keys = presetMetadataStateKeys(kind);
+  if (state[keys.timer]) clearTimeout(state[keys.timer]);
+  state[keys.queued] = true;
+  state[keys.timer] = setTimeout(() => {
+    flushPresetMetadataAutosave(kind).catch((error) => setMessage(friendlyErrorMessage(error)));
+  }, TEXT_AUTOSAVE_DELAY_MS);
+}
+
+async function flushPresetMetadataAutosave(kind) {
+  const keys = presetMetadataStateKeys(kind);
+  if (state[keys.timer]) {
+    clearTimeout(state[keys.timer]);
+    state[keys.timer] = null;
+  }
+  state[keys.queued] = false;
+  await savePresetMetadata(kind, { autosave: true });
+}
+
+async function savePresetMetadata(kind, options = {}) {
+  const keys = presetMetadataStateKeys(kind);
+  if (state[keys.saving]) {
+    state[keys.queued] = true;
+    return;
+  }
+  const preset = editablePresetForKind(kind);
+  if (!preset) return;
+  const isTerrain = kind === "terrain";
+  const isDraft = isTerrain ? Boolean(state.draftTerrainPreset) : Boolean(state.draftPreset);
+  const values = presetMetadataValues(kind, preset);
+  if (!isDraft && values.name === (preset.name || "") && values.description === (preset.description || "")) {
+    return;
+  }
+
+  const updatedAt = new Date().toISOString();
+  state[keys.saving] = true;
+  try {
+    if (isDraft) {
+      const payload = {
+        id: preset.id,
+        name: values.name,
+        description: values.description,
+        values: isTerrain ? collectTerrainValues() : collectRewardValues(),
+        built_in: false,
+        created_by: preset.created_by || state.user?.id || null,
+        updated_by: state.user?.id || null,
+        updated_at: updatedAt,
+      };
+      await upsert(isTerrain ? "terrain_presets" : "reward_presets", payload);
+      if (isTerrain) {
+        state.draftTerrainPreset = null;
+        state.selectedTerrainPresetId = payload.id;
+        localStorage.setItem("redrhex_child_terrain_preset", payload.id);
+      } else {
+        state.draftPreset = null;
+        state.selectedPresetId = payload.id;
+        localStorage.setItem("redrhex_child_preset", payload.id);
+      }
+    } else {
+      await update(
+        isTerrain ? "terrain_presets" : "reward_presets",
+        `id=eq.${encodeURIComponent(preset.id)}`,
+        {
+          name: values.name,
+          description: values.description,
+          updated_by: state.user?.id || null,
+          updated_at: updatedAt,
+        },
+      );
+      patchPresetMetadataInSnapshot(kind, preset.id, values, updatedAt);
+    }
+    await refresh({ silent: true });
+    setMessage(`${isTerrain ? "Terrain" : "Reward"} preset metadata autosaved.`);
+  } finally {
+    state[keys.saving] = false;
+    if (state[keys.queued]) {
+      schedulePresetMetadataAutosave(kind);
+    }
+  }
 }
 
 async function savePreset() {
@@ -1360,6 +1957,7 @@ async function savePreset() {
   if (!preset.created_by) payload.created_by = state.user?.id || null;
   await upsert("reward_presets", payload);
   state.draftPreset = null;
+  state.tweakDraftPreset = null;
   state.selectedPresetId = payload.id;
   await refresh();
   setMessage(`Saved preset ${payload.name}.`);
@@ -1369,9 +1967,11 @@ async function deletePreset() {
   const preset = state.draftPreset || selectedPreset();
   if (!preset || preset.built_in) return;
   if (!window.confirm(`Delete reward preset "${preset.name}"?`)) return;
-  if (state.draftPreset) {
+  if (state.draftPreset || preset.draft) {
     state.draftPreset = null;
+    if (preset.draft) state.tweakDraftPreset = null;
     state.selectedPresetId = "baseline";
+    localStorage.setItem("redrhex_child_preset", state.selectedPresetId);
     render();
     return;
   }
@@ -1385,11 +1985,13 @@ async function deletePreset() {
 function duplicatePreset() {
   const source = state.draftPreset || selectedPreset();
   const id = slugify(`${source.id || source.name}-copy`);
+  if (source.draft) state.tweakDraftPreset = null;
   state.draftPreset = {
     ...source,
     id,
     name: `${source.name} Copy`,
     built_in: false,
+    draft: false,
     values: { ...(source.values || {}) },
     created_by: state.user?.id || null,
   };
@@ -1478,20 +2080,106 @@ function newPreset() {
   render();
 }
 
-async function saveRun() {
-  const run = selectedRun();
+function collectRunMetadataDraft(run) {
+  if (!run) return null;
+  const nameInput = document.querySelector("#run-name");
+  if (nameInput?.dataset.runId === run.id) {
+    return {
+      display_name: nameInput.value ?? run.display_name ?? "",
+      folder: document.querySelector("#run-folder")?.value ?? run.folder ?? "",
+      notes: document.querySelector("#run-notes")?.value ?? run.notes ?? "",
+    };
+  }
+  return state.runDrafts[run.id] || currentRunMetadata(run);
+}
+
+function updateRunMetadataDraft(runId) {
+  const run = runById(runId);
+  if (!run) return null;
+  const draft = collectRunMetadataDraft(run);
+  if (!draft) return null;
+  state.runDrafts[run.id] = {
+    ...state.runDrafts[run.id],
+    ...draft,
+  };
+  return state.runDrafts[run.id];
+}
+
+function scheduleRunMetadataAutosave(runId) {
+  if (!runId) return;
+  if (state.runMetadataAutosaveTimer) clearTimeout(state.runMetadataAutosaveTimer);
+  state.runMetadataQueuedRunId = runId;
+  setRunMetadataSaveStatus("dirty", runId);
+  state.runMetadataAutosaveTimer = setTimeout(() => {
+    flushRunMetadataAutosave(runId).catch((error) => {
+      setRunMetadataSaveStatus("error", runId);
+      setMessage(friendlyErrorMessage(error));
+    });
+  }, TEXT_AUTOSAVE_DELAY_MS);
+}
+
+async function flushRunMetadataAutosave(runId = state.runMetadataQueuedRunId) {
+  if (!runId) return;
+  if (state.runMetadataAutosaveTimer) {
+    clearTimeout(state.runMetadataAutosaveTimer);
+    state.runMetadataAutosaveTimer = null;
+  }
+  state.runMetadataQueuedRunId = "";
+  await saveRun(runId, { autosave: true });
+}
+
+async function saveRun(runId = state.selectedRunId, options = {}) {
+  const targetRunId = runId || state.selectedRunId;
+  const run = targetRunId ? runById(targetRunId) : selectedRun({ fallback: false });
   if (!run) return;
-  const displayName = (document.querySelector("#run-name")?.value || "").trim();
-  const folder = (document.querySelector("#run-folder")?.value || "").trim();
-  const notes = document.querySelector("#run-notes")?.value || "";
-  await update(
-    "runs",
-    `id=eq.${encodeURIComponent(run.id)}`,
-    buildRunMetadataPatch({ displayName, folder, notes }),
-  );
-  delete state.runDrafts[run.id];
-  await refresh({ silent: true });
-  setMessage("Run metadata saved.");
+  if (state.runMetadataSaveInFlight) {
+    state.runMetadataQueuedRunId = run.id;
+    return;
+  }
+  const draft = collectRunMetadataDraft(run);
+  const normalized = normalizeRunMetadata(draft);
+  if (runMetadataValuesMatch(normalized, currentRunMetadata(run))) {
+    delete state.runDrafts[run.id];
+    if (options.autosave) setRunMetadataSaveStatus("saved", run.id);
+    if (!options.autosave) setMessage("No metadata changes to save.");
+    return;
+  }
+  state.runMetadataSaveInFlight = true;
+  if (options.autosave) setRunMetadataSaveStatus("saving", run.id);
+  try {
+    await update(
+      "runs",
+      `id=eq.${encodeURIComponent(run.id)}`,
+      buildRunMetadataPatch({
+        displayName: normalized.display_name,
+        folder: normalized.folder,
+        notes: normalized.notes,
+      }),
+    );
+    run.display_name = normalized.display_name || null;
+    run.folder = normalized.folder || null;
+    run.notes = normalized.notes;
+    const latestDraft = state.runDrafts[run.id];
+    if (!latestDraft || runMetadataValuesMatch(latestDraft, normalized)) {
+      delete state.runDrafts[run.id];
+    } else {
+      state.runMetadataQueuedRunId = run.id;
+    }
+    await refresh({ silent: true });
+    if (options.autosave) {
+      setRunMetadataSaveStatus("saved", run.id);
+    } else {
+      setMessage("Run metadata saved.");
+    }
+  } catch (error) {
+    if (options.autosave) setRunMetadataSaveStatus("error", run.id);
+    throw error;
+  } finally {
+    state.runMetadataSaveInFlight = false;
+    if (state.runMetadataQueuedRunId) {
+      scheduleRunMetadataAutosave(state.runMetadataQueuedRunId);
+    }
+  }
 }
 
 async function queueRunAction(type, message, payload = {}) {
@@ -1551,6 +2239,7 @@ async function loadVideo(storagePath) {
 }
 
 function openHistoryFolder(folderKey) {
+  persistActiveRunMetadataDraft({ flush: true });
   state.folderFilter = folderKey || "all";
   state.selectedRunId = "";
   if (state.folderFilter !== "all" && !state.isPhone) {
@@ -1584,6 +2273,7 @@ document.addEventListener("click", async (event) => {
   event.preventDefault();
   const action = target.dataset.action;
   try {
+    if (action === "toggle-theme") return toggleTheme();
     if (action === "view") return setView(target.dataset.view);
     if (action === "login") return await handleLogin();
     if (action === "refresh") return await refresh({ silent: true });
@@ -1602,6 +2292,7 @@ document.addEventListener("click", async (event) => {
       return setMessage("Machine target saved.");
     }
     if (action === "queue-training") return await queueTraining();
+    if (action === "tweak-last-run") return tweakFromLastRun();
     if (action === "select-preset") {
       state.selectedPresetId = target.dataset.id;
       state.draftPreset = null;
@@ -1632,6 +2323,7 @@ document.addEventListener("click", async (event) => {
     if (action === "open-folder") return openHistoryFolder(target.dataset.folder || "all");
     if (action === "open-folder-root") return openHistoryFolder("all");
     if (action === "select-run") {
+      const previousDraftRunId = persistActiveRunMetadataDraft({ flush: true });
       if (state.view === "history") {
         const opened = !(state.isPhone && state.selectedRunId === target.dataset.id);
         if (state.isPhone && syncHistoryAccordion(target)) {
@@ -1641,6 +2333,9 @@ document.addEventListener("click", async (event) => {
           }
         } else {
           state.selectedRunId = target.dataset.id;
+          if (previousDraftRunId !== state.selectedRunId && !state.runDrafts[state.selectedRunId]) {
+            setRunMetadataSaveStatus("saved");
+          }
           await ensureSelectedVideoSigned();
           patchHistory({ forceList: true });
         }
@@ -1651,13 +2346,14 @@ document.addEventListener("click", async (event) => {
       await ensureSelectedVideoSigned();
       return render();
     }
-    if (action === "save-run") return await saveRun();
+    if (action === "save-run") return await saveRun(target.dataset.runId || state.selectedRunId);
     if (action === "load-video") return await loadVideo(target.dataset.path);
     if (action === "copy-video-path") {
       await navigator.clipboard.writeText(target.dataset.path || "");
       return setMessage("Video storage path copied.");
     }
     if (action === "check-video") return await checkOrCreateVideo();
+    if (action === "tweak-run") return tweakFromRun(selectedRun()?.id || "");
     if (action === "job-tensorboard") return await queueTensorBoard();
     if (action === "job-compact-run") return await compactSelectedRun();
   } catch (error) {
@@ -1666,12 +2362,21 @@ document.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (["task", "num-envs", "max-iterations", "device", "seed"].includes(event.target.id)) {
+    state.trainForm = {
+      task: document.querySelector("#task")?.value || "Template-Redrhex-Direct-v0",
+      num_envs: Number(document.querySelector("#num-envs")?.value || 4),
+      max_iterations: Number(document.querySelector("#max-iterations")?.value || 8),
+      device: document.querySelector("#device")?.value || "cuda:0",
+      seed: document.querySelector("#seed")?.value || "",
+    };
+  }
   if (event.target.id === "train-preset") {
     state.selectedPresetId = event.target.value;
     localStorage.setItem("redrhex_child_preset", state.selectedPresetId);
     const snapshot = document.querySelector("#train-preset-snapshot");
     if (snapshot) {
-      snapshot.innerHTML = trainPresetSnapshot(selectedPreset(), selectedTerrainPreset());
+      snapshot.innerHTML = trainPresetSnapshot(selectedPreset(), selectedTerrainPresetForTraining());
     } else {
       render();
     }
@@ -1681,7 +2386,7 @@ document.addEventListener("change", (event) => {
     localStorage.setItem("redrhex_child_terrain_preset", state.selectedTerrainPresetId);
     const snapshot = document.querySelector("#train-preset-snapshot");
     if (snapshot) {
-      snapshot.innerHTML = trainPresetSnapshot(selectedPreset(), selectedTerrainPreset());
+      snapshot.innerHTML = trainPresetSnapshot(selectedPreset(), selectedTerrainPresetForTraining());
     } else {
       render();
     }
@@ -1709,21 +2414,26 @@ document.addEventListener("input", (event) => {
     renderRunListOnly();
   }
   if (["run-name", "run-folder", "run-notes"].includes(event.target.id)) {
-    const run = selectedRun();
+    const run = runById(event.target.dataset.runId) || selectedRun({ fallback: false });
     if (run) {
-      state.runDrafts[run.id] = {
-        ...state.runDrafts[run.id],
-        display_name: document.querySelector("#run-name")?.value ?? run.display_name ?? "",
-        folder: document.querySelector("#run-folder")?.value ?? run.folder ?? "",
-        notes: document.querySelector("#run-notes")?.value ?? run.notes ?? "",
-      };
+      updateRunMetadataDraft(run.id);
+      scheduleRunMetadataAutosave(run.id);
     }
   }
   if (event.target.id === "preset-name" && state.draftPreset) {
     state.draftPreset.name = event.target.value;
   }
+  if (event.target.id === "preset-name" && state.tweakDraftPreset && state.selectedPresetId === state.tweakDraftPreset.id) {
+    state.tweakDraftPreset.name = event.target.value;
+  }
   if (event.target.id === "preset-description" && state.draftPreset) {
     state.draftPreset.description = event.target.value;
+  }
+  if (event.target.id === "preset-description" && state.tweakDraftPreset && state.selectedPresetId === state.tweakDraftPreset.id) {
+    state.tweakDraftPreset.description = event.target.value;
+  }
+  if (["preset-name", "preset-description"].includes(event.target.id)) {
+    schedulePresetMetadataAutosave("reward");
   }
   if (event.target.id === "terrain-preset-name" && state.draftTerrainPreset) {
     state.draftTerrainPreset.name = event.target.value;
@@ -1731,11 +2441,63 @@ document.addEventListener("input", (event) => {
   if (event.target.id === "terrain-preset-description" && state.draftTerrainPreset) {
     state.draftTerrainPreset.description = event.target.value;
   }
+  if (["terrain-preset-name", "terrain-preset-description"].includes(event.target.id)) {
+    schedulePresetMetadataAutosave("terrain");
+  }
   if (event.target.classList.contains("reward-input") && state.draftPreset) {
     state.draftPreset.values[event.target.dataset.key] = Number(event.target.value || 0);
   }
+  if (event.target.classList.contains("reward-input") && state.tweakDraftPreset && state.selectedPresetId === state.tweakDraftPreset.id) {
+    state.tweakDraftPreset.values[event.target.dataset.key] = Number(event.target.value || 0);
+  }
   if (event.target.classList.contains("terrain-input") && state.draftTerrainPreset) {
     state.draftTerrainPreset.values[event.target.dataset.key] = parseTerrainValue(event.target);
+  }
+});
+
+document.addEventListener("focusout", (event) => {
+  if (["run-name", "run-folder", "run-notes"].includes(event.target.id)) {
+    const runId = event.target.dataset.runId || state.selectedRunId;
+    updateRunMetadataDraft(runId);
+    flushRunMetadataAutosave(runId).catch((error) => {
+      setRunMetadataSaveStatus("error", runId);
+      setMessage(friendlyErrorMessage(error));
+    });
+  }
+  if (["preset-name", "preset-description"].includes(event.target.id)) {
+    flushPresetMetadataAutosave("reward").catch((error) => setMessage(friendlyErrorMessage(error)));
+  }
+  if (["terrain-preset-name", "terrain-preset-description"].includes(event.target.id)) {
+    flushPresetMetadataAutosave("terrain").catch((error) => setMessage(friendlyErrorMessage(error)));
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (["run-name", "run-folder", "run-notes"].includes(event.target.id)) {
+    const shouldSave = event.target.id === "run-notes"
+      ? (event.ctrlKey || event.metaKey) && event.key === "Enter"
+      : event.key === "Enter";
+    if (!shouldSave) return;
+    event.preventDefault();
+    const runId = event.target.dataset.runId || state.selectedRunId;
+    updateRunMetadataDraft(runId);
+    flushRunMetadataAutosave(runId).catch((error) => {
+      setRunMetadataSaveStatus("error", runId);
+      setMessage(friendlyErrorMessage(error));
+    });
+    event.target.blur();
+  }
+  if (["preset-name", "terrain-preset-name"].includes(event.target.id) && event.key === "Enter") {
+    event.preventDefault();
+    flushPresetMetadataAutosave(event.target.id === "terrain-preset-name" ? "terrain" : "reward")
+      .catch((error) => setMessage(friendlyErrorMessage(error)));
+    event.target.blur();
+  }
+  if (["preset-description", "terrain-preset-description"].includes(event.target.id) && (event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    flushPresetMetadataAutosave(event.target.id === "terrain-preset-description" ? "terrain" : "reward")
+      .catch((error) => setMessage(friendlyErrorMessage(error)));
+    event.target.blur();
   }
 });
 

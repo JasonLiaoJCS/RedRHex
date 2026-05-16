@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.training_panel.training_panel.commands import TrainingParams, VideoParams, export_onnx_argv, play_argv, shell_for_command
+from tools.training_panel.training_panel.commands import TrainingParams, VideoParams, export_onnx_argv, play_argv, shell_for_command, training_argv
 from tools.training_panel.training_panel.config import PanelPaths
 
 
@@ -83,6 +83,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(params.terrain_overrides["terrain.terrain_type"], "plane")
         self.assertEqual(params.terrain_overrides["terrain_curriculum_enable"], False)
         self.assertEqual(params.terrain_overrides["terrain_curriculum_levels"], [0.0])
+
+    def test_training_params_preserve_tweak_metadata_without_changing_argv(self):
+        params = TrainingParams.from_dict(
+            {
+                "task": "Template-Redrhex-Direct-v0",
+                "num_envs": 4,
+                "max_iterations": 8,
+                "device": "cuda:0",
+                "tweak_source_run_id": "panel_123",
+                "tweak_source_label": "Baseline trial",
+            }
+        )
+        self.assertEqual(params.tweak_source_run_id, "panel_123")
+        self.assertEqual(params.tweak_source_label, "Baseline trial")
+        self.assertNotIn("tweak_source_run_id", " ".join(training_argv(params)))
 
 
 if __name__ == "__main__":

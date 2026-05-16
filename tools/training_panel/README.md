@@ -2,7 +2,7 @@
 
 Local admin panel and V2.1 remote-control system for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
 
-**Version:** 2.1.1
+**Version:** 2.2.0
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
@@ -194,7 +194,7 @@ Apply the Supabase schema from:
 tools/training_panel/supabase/schema.sql
 ```
 
-Re-apply the schema after pulling V2.1.1 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
+Re-apply the schema after pulling V2.2.0 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
 
 Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
 

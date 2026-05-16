@@ -1,4 +1,4 @@
--- RedRHex Training Panel V2.1.1 Supabase schema
+-- RedRHex Training Panel V2.2.0 Supabase schema
 -- Apply in the Supabase SQL editor, then configure Row Level Security policies
 -- for your team's auth provider.
 
@@ -137,6 +137,22 @@ create table if not exists public.run_events (
   -- after resume, so multiple events of the same type must be allowed.
 );
 
+create table if not exists public.team_activity_events (
+  id uuid primary key default gen_random_uuid(),
+  machine_id text references public.machines(machine_id),
+  actor_id uuid references auth.users(id),
+  actor_name text,
+  actor_role public.redrhex_role,
+  event_type text not null,
+  category text not null default 'system',
+  outcome text not null default 'info',
+  run_id text references public.runs(id) on delete set null,
+  job_id uuid references public.jobs(id) on delete set null,
+  points integer not null default 0,
+  metadata jsonb not null default '{}',
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.artifacts (
   id uuid primary key default gen_random_uuid(),
   run_id text references public.runs(id) on delete cascade,
@@ -252,6 +268,7 @@ alter table public.machines enable row level security;
 alter table public.runs enable row level security;
 alter table public.jobs enable row level security;
 alter table public.run_events enable row level security;
+alter table public.team_activity_events enable row level security;
 alter table public.artifacts enable row level security;
 alter table public.proxy_sessions enable row level security;
 alter table public.notification_settings enable row level security;
@@ -281,6 +298,8 @@ drop policy if exists "operators can create terrain presets" on public.terrain_p
 drop policy if exists "operators can update custom terrain presets" on public.terrain_presets;
 drop policy if exists "operators can delete custom terrain presets" on public.terrain_presets;
 drop policy if exists "run_events readable by authenticated users" on public.run_events;
+drop policy if exists "team activity readable by authenticated users" on public.team_activity_events;
+drop policy if exists "machine can insert team activity" on public.team_activity_events;
 drop policy if exists "machine can upsert own row" on public.machines;
 drop policy if exists "machine can upsert own runs" on public.runs;
 drop policy if exists "machine can upsert own artifacts" on public.artifacts;
@@ -418,6 +437,12 @@ create policy "operators can delete custom terrain presets" on public.terrain_pr
 create policy "run_events readable by authenticated users" on public.run_events
   for select to authenticated using (true);
 
+create policy "team activity readable by authenticated users" on public.team_activity_events
+  for select to authenticated using (true);
+
+create policy "machine can insert team activity" on public.team_activity_events
+  for insert with check (machine_id = (auth.jwt() ->> 'sub'));
+
 -- Worker write policies.
 -- The remote worker authenticates with machine_token as the bearer JWT.
 -- If machine_token is a Supabase service-role key it bypasses RLS entirely;
@@ -446,4 +471,34 @@ create index if not exists idx_jobs_status          on public.jobs(status);
 create index if not exists idx_artifacts_run_id     on public.artifacts(run_id);
 create index if not exists idx_run_events_run_id    on public.run_events(run_id);
 create index if not exists idx_reward_presets_builtin on public.reward_presets(built_in);
+create index if not exists idx_team_activity_created_at on public.team_activity_events(created_at desc);
+create index if not exists idx_team_activity_actor_id   on public.team_activity_events(actor_id);
+create index if not exists idx_team_activity_machine_id on public.team_activity_events(machine_id);
+create index if not exists idx_team_activity_run_id     on public.team_activity_events(run_id);
+create index if not exists idx_team_activity_job_id     on public.team_activity_events(job_id);
+
+create or replace view public.team_activity_member_7d as
+select
+  actor_id,
+  coalesce(actor_name, 'Unknown member') as actor_name,
+  actor_role,
+  count(*) as events,
+  sum(points) as points,
+  count(*) filter (where category = 'training') as training_events,
+  count(*) filter (where outcome = 'completed') as completed_events,
+  count(*) filter (where outcome in ('failed', 'interrupted')) as failed_events
+from public.team_activity_events
+where created_at >= now() - interval '7 days'
+group by actor_id, coalesce(actor_name, 'Unknown member'), actor_role;
+
+create or replace view public.team_activity_experiment_7d as
+select
+  category,
+  event_type,
+  outcome,
+  count(*) as events,
+  sum(points) as points
+from public.team_activity_events
+where created_at >= now() - interval '7 days'
+group by category, event_type, outcome;
 create index if not exists idx_terrain_presets_builtin on public.terrain_presets(built_in);

@@ -74,6 +74,8 @@ class TrainingParams:
     reward_overrides: dict = field(default_factory=dict)
     terrain_preset_id: str = "baseline"
     terrain_overrides: dict = field(default_factory=dict)
+    tweak_source_run_id: str | None = None
+    tweak_source_label: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainingParams":
@@ -92,6 +94,8 @@ class TrainingParams:
             reward_overrides={str(k): float(v) for k, v in raw_overrides.items()},
             terrain_preset_id=str(data.get("terrain_preset_id") or "baseline"),
             terrain_overrides={str(k): _normalize_override_value(v) for k, v in raw_terrain_overrides.items()},
+            tweak_source_run_id=str(data["tweak_source_run_id"]) if data.get("tweak_source_run_id") else None,
+            tweak_source_label=str(data["tweak_source_label"]) if data.get("tweak_source_label") else None,
         )
         params.validate()
         return params

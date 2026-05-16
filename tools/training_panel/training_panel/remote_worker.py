@@ -6,7 +6,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
+from .activity import category_for_job_type, outcome_for_status, score_activity_event
 from .commands import DEFAULT_VIDEO_PRESET, TrainingParams, VideoParams
 from .config import PanelPaths
 from .history import HistoryStore, checkpoint_inventory
@@ -94,6 +96,15 @@ def _parse_time(value: str | None) -> float:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _uuid_or_none(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(UUID(str(value)))
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -446,6 +457,87 @@ class RemoteWorker:
             return rows[0]
         return None
 
+    def _profile_for_job(self, job: dict) -> dict:
+        actor_id = _uuid_or_none(str(job.get("actor_id") or ""))
+        if not actor_id:
+            return {}
+        try:
+            rows = self.client.select(
+                "profiles",
+                query={
+                    "id": f"eq.{actor_id}",
+                    "select": "id,email,display_name,role",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return {}
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            return row if isinstance(row, dict) else {}
+        return {}
+
+    def _record_job_activity(
+        self,
+        job: dict,
+        outcome: str,
+        *,
+        result: dict | None = None,
+        error: str = "",
+    ) -> None:
+        try:
+            job_type = str(job.get("type") or job.get("job_type") or "job")
+            payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+            result = result or {}
+            result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+            profile = self._profile_for_job(job)
+            actor_id = _uuid_or_none(str(job.get("actor_id") or ""))
+            actor_name = str(
+                profile.get("display_name")
+                or profile.get("email")
+                or job.get("actor_name")
+                or actor_id
+                or job.get("actor_role")
+                or "Remote member"
+            )
+            actor_role = str(profile.get("role") or job.get("actor_role") or "viewer")
+            category = category_for_job_type(job_type)
+            normalized_outcome = outcome_for_status(outcome)
+            run_id = str(
+                payload.get("run_id")
+                or result.get("local_run_id")
+                or result_payload.get("run_id")
+                or result_payload.get("source_run_id")
+                or ""
+            )
+            metadata = {
+                "job_type": job_type,
+                "status": normalized_outcome,
+                "run_id": run_id,
+                "process_id": result.get("process_id") or result_payload.get("id") or "",
+                "reward_preset_id": payload.get("reward_preset_id") or "",
+                "terrain_preset_id": payload.get("terrain_preset_id") or "",
+                "error": error,
+            }
+            record = {
+                "machine_id": self.config.machine_id,
+                "actor_id": actor_id,
+                "actor_name": actor_name,
+                "actor_role": actor_role if actor_role in {"viewer", "operator", "admin"} else "viewer",
+                "event_type": f"remote_job_{normalized_outcome}",
+                "category": category,
+                "outcome": normalized_outcome,
+                "run_id": run_id or None,
+                "job_id": _uuid_or_none(str(job.get("id") or "")),
+                "points": score_activity_event(job_type, outcome=normalized_outcome, category=category, job_type=job_type),
+                "metadata": metadata,
+                "created_at": _now_iso(),
+            }
+            self.client.insert("team_activity_events", record, prefer="return=minimal")
+        except Exception:
+            # Analytics must never block training, video, export, or stop jobs.
+            return
+
     def poll_once(self) -> dict:
         accept_jobs = self.state_store.effective_accept_jobs(self.config)
         gpu_locked = self.executor.gpu_locked()
@@ -459,12 +551,16 @@ class RemoteWorker:
 
         job_id = str(job.get("id"))
         self.active_job_id = job_id
+        self._record_job_activity(job, "queued")
+        self._record_job_activity(job, "claimed")
+        self._record_job_activity(job, "running")
         try:
             result = self.executor.execute(job).to_dict()
             sync_error = self.sync_if_due(force=True)
             if sync_error:
                 result.setdefault("payload", {})["sync_error"] = sync_error
             self.client.complete_job(job_id, result)
+            self._record_job_activity(job, "completed", result=result)
             return {"status": "completed", "job_id": job_id, "result": result}
         except Exception as exc:
             sync_error = self.sync_if_due(force=True)
@@ -472,6 +568,7 @@ class RemoteWorker:
             if sync_error:
                 result["sync_error"] = sync_error
             self.client.fail_job(job_id, str(exc), result)
+            self._record_job_activity(job, "failed", result=result, error=str(exc))
             return {"status": "failed", "job_id": job_id, "error": str(exc)}
         finally:
             self.active_job_id = None

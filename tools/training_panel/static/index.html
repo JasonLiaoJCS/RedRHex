@@ -24,7 +24,7 @@
         <button class="nav-button" data-view="access">Control Center</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 2.1.1</span>
+        <span class="release-version">Version 2.2.0</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -37,7 +37,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V2.1.1</span>
+          <span class="release-chip">Training Panel V2.2.0</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -75,6 +75,7 @@
           </label>
           <div class="form-actions">
             <button type="submit" class="primary-button">Start Training</button>
+            <button type="button" id="tweak-last-run" class="ghost-button">Tweak From Last Run</button>
             <button type="button" id="smoke-button" class="ghost-button">Use Smoke Defaults</button>
             <button type="button" id="debug-button" class="ghost-button">Use Debug Defaults</button>
             <button type="button" id="clear-resume" class="ghost-button">Clear Resume</button>
@@ -266,6 +267,7 @@
                 <div class="action-button-grid">
                   <button type="button" id="play-run" class="ghost-button" data-tooltip="Run the checkpoint in Isaac Sim for visualization (no training)">Play</button>
                   <button type="button" id="resume-run" class="ghost-button" data-tooltip="Start a new training run resuming from this checkpoint">Resume to Train</button>
+                  <button type="button" id="tweak-run" class="ghost-button" data-tooltip="Copy this run into an editable reward tweak draft">Tweak From This Run</button>
                   <button type="button" id="tensorboard-run" class="ghost-button" data-tooltip="Open TensorBoard to visualize training metrics and reward curves">TensorBoard</button>
                   <button type="button" id="open-run-folder" class="ghost-button" data-tooltip="Open the training log folder in the file manager (local only)">Open Run Folder</button>
                 </div>
@@ -315,7 +317,13 @@
 
             <!-- ── Reward Config (Module D) ── -->
             <section id="reward-config-panel" class="reward-config-panel" hidden>
-              <div class="section-header"><h3>Reward Config</h3></div>
+              <div class="section-header reward-config-header">
+                <h3>Reward Config</h3>
+                <div class="segmented-control compact-segments" id="reward-compare-mode" aria-label="Reward comparison baseline">
+                  <button type="button" class="segment-button active" data-compare-mode="default">Default</button>
+                  <button type="button" class="segment-button" data-compare-mode="previous">Last Run</button>
+                </div>
+              </div>
               <div id="reward-config-content"></div>
             </section>
 
@@ -370,7 +378,9 @@
           </div>
           <button type="button" id="activity-refresh" class="ghost-button small-button">Refresh</button>
         </div>
+        <div id="activity-controls" class="activity-controls"></div>
         <div id="activity-analytics" class="activity-analytics"></div>
+        <div id="activity-mission" class="activity-mission"></div>
         <div id="activity-events" class="activity-events"></div>
       </section>
 
@@ -390,72 +400,71 @@
             <article class="control-card worker-card">
               <div class="card-head">
                 <div>
-                  <h2>Remote Worker</h2>
-                  <p id="remote-worker-summary" class="muted-copy">Checking worker state...</p>
+                  <h2>Remote Connection</h2>
+                  <p id="remote-worker-summary" class="muted-copy">Checking connection state...</p>
                 </div>
                 <span id="remote-worker-badge" class="status-badge muted-pill">Unknown</span>
               </div>
 
-              <div class="worker-command-bar">
-                <div>
-                  <span class="mini-label">Worker Lifecycle</span>
-                  <div class="form-actions compact-actions">
-                    <button type="button" id="remote-worker-start" class="primary-button small-button"
-                      data-tooltip="Launch the remote worker so this machine can receive jobs from the phone web shell.">Start Worker</button>
-                    <button type="button" id="remote-worker-stop" class="danger-button small-button"
-                      data-tooltip="Gracefully stop the worker. Any in-flight job finishes first before it exits.">Stop Worker</button>
-                    <button type="button" id="remote-worker-restart" class="ghost-button small-button"
-                      data-tooltip="Stop the worker and immediately start it again. Useful after changing environment variables.">Restart</button>
-                  </div>
-                </div>
-                <div class="acceptance-box">
-                  <span class="mini-label">Remote Launch</span>
-                  <div class="form-actions compact-actions">
-                    <button type="button" id="remote-enable" class="primary-button small-button"
-                      data-tooltip="Allow the phone web shell to queue training, video, and export jobs on this machine.">Accept Jobs</button>
-                    <button type="button" id="remote-disable" class="ghost-button small-button"
-                      data-tooltip="Stop accepting new remote jobs. Any job currently running will finish normally.">Pause Jobs</button>
-                  </div>
-                </div>
+              <!-- 3 lifecycle buttons -->
+              <div class="form-actions compact-actions">
+                <button type="button" id="remote-worker-start" class="primary-button small-button"
+                  data-tooltip="Start the remote connection so teammates can control this machine from RedRHex Go.">Connect</button>
+                <button type="button" id="remote-worker-stop" class="danger-button small-button"
+                  data-tooltip="Disconnect. Any job already running will finish before stopping.">Disconnect</button>
+                <button type="button" id="remote-worker-restart" class="ghost-button small-button"
+                  data-tooltip="Disconnect and immediately reconnect. Use this after changing environment variables.">Restart</button>
               </div>
 
-              <div class="worker-settings-grid">
-                <section class="setting-panel">
-                  <h3>Launch Mode</h3>
-                  <div class="segmented-control" aria-label="Remote worker launch mode">
-                    <button type="button" id="remote-mode-tmux" class="segment-button active" data-mode="tmux"
-                      data-tooltip="Recommended. The worker keeps running in a background terminal session (tmux) even if you close the browser tab.">Persist in tmux</button>
-                    <button type="button" id="remote-mode-child" class="segment-button" data-mode="child"
-                      data-tooltip="The worker runs as a child of this panel. It stops when you close the panel. Useful for quick testing.">Child process</button>
-                  </div>
-                  <p id="remote-mode-note" class="muted-copy"></p>
-                </section>
-
-                <section class="setting-panel">
-                  <h3>Startup</h3>
-                  <label class="toggle-row">
-                    <input type="checkbox" id="remote-autostart" />
-                    <span>Auto-start worker when the local panel starts</span>
-                  </label>
-                  <p class="muted-copy">Enable this after the setup checklist is complete.</p>
-                </section>
-              </div>
+              <!-- Accept / pause as a single toggle (simpler than two buttons) -->
+              <label class="toggle-row"
+                data-tooltip="When on, teammates can start training, record videos, and export models from RedRHex Go.">
+                <input type="checkbox" id="remote-accept-toggle" />
+                <span>Allow remote training &amp; control</span>
+              </label>
 
               <div id="remote-worker-grid" class="run-info-grid compact-info-grid"></div>
               <div id="remote-worker-attach-wrap" class="copy-row" hidden>
                 <code id="remote-worker-attach"></code>
                 <button type="button" id="copy-worker-attach" class="ghost-button small-button"
-                  data-tooltip="Copy a tmux command you can paste in a terminal to watch worker output in real time.">Copy Attach</button>
+                  data-tooltip="Copy a tmux command you can paste in a terminal to watch the connection output live.">Copy Attach</button>
               </div>
 
+              <!-- Connection output — collapsed so it's out of the way -->
               <details class="worker-output-panel">
-                <summary>Worker Output</summary>
+                <summary>Connection Output</summary>
                 <div class="section-header compact-section-header">
                   <h3>Recent Log Tail</h3>
                   <button type="button" id="copy-worker-output" class="ghost-button small-button"
-                    data-tooltip="Copy the recent worker log text to clipboard.">Copy Output</button>
+                    data-tooltip="Copy the recent log text to clipboard.">Copy Output</button>
                 </div>
                 <pre id="remote-worker-output"></pre>
+              </details>
+
+              <!-- Launch mode + auto-start hidden behind Advanced — most users never need to touch this -->
+              <details class="advanced-panel" id="worker-advanced">
+                <summary>⚙ Connection Settings</summary>
+                <div class="worker-settings-grid" style="margin-top:10px">
+                  <section class="setting-panel">
+                    <h3>Launch Mode</h3>
+                    <div class="segmented-control" aria-label="Remote worker launch mode">
+                      <button type="button" id="remote-mode-tmux" class="segment-button active" data-mode="tmux"
+                        data-tooltip="Recommended. Keeps running in the background even if you close the browser tab.">Keep running in background</button>
+                      <button type="button" id="remote-mode-child" class="segment-button" data-mode="child"
+                        data-tooltip="Stops automatically when you close this panel. Good for quick testing.">Stop when panel closes</button>
+                    </div>
+                    <p id="remote-mode-note" class="muted-copy"></p>
+                  </section>
+
+                  <section class="setting-panel">
+                    <h3>Startup</h3>
+                    <label class="toggle-row">
+                      <input type="checkbox" id="remote-autostart" />
+                      <span>Auto-connect when panel opens</span>
+                    </label>
+                    <p class="muted-copy">Enable after completing the Setup Checklist.</p>
+                  </section>
+                </div>
               </details>
             </article>
 

@@ -33,7 +33,9 @@ const state = {
   activePresetId: "baseline",
   activePresetOverrides: {},
   selectedPresetId: null,
+  rewardDraftPreset: null,
   rewardDefaults: {},
+  rewardCompareMode: "default",
   // Terrain / presets
   terrainPresets: [],
   activeTerrainPresetId: "baseline",
@@ -44,6 +46,12 @@ const state = {
   remoteStatus: null,
   activityEvents: [],
   activityAnalytics: null,
+  activityFilters: {
+    window: "7d",
+    member: "",
+    category: "",
+  },
+  activityCollapsedGroups: new Set(),
   // Comparison (Module 6)
   comparisonRun: null,
   comparisonMode: false,
@@ -203,6 +211,38 @@ function setView(name) {
   $("#view-subtitle").textContent = titles[name][1];
 }
 
+function rewardPresetsForRender() {
+  if (!state.rewardDraftPreset) return state.presets;
+  const withoutDraft = state.presets.filter((preset) => preset.id !== state.rewardDraftPreset.id);
+  return [state.rewardDraftPreset, ...withoutDraft];
+}
+
+function rewardPresetById(presetId) {
+  if (state.rewardDraftPreset && state.rewardDraftPreset.id === presetId) return state.rewardDraftPreset;
+  return state.presets.find((preset) => preset.id === presetId);
+}
+
+function currentRewardEditorValues() {
+  const values = {};
+  document.querySelectorAll("#reward-categories .reward-row-input").forEach((input) => {
+    const key = input.dataset.key;
+    const val = parseFloat(input.value);
+    if (key && !Number.isNaN(val)) values[key] = val;
+  });
+  return values;
+}
+
+function activeRewardOverridesForTraining() {
+  if (state.rewardDraftPreset && state.activePresetId === state.rewardDraftPreset.id) {
+    if (state.selectedPresetId === state.rewardDraftPreset.id) {
+      const values = currentRewardEditorValues();
+      if (Object.keys(values).length) state.rewardDraftPreset.values = values;
+    }
+    return state.rewardDraftPreset.values || {};
+  }
+  return state.activePresetOverrides || {};
+}
+
 function formData(form) {
   const data = Object.fromEntries(new FormData(form).entries());
   data.headless = form.elements.headless.checked;
@@ -211,9 +251,13 @@ function formData(form) {
   data.max_iterations = Number(data.max_iterations);
   // Include active reward preset
   data.reward_preset_id = state.activePresetId || "baseline";
-  data.reward_overrides = state.activePresetOverrides || {};
+  data.reward_overrides = activeRewardOverridesForTraining();
   data.terrain_preset_id = state.activeTerrainPresetId || "baseline";
   data.terrain_overrides = state.activeTerrainPresetOverrides || {};
+  if (state.rewardDraftPreset?.source_run_id && data.reward_preset_id === state.rewardDraftPreset.id) {
+    data.tweak_source_run_id = state.rewardDraftPreset.source_run_id;
+    data.tweak_source_label = state.rewardDraftPreset.source_label || state.rewardDraftPreset.source_run_id;
+  }
   return data;
 }
 
@@ -254,7 +298,7 @@ async function loadRemoteStatus() {
     strip.innerHTML = [
       remoteStatusPill("Setup", status.configured ? "Configured" : "Needs Setup", status.configured ? "status-completed" : "status-interrupted", status.env_file_exists ? "env file found" : "env file missing"),
       remoteStatusPill("Worker", status.worker_running ? "Running" : "Stopped", status.worker_running ? "status-running" : "muted-pill", status.worker_runtime_mode || status.worker_mode || "tmux"),
-      remoteStatusPill("Remote Launch", status.accept_jobs ? "Accepting Jobs" : "Paused", status.accept_jobs ? "status-completed" : "status-interrupted", status.remote_web_url || "RedRHex To Go"),
+      remoteStatusPill("Remote Control", status.accept_jobs ? "Enabled" : "Paused", status.accept_jobs ? "status-completed" : "status-interrupted", status.remote_web_url || "RedRHex To Go"),
       remoteStatusPill("Isaac/GPU", status.active_isaac_process_count ? "Busy" : "Free", status.active_isaac_process_count ? "status-running" : "status-completed", `${status.active_process_count || 0} active process${Number(status.active_process_count || 0) === 1 ? "" : "es"}`),
     ].join("");
   }
@@ -270,11 +314,11 @@ async function loadRemoteStatus() {
     if (!status.configured) {
       workerSummary.textContent = "Set REDRHEX_SUPABASE_URL and REDRHEX_SUPABASE_MACHINE_TOKEN in your .env to enable remote access.";
     } else if (status.worker_running && status.accept_jobs) {
-      workerSummary.textContent = `Online in ${mode} mode — accepting jobs from the phone web shell.`;
+      workerSummary.textContent = `Connected in ${mode} mode — teammates can control training from RedRHex Go.`;
     } else if (status.worker_running && !status.accept_jobs) {
-      workerSummary.textContent = `Running in ${mode} mode but not accepting new jobs. Click Accept Jobs to resume.`;
+      workerSummary.textContent = `Connected in ${mode} mode but remote control is paused. Toggle "Allow remote training & control" to resume.`;
     } else {
-      workerSummary.textContent = "Worker is not running. Click Start Worker to begin accepting remote jobs.";
+      workerSummary.textContent = "Not connected. Click Connect to let teammates use RedRHex Go.";
     }
   }
   document.querySelectorAll(".segment-button[data-mode]").forEach((button) => {
@@ -290,10 +334,8 @@ async function loadRemoteStatus() {
   if (stopButton) stopButton.disabled = !status.worker_running;
   const restartButton = $("#remote-worker-restart");
   if (restartButton) restartButton.disabled = !status.configured;
-  const enableButton = $("#remote-enable");
-  if (enableButton) enableButton.disabled = Boolean(status.accept_jobs);
-  const disableButton = $("#remote-disable");
-  if (disableButton) disableButton.disabled = !status.accept_jobs;
+  const acceptToggle = $("#remote-accept-toggle");
+  if (acceptToggle) acceptToggle.checked = Boolean(status.accept_jobs);
 
   const modeNote = $("#remote-mode-note");
   if (modeNote) {
@@ -696,6 +738,7 @@ function renderRuns() {
       const playLabel = playProcessId ? "Stop Play" : "Play";
       const playProcessAttr = playProcessId ? `data-process-id="${escapeHtml(playProcessId)}"` : "";
       const playDisabled = (!canCheckpoint && !playProcessId) || Boolean(mediaProcess && !playProcessId);
+      const canTweak = !["running", "stopping"].includes(String(run.status || "").toLowerCase());
       const unread = state.notifications.unreadRunIds.has(run.id);
       return `
         <article class="run-card ${active} ${unread ? "unread" : ""}" data-run-id="${escapeHtml(run.id)}">
@@ -725,6 +768,7 @@ function renderRuns() {
             <button type="button" data-action="tensorboard" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTensorboard)} data-tooltip="Open metrics">TensorBoard</button>
             <button type="button" data-action="${playAction}" data-run-id="${escapeHtml(run.id)}" ${playProcessAttr} ${runButtonDisabled(playDisabled)} data-tooltip="${playProcessId ? "Stop Isaac playback" : "Play checkpoint"}">${escapeHtml(playLabel)}</button>
             <button type="button" data-action="resume" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canCheckpoint)} data-tooltip="Resume training from checkpoint">Resume to Train</button>
+            <button type="button" data-action="tweak" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTweak)} data-tooltip="Copy this run into an editable reward tweak draft">Tweak</button>
             <button type="button" data-action="console" data-run-id="${escapeHtml(run.id)}" data-tooltip="Show Process Console">Console</button>
             ${videoProcessId
               ? `<button type="button" data-action="stop-video" data-run-id="${escapeHtml(run.id)}" data-process-id="${escapeHtml(videoProcessId)}" data-tooltip="Stop recording">Stop Recording</button>`
@@ -932,6 +976,7 @@ function renderRunDetails() {
   $("#open-onnx-folder").hidden = !run || !run.onnx_path;
   $("#open-onnx-folder").disabled = !run || !run.onnx_path;
   $("#resume-run").disabled = !run || !run.latest_checkpoint;
+  $("#tweak-run").disabled = !run || ["running", "stopping"].includes(String(run.status || "").toLowerCase());
   $("#stop-process").disabled = !state.debugTarget && !run;
 
   const hasAttach = Boolean(state.lastDebug && state.lastDebug.attach_command);
@@ -1631,6 +1676,7 @@ async function handleRunAction(action, runId, processId = "") {
     if (action === "tensorboard") await startTensorBoardForRun(runId, pendingWindow);
     if (action === "play") await playRun(runId);
     if (action === "resume") resumeRun(runId);
+    if (action === "tweak") await tweakFromRun(runId);
     if (action === "compare") { startComparison(runId); return; }
     if (action === "console") {
       setDebugTarget(consoleTargetForRun(runId));
@@ -1658,6 +1704,61 @@ function applyPreset(kind) {
 function clearResume() {
   $("#train-form").elements.checkpoint.value = "";
   $("#train-status").textContent = "Resume checkpoint cleared.";
+}
+
+function applyTrainingParamsToForm(params) {
+  const form = $("#train-form");
+  if (!form || !params) return;
+  form.elements.task.value = params.task || "Template-Redrhex-Direct-v0";
+  form.elements.num_envs.value = params.num_envs ?? 4;
+  form.elements.max_iterations.value = params.max_iterations ?? 1;
+  form.elements.device.value = params.device || "cuda:0";
+  form.elements.seed.value = params.seed ?? "";
+  form.elements.checkpoint.value = "";
+  form.elements.headless.checked = params.headless !== false;
+}
+
+async function applyTweakPayload(payload) {
+  if (!payload || !payload.training_params || !payload.reward_preset) return;
+  if (!state.presets.length) await loadRewardsPage();
+  if (!state.terrainPresets.length) await loadTerrainPage();
+  const params = payload.training_params;
+  applyTrainingParamsToForm(params);
+  state.rewardDraftPreset = {
+    ...payload.reward_preset,
+    draft: true,
+    source_run_id: payload.source_run?.id || params.tweak_source_run_id || payload.reward_preset.source_run_id,
+    source_label: params.tweak_source_label || payload.source_run?.display_name || payload.source_run?.id || "",
+  };
+  state.selectedPresetId = state.rewardDraftPreset.id;
+  state.activePresetId = state.rewardDraftPreset.id;
+  state.activePresetOverrides = state.rewardDraftPreset.values || {};
+  state.activeTerrainPresetId = params.terrain_preset_id || "baseline";
+  state.selectedTerrainPresetId = state.activeTerrainPresetId;
+  state.activeTerrainPresetOverrides = params.terrain_overrides || {};
+  renderPresets();
+  renderTerrainPresets();
+  setView("rewards");
+  selectPresetForEdit(state.rewardDraftPreset.id);
+  $("#train-status").textContent = payload.message || `Loaded tweak draft from ${state.rewardDraftPreset.source_label || "run"}.`;
+  setStatus("Tweak draft is active for the next training run. Adjust rewards, then start training.");
+}
+
+async function tweakFromLastRun() {
+  try {
+    await applyTweakPayload(await api("/api/tweaks/last-run"));
+  } catch (error) {
+    $("#train-status").textContent = error.message;
+    setStatus(error.message);
+  }
+}
+
+async function tweakFromRun(runId) {
+  try {
+    await applyTweakPayload(await api(`/api/runs/${encodeURIComponent(runId)}/tweak`));
+  } catch (error) {
+    setStatus(error.message);
+  }
 }
 
 // ============================================================
@@ -1801,12 +1902,13 @@ function toggleRewardCategoriesCollapsed() {
 }
 
 function renderPresets() {
-  const { presets, activePresetId, selectedPresetId } = state;
+  const { activePresetId, selectedPresetId } = state;
+  const presets = rewardPresetsForRender();
   $("#preset-list").innerHTML = presets.map((p) => `
-    <div class="preset-card ${p.id === selectedPresetId ? "selected" : ""} ${p.id === activePresetId ? "active-for-training" : ""}"
+    <div class="preset-card ${p.id === selectedPresetId ? "selected" : ""} ${p.id === activePresetId ? "active-for-training" : ""} ${p.draft ? "draft-preset" : ""}"
          data-preset-id="${escapeHtml(p.id)}"
          title="${escapeHtml(p.description)}">
-      <div class="preset-card-name">${escapeHtml(p.name)}</div>
+      <div class="preset-card-name">${escapeHtml(p.name)}${p.draft ? ` <span class="draft-badge">Draft</span>` : ""}</div>
       <div class="preset-card-desc">${escapeHtml(p.description)}</div>
     </div>`
   ).join("");
@@ -1814,13 +1916,13 @@ function renderPresets() {
     card.addEventListener("click", () => selectPresetForEdit(card.dataset.presetId));
   });
   // Update training form indicator
-  const activePreset = presets.find((p) => p.id === activePresetId) || { name: activePresetId };
+  const activePreset = rewardPresetById(activePresetId) || { name: activePresetId };
   const el = $("#train-active-preset-name");
   if (el) el.textContent = activePreset.name || activePresetId;
 }
 
 function selectPresetForEdit(presetId) {
-  const preset = state.presets.find((p) => p.id === presetId);
+  const preset = rewardPresetById(presetId);
   if (!preset) return;
   state.selectedPresetId = presetId;
   renderPresets();
@@ -1838,7 +1940,8 @@ function selectPresetForEdit(presetId) {
     descInput.disabled = Boolean(preset.built_in);
   }
   const builtInBadge = $("#preset-builtin-badge");
-  builtInBadge.hidden = !preset.built_in;
+  builtInBadge.hidden = !preset.built_in && !preset.draft;
+  builtInBadge.textContent = preset.draft ? "Unsaved Draft" : "Built-in";
 
   const isActive = preset.id === state.activePresetId;
   const activateBtn = $("#preset-activate-btn");
@@ -1848,10 +1951,12 @@ function selectPresetForEdit(presetId) {
 
   $("#preset-collapse-all-btn").disabled = false;
   $("#preset-duplicate-btn").disabled = false;
-  $("#preset-delete-btn").disabled = preset.built_in;
-  $("#preset-save-btn").disabled = preset.built_in;
+  $("#preset-delete-btn").disabled = preset.built_in && !preset.draft;
+  $("#preset-delete-btn").textContent = preset.draft ? "Discard Draft" : "Delete";
+  $("#preset-save-btn").disabled = preset.built_in && !preset.draft;
+  $("#preset-save-btn").textContent = preset.draft ? "Save as Preset" : "Save Preset";
 
-  renderRewardEditor(preset, state.rewardDefaults, !preset.built_in);
+  renderRewardEditor(preset, state.rewardDefaults, !preset.built_in || Boolean(preset.draft));
 }
 
 async function loadRewardsPage() {
@@ -1863,7 +1968,7 @@ async function loadRewardsPage() {
   state.activePresetId = presetsData.active_preset_id || "baseline";
   state.rewardDefaults = tweakData.reward_defaults || {};
   // Populate active preset overrides for training form
-  const active = state.presets.find((p) => p.id === state.activePresetId);
+  const active = rewardPresetById(state.activePresetId);
   state.activePresetOverrides = active ? (active.values || {}) : {};
 
   renderPresets();
@@ -1888,13 +1993,21 @@ async function loadRewardsPage() {
   }
 
   // Auto-select the active preset for display
-  if (state.activePresetId) selectPresetForEdit(state.activePresetId);
+  if (state.selectedPresetId && rewardPresetById(state.selectedPresetId)) selectPresetForEdit(state.selectedPresetId);
+  else if (state.activePresetId) selectPresetForEdit(state.activePresetId);
 }
 
 async function activatePreset(presetId) {
+  if (state.rewardDraftPreset && presetId === state.rewardDraftPreset.id) {
+    state.activePresetId = presetId;
+    state.activePresetOverrides = state.rewardDraftPreset.values || {};
+    renderPresets();
+    selectPresetForEdit(presetId);
+    return;
+  }
   await api("/api/presets/activate", { method: "POST", body: JSON.stringify({ preset_id: presetId }) });
   state.activePresetId = presetId;
-  const active = state.presets.find((p) => p.id === presetId);
+  const active = rewardPresetById(presetId);
   state.activePresetOverrides = active ? (active.values || {}) : {};
   renderPresets();
   if (state.selectedPresetId === presetId) selectPresetForEdit(presetId);
@@ -1902,7 +2015,7 @@ async function activatePreset(presetId) {
 }
 
 async function duplicatePreset(sourcePresetId) {
-  const source = state.presets.find((p) => p.id === sourcePresetId);
+  const source = rewardPresetById(sourcePresetId);
   if (!source) return;
   const name = window.prompt(`Name for the new preset (copy of ${source.name}):`, `${source.name} (copy)`);
   if (!name) return;
@@ -1915,8 +2028,21 @@ async function duplicatePreset(sourcePresetId) {
 }
 
 async function deletePreset(presetId) {
-  const preset = state.presets.find((p) => p.id === presetId);
+  const preset = rewardPresetById(presetId);
   if (!preset || preset.built_in) return;
+  if (preset.draft) {
+    state.rewardDraftPreset = null;
+    state.selectedPresetId = state.activePresetId === presetId ? "baseline" : state.selectedPresetId;
+    if (state.activePresetId === presetId) {
+      state.activePresetId = "baseline";
+      const baseline = rewardPresetById("baseline");
+      state.activePresetOverrides = baseline ? (baseline.values || {}) : {};
+    }
+    renderPresets();
+    selectPresetForEdit(state.selectedPresetId || state.activePresetId || "baseline");
+    setStatus("Tweak draft discarded.");
+    return;
+  }
   if (!window.confirm(`Delete preset "${preset.name}"? This cannot be undone.`)) return;
   await api(`/api/presets/${encodeURIComponent(presetId)}/delete`, { method: "POST", body: JSON.stringify({}) });
   await loadRewardsPage();
@@ -1924,15 +2050,33 @@ async function deletePreset(presetId) {
 }
 
 async function savePresetChanges(presetId) {
-  const preset = state.presets.find((p) => p.id === presetId);
+  const preset = rewardPresetById(presetId);
   if (!preset || preset.built_in) return;
   // Collect values from inputs
-  const values = {};
-  document.querySelectorAll("#reward-categories .reward-row-input").forEach((input) => {
-    const key = input.dataset.key;
-    const val = parseFloat(input.value);
-    if (key && !Number.isNaN(val)) values[key] = val;
-  });
+  const values = currentRewardEditorValues();
+  if (preset.draft) {
+    const wasActive = state.activePresetId === preset.id;
+    const created = await api("/api/presets", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#reward-profile-name")?.value || preset.name,
+        description: $("#reward-profile-description")?.value || "",
+        values,
+      }),
+    });
+    state.rewardDraftPreset = null;
+    if (wasActive) {
+      await api("/api/presets/activate", { method: "POST", body: JSON.stringify({ preset_id: created.id }) });
+      state.activePresetId = created.id;
+      state.activePresetOverrides = created.values || values;
+    }
+    state.selectedPresetId = created.id;
+    await loadRewardsPage();
+    selectPresetForEdit(created.id);
+    await loadActivity();
+    setStatus("Tweak draft saved as a preset.");
+    return;
+  }
   await api(`/api/presets/${encodeURIComponent(presetId)}/update`, {
     method: "POST",
     body: JSON.stringify({
@@ -2262,20 +2406,46 @@ async function createNewTerrainPreset() {
 }
 
 // Run detail: reward config panel
+function updateRewardCompareToggle() {
+  document.querySelectorAll("#reward-compare-mode [data-compare-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.compareMode === state.rewardCompareMode);
+  });
+}
+
+async function setRewardCompareMode(mode) {
+  state.rewardCompareMode = mode === "previous" ? "previous" : "default";
+  updateRewardCompareToggle();
+  if (state.selectedRun && state.selectedRun.log_dir) {
+    await loadRewardConfigForRun(state.selectedRun.id);
+  }
+}
+
 async function loadRewardConfigForRun(runId) {
   const panel = $("#reward-config-panel");
   const content = $("#reward-config-content");
   if (!panel || !content) return;
+  updateRewardCompareToggle();
   try {
-    const data = await api(`/api/runs/${encodeURIComponent(runId)}/reward-config`);
+    const data = await api(`/api/runs/${encodeURIComponent(runId)}/reward-config?compare=${encodeURIComponent(state.rewardCompareMode)}`);
+    const baselineKind = data.baseline_kind || "default";
+    const baselineLabel = data.baseline_label || (baselineKind === "previous" ? "last run" : "default");
+    const baselineLine = baselineKind === "previous" && data.baseline_run_id
+      ? `<p class="muted-copy">Compared with: <strong>${escapeHtml(baselineLabel)}</strong> <code>${escapeHtml(data.baseline_run_id)}</code></p>`
+      : "";
+    if (data.baseline_missing) {
+      content.innerHTML = `<p class="muted-copy">No earlier run with saved reward config was found.</p>`;
+      panel.hidden = false;
+      return;
+    }
     if (!data.changed || data.changed.length === 0) {
-      content.innerHTML = `<p class="muted-copy">All reward values are at default for this run.</p>`;
+      content.innerHTML = `${baselineLine}<p class="muted-copy">All reward values match ${escapeHtml(baselineLabel)} for this run.</p>`;
       panel.hidden = false;
       return;
     }
     const presetLine = data.preset_id && data.preset_id !== "baseline"
       ? `<p class="muted-copy">Preset: <strong>${escapeHtml(data.preset_id)}</strong></p>`
       : "";
+    const baselineName = baselineKind === "previous" ? "last run" : "default";
     const rows = data.changed.map((item) => {
       const meta = REWARD_META[item.name] || { label: item.name };
       const delta = item.delta_pct !== null ? item.delta_pct : null;
@@ -2286,11 +2456,11 @@ async function loadRewardConfigForRun(runId) {
       return `<div class="reward-diff-row">
         <span class="diff-name">${escapeHtml(meta.label || item.name)}</span>
         <span class="diff-value">${item.yaml_value}</span>
-        <span class="diff-baseline">← default: ${item.default_value !== null ? item.default_value : "?"}</span>
+        <span class="diff-baseline">← ${escapeHtml(baselineName)}: ${item.default_value !== null ? item.default_value : "?"}</span>
         ${deltaHtml}
       </div>`;
     }).join("");
-    content.innerHTML = presetLine + rows;
+    content.innerHTML = presetLine + baselineLine + rows;
     panel.hidden = false;
   } catch {
     panel.hidden = true;
@@ -2652,45 +2822,356 @@ function activityCard(label, value, detail) {
   `;
 }
 
-function renderActivity() {
-  const analytics = state.activityAnalytics || {};
-  const cards = $("#activity-analytics");
-  if (cards) {
-    cards.innerHTML = [
-      activityCard("Events", analytics.total_events || 0, "local and remote"),
-      activityCard("Run Starts", analytics.run_starts || 0, analyticsList(analytics.most_used_profiles)),
-      activityCard("Deletes", analytics.deletes || 0, "single and bulk cleanup"),
-      activityCard("Members", (analytics.requests_by_member || []).length, analyticsList(analytics.requests_by_member)),
-    ].join("");
-  }
-  const events = $("#activity-events");
-  if (!events) return;
-  if (!state.activityEvents.length) {
-    events.innerHTML = `<article class="empty-panel">No activity recorded yet.</article>`;
-    return;
-  }
-  events.innerHTML = state.activityEvents.map((event) => {
-    const payload = event.payload || {};
-    const detail = [
-      event.subject_id || payload.run_id || payload.job_id || "",
-      event.status || payload.status || "",
-    ].filter(Boolean).join(" · ");
+function activityWindowLabel(value) {
+  return { today: "Today", "7d": "7 Days", "30d": "30 Days" }[value] || "7 Days";
+}
+
+function activityCategoryLabel(value) {
+  if (!value) return "All Categories";
+  const labels = {
+    training: "Training",
+    artifact: "Videos / ONNX",
+    preset: "Presets",
+    metadata: "Notes / Folders",
+    admin: "Admin",
+    system: "System",
+  };
+  return labels[value] || value;
+}
+
+function renderActivityControls(analytics) {
+  const controls = $("#activity-controls");
+  if (!controls) return;
+  const leaderboard = analytics.leaderboard || [];
+  controls.innerHTML = `
+    <div class="segmented-control activity-window-control" aria-label="Activity time window">
+      ${["today", "7d", "30d"].map((windowKey) => `
+        <button type="button" data-activity-window="${windowKey}" class="${state.activityFilters.window === windowKey ? "active" : ""}">${activityWindowLabel(windowKey)}</button>
+      `).join("")}
+    </div>
+    <label>Member
+      <select id="activity-member-filter">
+        <option value="">All members</option>
+        ${leaderboard.map((member) => `<option value="${escapeHtml(member.actor_id || member.name)}" ${state.activityFilters.member === (member.actor_id || member.name) ? "selected" : ""}>${escapeHtml(member.name || "Unknown")}</option>`).join("")}
+      </select>
+    </label>
+    <label>Category
+      <select id="activity-category-filter">
+        <option value="">All categories</option>
+        ${["training", "artifact", "preset", "metadata", "admin", "system"].map((category) => `<option value="${category}" ${state.activityFilters.category === category ? "selected" : ""}>${activityCategoryLabel(category)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function activityBars(items, total) {
+  if (!items || !items.length) return `<article class="empty-panel">No signal yet.</article>`;
+  return `<div class="activity-bars">${items.slice(0, 8).map(([label, value]) => {
+    const pct = total ? Math.max(4, Math.round((Number(value) / total) * 100)) : 0;
     return `
-      <article class="activity-event ${event.source === "remote" ? "remote" : "local"}">
-        <div>
-          <strong>${escapeHtml(event.summary || event.event_type)}</strong>
-          <small>${escapeHtml(event.actor_name || event.actor_role || "Local panel")} · ${escapeHtml(formatRelativeTime(event.created_at))}</small>
-          ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+      <div class="activity-bar-row">
+        <span>${escapeHtml(activityCategoryLabel(label) || label)}</span>
+        <strong>${escapeHtml(String(value))}</strong>
+        <div><i style="width: ${pct}%"></i></div>
+      </div>
+    `;
+  }).join("")}</div>`;
+}
+
+function activityActorKey(event) {
+  return String(event.actor_id || event.actor_name || event.actor_role || "Local panel");
+}
+
+function activityActorName(event) {
+  return String(event.actor_name || event.actor_email || event.actor_role || "Local panel");
+}
+
+function activityEventDetail(event) {
+  const payload = event.payload || {};
+  return [
+    event.subject_id || payload.run_id || payload.job_id || "",
+    event.status || payload.status || event.outcome || "",
+  ].filter(Boolean).join(" · ");
+}
+
+function groupActivityByActor(events) {
+  const groups = new Map();
+  for (const event of events) {
+    const key = activityActorKey(event);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        name: activityActorName(event),
+        role: event.actor_role || "",
+        points: 0,
+        events: [],
+        lastAt: event.created_at || "",
+      });
+    }
+    const group = groups.get(key);
+    group.events.push(event);
+    group.points += Number(event.points || 0);
+    if (String(event.created_at || "") > String(group.lastAt || "")) group.lastAt = event.created_at;
+  }
+  return Array.from(groups.values()).sort((a, b) => String(b.lastAt || "").localeCompare(String(a.lastAt || "")));
+}
+
+function renderActivityEvent(event) {
+  const detail = activityEventDetail(event);
+  const outcomeClass = event.outcome === "completed"
+    ? "status-completed"
+    : event.outcome === "failed" || event.outcome === "interrupted"
+      ? "status-failed"
+      : event.source === "remote"
+        ? "status-running"
+        : "muted-pill";
+  return `
+    <article class="activity-event ${event.source === "remote" ? "remote" : "local"}">
+      <div>
+        <strong>${escapeHtml(event.summary || event.event_type)}</strong>
+        <small>${escapeHtml(activityActorName(event))} · ${escapeHtml(formatRelativeTime(event.created_at))}</small>
+        ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+      </div>
+      <span class="status-badge ${outcomeClass}">${escapeHtml(activityCategoryLabel(event.category) || event.category || event.source || "local")}</span>
+    </article>
+  `;
+}
+
+function renderActivityGroups(events) {
+  if (!events.length) return `<article class="empty-panel">No activity recorded yet.</article>`;
+  const groups = groupActivityByActor(events);
+  return groups.map((group) => {
+    const collapsed = state.activityCollapsedGroups.has(group.key);
+    const completed = group.events.filter((event) => event.outcome === "completed").length;
+    const failed = group.events.filter((event) => event.outcome === "failed" || event.outcome === "interrupted").length;
+    return `
+      <section class="activity-user-group ${collapsed ? "collapsed" : ""}">
+        <button type="button" class="activity-user-summary" data-activity-group="${escapeHtml(group.key)}" aria-expanded="${collapsed ? "false" : "true"}">
+          <span class="folder-chevron">${collapsed ? "+" : "-"}</span>
+          <span>
+            <strong>${escapeHtml(group.name || "Unknown member")}</strong>
+            <small>${escapeHtml(group.role || "member")} · ${escapeHtml(String(group.events.length))} logs · ${escapeHtml(String(group.points))} pts</small>
+          </span>
+          <span class="activity-folder-stats">${escapeHtml(String(completed))} done · ${escapeHtml(String(failed))} failed</span>
+        </button>
+        <div class="activity-user-events">
+          ${group.events.map(renderActivityEvent).join("")}
         </div>
-        <span class="status-badge ${event.source === "remote" ? "status-running" : "muted-pill"}">${escapeHtml(event.source || "local")}</span>
-      </article>
+      </section>
     `;
   }).join("");
 }
 
+function activityCategoryColor(label, index = 0) {
+  const palette = {
+    training: "#2563eb",
+    artifact: "#059669",
+    preset: "#7c3aed",
+    metadata: "#d97706",
+    admin: "#991b1b",
+    system: "#64748b",
+    completed: "#059669",
+    failed: "#dc2626",
+    interrupted: "#d97706",
+    running: "#2563eb",
+    queued: "#64748b",
+    claimed: "#7c3aed",
+    info: "#64748b",
+  };
+  return palette[label] || ["#2563eb", "#059669", "#7c3aed", "#d97706", "#dc2626", "#64748b"][index % 6];
+}
+
+function activityDonut(items, title) {
+  const total = items.reduce((sum, item) => sum + Number(item[1] || 0), 0);
+  if (!total) return `<article class="activity-chart-card"><h3>${escapeHtml(title)}</h3><p class="muted-copy">No data yet.</p></article>`;
+  let cursor = 0;
+  const stops = items.map(([label, value], index) => {
+    const start = cursor;
+    cursor += (Number(value) / total) * 100;
+    return `${activityCategoryColor(label, index)} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+  }).join(", ");
+  return `
+    <article class="activity-chart-card">
+      <div class="activity-panel-head"><h3>${escapeHtml(title)}</h3></div>
+      <div class="activity-donut-wrap">
+        <div class="activity-donut" style="background: conic-gradient(${stops})">
+          <strong>${escapeHtml(String(total))}</strong>
+          <small>events</small>
+        </div>
+        <div class="activity-legend">
+          ${items.slice(0, 6).map(([label, value], index) => `
+            <span><i style="background:${activityCategoryColor(label, index)}"></i>${escapeHtml(activityCategoryLabel(label) || label)} <strong>${escapeHtml(String(value))}</strong></span>
+          `).join("")}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function activityTrendBuckets(events) {
+  const days = state.activityFilters.window === "today" ? 12 : state.activityFilters.window === "30d" ? 15 : 7;
+  const now = new Date();
+  const buckets = Array.from({ length: days }, (_, index) => {
+    const date = new Date(now);
+    if (state.activityFilters.window === "today") {
+      date.setHours(now.getHours() - (days - 1 - index), 0, 0, 0);
+      return { key: date.toISOString().slice(0, 13), label: `${date.getHours()}:00`, value: 0 };
+    }
+    date.setDate(now.getDate() - (days - 1 - index));
+    date.setHours(0, 0, 0, 0);
+    return { key: date.toISOString().slice(0, 10), label: `${date.getMonth() + 1}/${date.getDate()}`, value: 0 };
+  });
+  const byKey = new Map(buckets.map((bucket) => [bucket.key, bucket]));
+  for (const event of events) {
+    const date = new Date(event.created_at || "");
+    if (Number.isNaN(date.getTime())) continue;
+    const key = state.activityFilters.window === "today" ? date.toISOString().slice(0, 13) : date.toISOString().slice(0, 10);
+    const bucket = byKey.get(key);
+    if (bucket) bucket.value += 1;
+  }
+  return buckets;
+}
+
+function activityTrendChart(events) {
+  const buckets = activityTrendBuckets(events);
+  const maxValue = Math.max(1, ...buckets.map((bucket) => bucket.value));
+  return `
+    <article class="activity-chart-card">
+      <div class="activity-panel-head">
+        <h3>Activity Rhythm</h3>
+      </div>
+      <div class="activity-spark-bars">
+        ${buckets.map((bucket) => `
+          <span title="${escapeHtml(bucket.label)} · ${escapeHtml(String(bucket.value))} events">
+            <i style="height:${Math.max(6, Math.round((bucket.value / maxValue) * 100))}%"></i>
+            <small>${escapeHtml(bucket.label)}</small>
+          </span>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function activityContributionStack(leaderboard) {
+  const total = leaderboard.reduce((sum, member) => sum + Number(member.points || 0), 0);
+  if (!total) return `<article class="activity-chart-card"><h3>Contribution Share</h3><p class="muted-copy">No score yet.</p></article>`;
+  return `
+    <article class="activity-chart-card">
+      <div class="activity-panel-head"><h3>Contribution Share</h3></div>
+      <div class="activity-stack">
+        ${leaderboard.slice(0, 6).map((member, index) => {
+          const width = Math.max(5, Math.round((Number(member.points || 0) / total) * 100));
+          return `<i style="width:${width}%;background:${activityCategoryColor(member.name, index)}" title="${escapeHtml(member.name || "Member")} · ${escapeHtml(String(member.points || 0))} pts"></i>`;
+        }).join("")}
+      </div>
+      <div class="activity-legend compact">
+        ${leaderboard.slice(0, 6).map((member, index) => `
+          <span><i style="background:${activityCategoryColor(member.name, index)}"></i>${escapeHtml(member.name || "Member")} <strong>${escapeHtml(String(member.points || 0))}</strong></span>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderActivityCharts(analytics) {
+  const leaderboard = analytics.leaderboard || [];
+  return `
+    <section class="activity-charts">
+      ${activityContributionStack(leaderboard)}
+      ${activityDonut(analytics.action_mix || [], "Action Orbit")}
+      ${activityTrendChart(state.activityEvents || [])}
+    </section>
+  `;
+}
+
+function renderActivityMission(analytics) {
+  const mission = $("#activity-mission");
+  if (!mission) return;
+  const leaderboard = analytics.leaderboard || [];
+  const recentFailures = analytics.recent_failures || [];
+  mission.innerHTML = `
+    <section class="activity-panel activity-leaderboard">
+      <div class="activity-panel-head">
+        <div>
+          <h3>Member Leaderboard</h3>
+          <p class="muted-copy">Contribution mix over ${activityWindowLabel(state.activityFilters.window).toLowerCase()}.</p>
+        </div>
+      </div>
+      ${leaderboard.length ? leaderboard.map((member, index) => `
+        <article class="member-row">
+          <span class="rank-chip">#${index + 1}</span>
+          <div>
+            <strong>${escapeHtml(member.name || "Unknown member")}</strong>
+            <small>${escapeHtml(member.role || "member")} · ${escapeHtml(String(member.events || 0))} events</small>
+          </div>
+          <strong>${escapeHtml(String(member.points || 0))}</strong>
+          <small>${escapeHtml(String(member.runs || 0))} runs · ${escapeHtml(String(member.completions || 0))} done · ${escapeHtml(String(member.failures || 0))} failed · ${escapeHtml(String(member.videos || 0))} videos</small>
+        </article>
+      `).join("") : `<article class="empty-panel">No member activity in this window.</article>`}
+    </section>
+    <section class="activity-panel">
+      <div class="activity-panel-head">
+        <h3>Experiment Mix</h3>
+      </div>
+      ${activityBars(analytics.action_mix || [], analytics.total_events || 0)}
+    </section>
+    <section class="activity-panel">
+      <div class="activity-panel-head">
+        <h3>Outcomes</h3>
+      </div>
+      ${activityBars(analytics.outcome_mix || [], analytics.total_events || 0)}
+    </section>
+    <section class="activity-panel">
+      <div class="activity-panel-head">
+        <h3>Team Pulse</h3>
+      </div>
+      ${recentFailures.length ? recentFailures.map((event) => `
+        <article class="pulse-row">
+          <strong>${escapeHtml(event.summary || event.event_type)}</strong>
+          <small>${escapeHtml(event.actor_name || "Unknown")} · ${escapeHtml(formatRelativeTime(event.created_at))}</small>
+        </article>
+      `).join("") : `<article class="empty-panel">No recent failures or interruptions.</article>`}
+    </section>
+    ${renderActivityCharts(analytics)}
+  `;
+}
+
+function renderActivity() {
+  const analytics = state.activityAnalytics || {};
+  renderActivityControls(analytics);
+  const cards = $("#activity-analytics");
+  if (cards) {
+    const kpis = analytics.kpis || {};
+    cards.innerHTML = [
+      activityCard("Contribution", kpis.total_points || 0, "team points"),
+      activityCard("Training Runs", kpis.training_runs || 0, `${kpis.success_rate || 0}% success`),
+      activityCard("Videos / ONNX", kpis.artifacts_completed || 0, "completed artifacts"),
+      activityCard("Active Members", kpis.active_members || 0, analyticsList(analytics.requests_by_member)),
+    ].join("");
+  }
+  renderActivityMission(analytics);
+  const events = $("#activity-events");
+  if (!events) return;
+  events.innerHTML = `
+    <div class="activity-log-head">
+      <div>
+        <h3>Detailed Run Logs</h3>
+        <p class="muted-copy">Grouped by user/account. Open a member folder to inspect the run-level timeline.</p>
+      </div>
+    </div>
+    ${renderActivityGroups(state.activityEvents)}
+  `;
+}
+
 async function loadActivity() {
   try {
-    const data = await api("/api/activity?limit=80");
+    const params = new URLSearchParams({
+      limit: "160",
+      window: state.activityFilters.window,
+    });
+    if (state.activityFilters.member) params.set("member", state.activityFilters.member);
+    if (state.activityFilters.category) params.set("category", state.activityFilters.category);
+    const data = await api(`/api/activity?${params.toString()}`);
     state.activityEvents = data.events || [];
     state.activityAnalytics = data.analytics || {};
   } catch {
@@ -2863,6 +3344,9 @@ $("#run-name").addEventListener("input", () => {
 $("#save-notes").addEventListener("click", () => saveNotes().catch(handleActionError));
 $("#delete-run").addEventListener("click", () => deleteSelectedRun().catch(handleActionError));
 $("#compact-run").addEventListener("click", () => compactSelectedRun().catch(handleActionError));
+document.querySelectorAll("#reward-compare-mode [data-compare-mode]").forEach((button) => {
+  button.addEventListener("click", () => setRewardCompareMode(button.dataset.compareMode).catch(handleActionError));
+});
 $("#open-run-folder").addEventListener("click", () => openRunFolder().catch(handleActionError));
 $("#export-onnx").addEventListener("click", () => exportOnnx().catch(handleActionError));
 $("#copy-onnx-path").addEventListener("click", () => copyOnnxPath().catch(handleActionError));
@@ -2878,6 +3362,8 @@ $("#terminal-view").addEventListener("click", () => openTerminalView());
 $("#open-process-log-folder").addEventListener("click", () => openProcessLogFolder().catch(handleActionError));
 $("#stop-process").addEventListener("click", () => stopSelectedProcess().catch(handleActionError));
 $("#resume-run").addEventListener("click", () => state.selectedRun && handleRunAction("resume", state.selectedRun.id));
+$("#tweak-run").addEventListener("click", () => state.selectedRun && handleRunAction("tweak", state.selectedRun.id));
+$("#tweak-last-run").addEventListener("click", tweakFromLastRun);
 $("#play-run").addEventListener("click", () => {
   if (!state.selectedRun) return;
   const playProcessId = activeProcessIdForRun(state.selectedRun.id, "play");
@@ -2946,10 +3432,35 @@ const trainChangeTerrainPreset = $("#train-change-terrain-preset");
 if (trainChangeTerrainPreset) trainChangeTerrainPreset.addEventListener("click", () => setView("terrain"));
 const activityRefresh = $("#activity-refresh");
 if (activityRefresh) activityRefresh.addEventListener("click", () => loadActivity().catch(handleActionError));
-const remoteEnable = $("#remote-enable");
-if (remoteEnable) remoteEnable.addEventListener("click", () => saveRemoteAcceptance(true).catch(handleActionError));
-const remoteDisable = $("#remote-disable");
-if (remoteDisable) remoteDisable.addEventListener("click", () => saveRemoteAcceptance(false).catch(handleActionError));
+document.addEventListener("click", (event) => {
+  const groupButton = event.target.closest("[data-activity-group]");
+  if (groupButton) {
+    const key = groupButton.dataset.activityGroup || "";
+    if (state.activityCollapsedGroups.has(key)) {
+      state.activityCollapsedGroups.delete(key);
+    } else {
+      state.activityCollapsedGroups.add(key);
+    }
+    renderActivity();
+    return;
+  }
+  const button = event.target.closest("[data-activity-window]");
+  if (!button) return;
+  state.activityFilters.window = button.dataset.activityWindow || "7d";
+  loadActivity().catch(handleActionError);
+});
+document.addEventListener("change", (event) => {
+  if (event.target.id === "activity-member-filter") {
+    state.activityFilters.member = event.target.value;
+    loadActivity().catch(handleActionError);
+  }
+  if (event.target.id === "activity-category-filter") {
+    state.activityFilters.category = event.target.value;
+    loadActivity().catch(handleActionError);
+  }
+});
+const remoteAcceptToggle = $("#remote-accept-toggle");
+if (remoteAcceptToggle) remoteAcceptToggle.addEventListener("change", () => saveRemoteAcceptance(remoteAcceptToggle.checked).catch(handleActionError));
 const remoteWorkerStart = $("#remote-worker-start");
 if (remoteWorkerStart) remoteWorkerStart.addEventListener("click", () => startRemoteWorker().catch(handleActionError));
 const remoteWorkerStop = $("#remote-worker-stop");

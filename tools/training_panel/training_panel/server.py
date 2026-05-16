@@ -22,6 +22,7 @@ from .remote_config import RemoteStateStore
 from .remote_manager import RemoteWorkerManager
 from .rewards import reward_defaults, reward_file_index
 from .terrain import TerrainPresetStore, terrain_defaults, terrain_file_index
+from .tweaks import build_tweak_payload, newest_finished_tweak_run
 
 
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
@@ -86,7 +87,22 @@ class PanelHandler(BaseHTTPRequestHandler):
                 limit = 80
             limit = max(1, min(limit, 200))
             include_remote = query.get("remote", ["1"])[0] not in {"0", "false", "False"}
-            return self._json(self.state.activity.snapshot(limit=limit, include_remote=include_remote))
+            window = query.get("window", ["7d"])[0]
+            if window not in {"today", "7d", "30d"}:
+                window = "7d"
+            member = query.get("member", [""])[0]
+            category = query.get("category", [""])[0]
+            if category not in {"", "training", "artifact", "preset", "metadata", "admin", "system"}:
+                category = ""
+            return self._json(
+                self.state.activity.snapshot(
+                    limit=limit,
+                    include_remote=include_remote,
+                    window=window,
+                    member=member,
+                    category=category,
+                )
+            )
         if parsed.path == "/api/remote/status":
             processes = self.state.processes.list_processes()
             active_isaac = self.state.processes.running_isaac_processes()
@@ -105,6 +121,37 @@ class PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/runs":
             self.state.processes.reconcile_stale_history()
             return self._json({"runs": self.state.history.list_runs()})
+        if parsed.path == "/api/tweaks/last-run":
+            self.state.processes.reconcile_stale_history()
+            reward_presets = self.state.presets.list_presets()
+            run = newest_finished_tweak_run(self.state.history.list_runs(), reward_presets)
+            if not run:
+                return self._json({"error": "No finished run with usable tweak data found"}, status=404)
+            try:
+                return self._json(
+                    build_tweak_payload(
+                        run,
+                        reward_presets=reward_presets,
+                        terrain_presets=self.state.terrain_presets.list_presets(),
+                    )
+                )
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/tweak"):
+            run_id = route_id(parsed.path)
+            run = self.state.history.get_run(run_id)
+            if not run:
+                return self._json({"error": "Run not found"}, status=404)
+            try:
+                return self._json(
+                    build_tweak_payload(
+                        run,
+                        reward_presets=self.state.presets.list_presets(),
+                        terrain_presets=self.state.terrain_presets.list_presets(),
+                    )
+                )
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/notes"):
             run_id = route_id(parsed.path)
             return self._json({"run_id": run_id, "notes": self.state.history.get_note(run_id)})
@@ -116,7 +163,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._json(debug)
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/reward-config"):
             run_id = route_id(parsed.path)
-            config = self.state.history.get_reward_config_for_run(run_id)
+            query = parse_qs(parsed.query)
+            compare_to = query.get("compare", ["default"])[0]
+            config = self.state.history.get_reward_config_for_run(run_id, compare_to=compare_to)
             if config is None:
                 return self._json({"error": "No reward config found for run"}, status=404)
             return self._json(config)

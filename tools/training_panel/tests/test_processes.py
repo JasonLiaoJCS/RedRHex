@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tools.training_panel.training_panel.commands import VideoParams
+from tools.training_panel.training_panel.commands import TrainingParams, VideoParams
 from tools.training_panel.training_panel.config import PanelPaths
 from tools.training_panel.training_panel.history import HistoryStore
-from tools.training_panel.training_panel.processes import EXTERNAL_TRAINING_ID_PREFIX, ProcessRegistry
+from tools.training_panel.training_panel.processes import EXTERNAL_TRAINING_ID_PREFIX, ProcessRegistry, SpawnedProcess
 
 
 class ProcessRegistryTests(unittest.TestCase):
@@ -32,6 +32,36 @@ class ProcessRegistryTests(unittest.TestCase):
             conda_sh=conda_sh,
             conda_env="env",
         )
+
+    def test_training_record_preserves_tweak_metadata(self):
+        class FakeProcess:
+            pid = 12345
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict(
+                {
+                    "task": "Template-Redrhex-Direct-v0",
+                    "num_envs": 4,
+                    "max_iterations": 8,
+                    "device": "cpu",
+                    "reward_preset_id": "tweak-run-one",
+                    "reward_overrides": {"rew_scale_alive": 0.2},
+                    "tweak_source_run_id": "run_one",
+                    "tweak_source_label": "Run One",
+                }
+            )
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                run = registry.start_training(params)
+
+            record = history.get_run(run["id"])
+            self.assertEqual(record["params"]["tweak_source_run_id"], "run_one")
+            self.assertEqual(record["params"]["tweak_source_label"], "Run One")
+            self.assertEqual(record["reward_preset_id"], "tweak-run-one")
 
     def test_play_process_debug_streams_log_tail(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -41,8 +41,10 @@ class FakeClient:
         self.select_rows = []
         self.deletes = []
         self.uploads = []
+        self.inserts = []
         self.claim_gpu_locked = []
         self.raise_on_artifacts_upsert = False
+        self.raise_on_activity_insert = False
 
     def heartbeat(self, payload):
         self.heartbeats.append(payload)
@@ -63,6 +65,11 @@ class FakeClient:
         if table == "artifacts" and self.raise_on_artifacts_upsert:
             raise RuntimeError("artifact sync failed")
         self.upserts.append((table, payload, kwargs))
+
+    def insert(self, table, payload, **kwargs):
+        if table == "team_activity_events" and self.raise_on_activity_insert:
+            raise RuntimeError("activity schema missing")
+        self.inserts.append((table, payload, kwargs))
 
     def select(self, table, query=None):
         return self.select_rows
@@ -187,6 +194,32 @@ class RemoteTests(unittest.TestCase):
             paths = self.make_paths(root)
             config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
             client = FakeClient(job={"id": "job_one", "type": "export_onnx", "actor_role": "operator", "payload": {}})
+            worker = RemoteWorker(config, paths, client, executor=FakeExecutor())
+            result = worker.poll_once()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(client.completed[0][0], "job_one")
+
+    def test_worker_records_team_activity_without_blocking_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
+            client = FakeClient(job={"id": "job_one", "type": "start_training", "actor_role": "operator", "payload": {}})
+            worker = RemoteWorker(config, paths, client, executor=FakeExecutor())
+            result = worker.poll_once()
+            self.assertEqual(result["status"], "completed")
+            activity_rows = [item for item in client.inserts if item[0] == "team_activity_events"]
+            self.assertTrue(activity_rows)
+            completed = [item[1] for item in activity_rows if item[1]["outcome"] == "completed"]
+            self.assertEqual(completed[0]["points"], 10)
+
+    def test_worker_activity_insert_failure_does_not_block_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
+            client = FakeClient(job={"id": "job_one", "type": "export_onnx", "actor_role": "operator", "payload": {}})
+            client.raise_on_activity_insert = True
             worker = RemoteWorker(config, paths, client, executor=FakeExecutor())
             result = worker.poll_once()
             self.assertEqual(result["status"], "completed")

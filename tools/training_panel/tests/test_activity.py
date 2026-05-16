@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.training_panel.training_panel.activity import ActivityStore
+from tools.training_panel.training_panel.activity import ActivityStore, score_activity_event
 from tools.training_panel.training_panel.config import PanelPaths
 
 
@@ -32,6 +32,76 @@ def test_activity_store_records_events_and_analytics(tmp_path):
     assert snapshot["analytics"]["run_starts"] == 1
     assert snapshot["analytics"]["deletes"] == 1
     assert ["speed-focus", 1] in [list(item) for item in snapshot["analytics"]["most_used_profiles"]]
+
+
+def test_activity_scoring_rules():
+    assert score_activity_event("start_training", outcome="completed", category="training", job_type="start_training") == 10
+    assert score_activity_event("start_training", outcome="failed", category="training", job_type="start_training") == 2
+    assert score_activity_event("record_video", outcome="completed", category="artifact", job_type="record_video") == 4
+    assert score_activity_event("reward_preset_save", outcome="info", category="preset") == 3
+    assert score_activity_event("run_metadata_save", outcome="info", category="metadata") == 1
+    assert score_activity_event("delete_run", outcome="completed", category="admin", job_type="delete_run") == 0
+
+
+def test_activity_snapshot_filters_window(tmp_path):
+    paths = make_paths(tmp_path)
+    paths.ensure_dirs()
+    paths.activity_file.write_text(
+        "\n".join(
+            [
+                '{"id":"old","created_at":"2026-01-01T00:00:00+00:00","event_type":"training_start","actor_name":"Old"}',
+                '{"id":"new","created_at":"2999-01-01T00:00:00+00:00","event_type":"training_start","actor_name":"New"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    store = ActivityStore(paths)
+    snapshot = store.snapshot(include_remote=False, window="7d")
+    assert [event["id"] for event in snapshot["events"]] == ["new"]
+
+
+def test_activity_analytics_counts_unique_training_runs_and_video_artifacts(tmp_path):
+    store = ActivityStore(make_paths(tmp_path))
+    events = [
+        {
+            "id": "queued",
+            "created_at": "2999-01-01T00:00:00+00:00",
+            "event_type": "remote_job_queued",
+            "category": "training",
+            "outcome": "queued",
+            "actor_name": "Jason",
+            "subject_id": "run_one",
+            "metadata": {"job_type": "start_training"},
+        },
+        {
+            "id": "done",
+            "created_at": "2999-01-01T00:01:00+00:00",
+            "event_type": "remote_job_completed",
+            "category": "training",
+            "outcome": "completed",
+            "actor_name": "Jason",
+            "subject_id": "run_one",
+            "metadata": {"job_type": "start_training"},
+            "points": 10,
+        },
+        {
+            "id": "video",
+            "created_at": "2999-01-01T00:02:00+00:00",
+            "event_type": "remote_job_completed",
+            "category": "artifact",
+            "outcome": "completed",
+            "actor_name": "Jason",
+            "subject_id": "run_one",
+            "metadata": {"job_type": "record_video"},
+            "points": 4,
+        },
+    ]
+
+    analytics = store.analytics(events)
+
+    assert analytics["kpis"]["training_runs"] == 1
+    assert analytics["leaderboard"][0]["runs"] == 1
+    assert analytics["leaderboard"][0]["videos"] == 1
 
 
 def test_activity_remote_events_are_enriched_with_profiles(tmp_path, monkeypatch):

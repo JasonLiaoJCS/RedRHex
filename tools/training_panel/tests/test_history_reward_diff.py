@@ -183,3 +183,97 @@ def test_get_reward_config_returns_diff_for_existing_yaml(tmp_path):
     changed_names = [c["name"] for c in result["changed"]]
     assert "rew_scale_forward_vel" in changed_names
     assert "rew_scale_alive" not in changed_names
+
+
+def test_get_reward_config_can_compare_with_previous_run(tmp_path):
+    from tools.training_panel.training_panel.history import HistoryStore
+    from tools.training_panel.training_panel.config import PanelPaths
+    from pathlib import Path
+
+    cfg_dir = tmp_path / "source" / "RedRhex" / "RedRhex" / "tasks" / "direct" / "redrhex"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "redrhex_env_cfg.py").write_text(
+        "rew_scale_forward_vel = 3.0\n"
+        "rew_scale_alive = 0.15\n"
+    )
+
+    previous_log = tmp_path / "logs" / "rsl_rl" / "redrhex_wheg" / "previous-run"
+    current_log = tmp_path / "logs" / "rsl_rl" / "redrhex_wheg" / "current-run"
+    for log_dir in (previous_log, current_log):
+        (log_dir / "params").mkdir(parents=True)
+    (previous_log / "params" / "env.yaml").write_text(
+        "rew_scale_forward_vel: 4.0\n"
+        "rew_scale_alive: 0.2\n"
+    )
+    (current_log / "params" / "env.yaml").write_text(
+        "rew_scale_forward_vel: 6.0\n"
+        "rew_scale_alive: 0.2\n"
+    )
+
+    paths = PanelPaths(
+        repo_root=tmp_path,
+        isaaclab_root=Path("/nonexistent"),
+        isaacsim_root=Path("/nonexistent"),
+        conda_sh=Path("/nonexistent"),
+        conda_env="none",
+    )
+    store = HistoryStore(paths)
+    store.add_run({
+        "id": "previous-run",
+        "source": "rsl_rl",
+        "status": "completed",
+        "log_dir": str(previous_log),
+        "created_at": "2026-05-15T12:00:00",
+        "updated_at": "2026-05-15T12:00:00",
+    })
+    store.add_run({
+        "id": "current-run",
+        "source": "rsl_rl",
+        "status": "completed",
+        "log_dir": str(current_log),
+        "created_at": "2026-05-15T13:00:00",
+        "updated_at": "2026-05-15T13:00:00",
+    })
+
+    result = store.get_reward_config_for_run("current-run", compare_to="previous")
+
+    assert result["baseline_kind"] == "previous"
+    assert result["baseline_run_id"] == "previous-run"
+    assert [item["name"] for item in result["changed"]] == ["rew_scale_forward_vel"]
+    assert result["changed"][0]["default_value"] == 4.0
+    assert result["changed"][0]["delta_pct"] == 50.0
+
+
+def test_get_reward_config_previous_reports_missing_baseline(tmp_path):
+    from tools.training_panel.training_panel.history import HistoryStore
+    from tools.training_panel.training_panel.config import PanelPaths
+    from pathlib import Path
+
+    cfg_dir = tmp_path / "source" / "RedRhex" / "RedRhex" / "tasks" / "direct" / "redrhex"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "redrhex_env_cfg.py").write_text("rew_scale_forward_vel = 3.0\n")
+    log_dir = tmp_path / "logs" / "rsl_rl" / "redrhex_wheg" / "only-run" / "params"
+    log_dir.mkdir(parents=True)
+    (log_dir / "env.yaml").write_text("rew_scale_forward_vel: 4.0\n")
+
+    paths = PanelPaths(
+        repo_root=tmp_path,
+        isaaclab_root=Path("/nonexistent"),
+        isaacsim_root=Path("/nonexistent"),
+        conda_sh=Path("/nonexistent"),
+        conda_env="none",
+    )
+    store = HistoryStore(paths)
+    store.add_run({
+        "id": "only-run",
+        "source": "rsl_rl",
+        "status": "completed",
+        "log_dir": str(log_dir.parent),
+        "created_at": "2026-05-15T12:00:00",
+    })
+
+    result = store.get_reward_config_for_run("only-run", compare_to="previous")
+
+    assert result["baseline_kind"] == "previous"
+    assert result["baseline_missing"] is True
+    assert result["changed"] == []

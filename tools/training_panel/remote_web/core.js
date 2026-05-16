@@ -545,6 +545,104 @@ export function buildTrainingJob({ machineId, params, preset, terrainPreset, rol
   };
 }
 
+function objectValues(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function runParams(run = {}) {
+  return objectValues(run.params);
+}
+
+function presetValuesById(presets = [], presetId = "") {
+  const preset = presets.find((item) => String(item?.id || "") === String(presetId || ""));
+  return objectValues(preset?.values);
+}
+
+export function isFinishedTweakRun(run = {}) {
+  const status = String(run.status || "").toLowerCase();
+  return status !== "running" && status !== "stopping";
+}
+
+export function rewardValuesForTweak(run = {}, presets = []) {
+  const params = runParams(run);
+  const overrides = objectValues(params.reward_overrides);
+  if (Object.keys(overrides).length) return { ...overrides };
+  const runOverrides = objectValues(run.reward_overrides);
+  if (Object.keys(runOverrides).length) return { ...runOverrides };
+  return { ...presetValuesById(presets, params.reward_preset_id || run.reward_preset_id) };
+}
+
+export function terrainValuesForTweak(run = {}, terrainPresets = []) {
+  const params = runParams(run);
+  const overrides = objectValues(params.terrain_overrides);
+  if (Object.keys(overrides).length) return { ...overrides };
+  const runOverrides = objectValues(run.terrain_overrides);
+  if (Object.keys(runOverrides).length) return { ...runOverrides };
+  return { ...presetValuesById(terrainPresets, params.terrain_preset_id || run.terrain_preset_id) };
+}
+
+export function canBuildTweakFromRun(run = {}, presets = []) {
+  if (!isFinishedTweakRun(run)) return false;
+  const params = runParams(run);
+  return Object.keys(params).length > 0 || Object.keys(rewardValuesForTweak(run, presets)).length > 0;
+}
+
+export function latestFinishedTweakRun(runs = [], presets = []) {
+  return [...runs]
+    .sort((a, b) => String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || "")))
+    .find((run) => canBuildTweakFromRun(run, presets)) || null;
+}
+
+export function buildTweakDraftFromRun(run = {}, { presets = [], terrainPresets = [] } = {}) {
+  if (!canBuildTweakFromRun(run, presets)) throw new Error("Run does not have usable tweak data.");
+  const params = runParams(run);
+  const sourceId = String(run.id || "");
+  const sourceLabel = String(run.display_name || run.id || "run");
+  const rewardValues = rewardValuesForTweak(run, presets);
+  const terrainPresetId = String(params.terrain_preset_id || run.terrain_preset_id || "baseline");
+  const terrainValues = terrainValuesForTweak(run, terrainPresets);
+  const draftId = `tweak-${slugify(sourceId || sourceLabel)}`;
+  return {
+    source_run: {
+      id: sourceId,
+      display_name: run.display_name || "",
+      status: run.status || "",
+      created_at: run.created_at || "",
+      updated_at: run.updated_at || "",
+      log_dir: run.log_dir || "",
+    },
+    training_params: {
+      task: params.task || "Template-Redrhex-Direct-v0",
+      num_envs: Number(params.num_envs || 4),
+      max_iterations: Number(params.max_iterations || 8),
+      device: params.device || "cuda:0",
+      headless: params.headless !== false,
+      seed: params.seed ?? null,
+      resume: false,
+      checkpoint: "",
+      reward_preset_id: draftId,
+      reward_overrides: rewardValues,
+      terrain_preset_id: terrainPresetId,
+      terrain_overrides: terrainValues,
+      tweak_source_run_id: sourceId,
+      tweak_source_label: sourceLabel,
+    },
+    reward_preset: {
+      id: draftId,
+      name: `Tweak from ${sourceLabel}`,
+      description: `Unsaved reward draft copied from ${sourceLabel}.`,
+      values: rewardValues,
+      built_in: false,
+      draft: true,
+      source_run_id: sourceId,
+      source_label: sourceLabel,
+    },
+    terrain_preset_id: terrainPresetId,
+    terrain_overrides: terrainValues,
+    message: `Loaded tweak draft from ${sourceLabel}.`,
+  };
+}
+
 export function buildActionJob({ machineId, type, runId, role, userId, payload = {} }) {
   return {
     machine_id: machineId || null,
