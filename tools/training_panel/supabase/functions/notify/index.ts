@@ -161,14 +161,50 @@ function discordPayload(event: NotifyRequest) {
   };
 }
 
+function normalizedDiscordWebhook(webhook: string): { url: string; error: string } {
+  const trimmed = String(webhook || "").trim();
+  if (!trimmed) return { url: "", error: "No Discord webhook configured" };
+  const withProtocol = /^discord(?:app)?\.com\/api\/webhooks\//i.test(trimmed)
+    ? `https://${trimmed}`
+    : trimmed;
+  if (/^https:\/\/discord(?:app)?\.com\/channels\//i.test(withProtocol)) {
+    return { url: "", error: "That is a Discord channel link. Paste a webhook URL from Server Settings > Integrations > Webhooks." };
+  }
+  if (!/^https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[\w-]+/i.test(withProtocol)) {
+    return { url: "", error: "Discord webhook must start with https://discord.com/api/webhooks/..." };
+  }
+  return { url: withProtocol, error: "" };
+}
+
 async function sendDiscord(webhook: string, event: NotifyRequest) {
-  if (!webhook) return { ok: false, skipped: true, reason: "No Discord webhook configured" };
-  const response = await fetch(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(discordPayload(event)),
-  });
-  return { ok: response.ok, status: response.status };
+  const normalized = normalizedDiscordWebhook(webhook);
+  if (normalized.error) return { ok: false, error: normalized.error };
+  try {
+    const response = await fetch(`${normalized.url}?wait=true`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "RedRHex-Training-Panel/3.0",
+      },
+      body: JSON.stringify(discordPayload(event)),
+    });
+    const text = await response.text();
+    let body: unknown = null;
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text.slice(0, 500);
+      }
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      ...(response.ok ? {} : { error: `Discord returned ${response.status}`, body }),
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 async function existingEvent(eventKey: string): Promise<RunEventRow | null> {

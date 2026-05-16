@@ -42,7 +42,7 @@ import {
   videoArtifactForCheckpoint,
   videoStateForCheckpoint,
   videoStateForRun,
-} from "./core.js?v=3.0.0-discord-test-feedback";
+} from "./core.js?v=3.0.0-discord-webhook-diagnostics";
 
 const PHONE_MEDIA = window.matchMedia
   ? window.matchMedia("(max-width: 720px)")
@@ -2340,6 +2340,21 @@ function collectNotificationSettings() {
   return next;
 }
 
+function discordWebhookValidationMessage(webhook) {
+  const value = String(webhook || "").trim();
+  if (!value) return "Paste a Discord webhook URL first.";
+  const withProtocol = /^discord(?:app)?\.com\/api\/webhooks\//i.test(value)
+    ? `https://${value}`
+    : value;
+  if (/^https:\/\/discord(?:app)?\.com\/channels\//i.test(withProtocol)) {
+    return "That is a Discord channel link. Paste a webhook URL from Server Settings > Integrations > Webhooks.";
+  }
+  if (!/^https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[\w-]+/i.test(withProtocol)) {
+    return "Discord webhook must start with https://discord.com/api/webhooks/...";
+  }
+  return "";
+}
+
 async function saveNotificationSettings({ silent = false } = {}) {
   const payload = collectNotificationSettings();
   state.notificationSaveStatus = "saving";
@@ -2362,6 +2377,14 @@ async function sendTestNotification() {
   state.notificationTestResult = { results: { discord: { pending: true } } };
   patchConnection();
   try {
+    const settings = collectNotificationSettings();
+    if (!settings.discord_enabled) {
+      throw new Error("Enable Discord before sending a test notification.");
+    }
+    const validationMessage = discordWebhookValidationMessage(settings.discord_webhook_url);
+    if (validationMessage) {
+      throw new Error(validationMessage);
+    }
     await saveNotificationSettings({ silent: true });
     const result = await invokeFunction("notify", {
       event_type: "test_notification",
