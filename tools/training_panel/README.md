@@ -2,7 +2,7 @@
 
 Local admin panel and V2.1 remote-control system for launching RSL-RL training runs, finding reward tuning files, viewing run history, keeping notes, and coordinating team access.
 
-**Version:** 2.1.0
+**Version:** 2.1.1
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
 
@@ -186,7 +186,7 @@ Phone page:
 https://popcorn-volcano.github.io/redrhex-training-remote/
 ```
 
-The phone page is the **child** panel: a simplified, team-friendly version of the local **mother** panel. It supports Dashboard, Train, Rewards, History, and Connection views. Team members can check worker health, queue training, tune shared reward presets, review history, edit notes/folders, request video/ONNX jobs, and play private uploaded result videos. Terminal, tmux attach, local file opening, compaction, deletion, and worker administration stay mother-only.
+The phone page is the **child** panel: a simplified, team-friendly version of the local **mother** panel. It supports Dashboard, Train, Rewards, Terrain, History, and Connection views. Team members can check worker health, queue training, tune shared reward and terrain presets, review history, edit notes/folders, start TensorBoard, compact runs, request checkpoint-specific videos, and play private uploaded result videos. Terminal, tmux attach, local file opening, ONNX export, stop-process controls, deletion, and worker administration stay mother-only.
 
 Apply the Supabase schema from:
 
@@ -194,7 +194,7 @@ Apply the Supabase schema from:
 tools/training_panel/supabase/schema.sql
 ```
 
-Re-apply the schema after pulling V2.1 updates. It adds `reward_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
+Re-apply the schema after pulling V2.1.1 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
 
 Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
 
@@ -221,7 +221,7 @@ History actions:
 Remote roles:
 
 - `viewer`: inspect runs, logs, artifacts, and proxy links.
-- `operator`: viewer permissions plus launch, stop, video recording, and ONNX export.
+- `operator`: viewer permissions plus launch, video recording, TensorBoard, and compaction.
 - `admin`: operator permissions plus delete, compact, access, and settings.
 
 Video default:

@@ -84,10 +84,228 @@ export const REWARD_FIELDS = [
   },
 ];
 
+export const BUILT_IN_TERRAIN_PRESETS = [
+  {
+    id: "baseline",
+    name: "Baseline",
+    description: "The current terrain defaults from redrhex_env_cfg.py.",
+    values: {},
+    built_in: true,
+  },
+  {
+    id: "flat-debug",
+    name: "Flat Debug",
+    description: "For quick debugging on a plane with terrain curriculum disabled.",
+    values: {
+      "terrain.terrain_type": "plane",
+      "terrain.max_init_terrain_level": 0,
+      terrain_curriculum_enable: false,
+      terrain_curriculum_levels: [0.0],
+    },
+    built_in: true,
+  },
+  {
+    id: "mild-mixed",
+    name: "Mild Mixed",
+    description: "A gentle rough/wave/stairs/boxes mix for early terrain training.",
+    values: {
+      "terrain.terrain_type": "generator",
+      "terrain.max_init_terrain_level": 1,
+      "terrain.terrain_generator.difficulty_range": [0.0, 0.1],
+      terrain_curriculum_enable: true,
+      terrain_curriculum_levels: [0.0, 0.05, 0.1, 0.16, 0.24],
+      "terrain.terrain_generator.sub_terrains.random_rough.noise_range": [0.005, 0.035],
+      "terrain.terrain_generator.sub_terrains.wave.amplitude_range": [0.005, 0.035],
+      "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [0.01, 0.07],
+      "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [0.01, 0.07],
+    },
+    built_in: true,
+  },
+  {
+    id: "rough-mixed",
+    name: "Rough Mixed",
+    description: "A stronger mixed-terrain profile for robustness work.",
+    values: {
+      "terrain.terrain_type": "generator",
+      "terrain.max_init_terrain_level": 2,
+      "terrain.terrain_generator.difficulty_range": [0.0, 0.3],
+      terrain_curriculum_enable: true,
+      terrain_curriculum_levels: [0.0, 0.12, 0.28, 0.45, 0.7],
+      "terrain.terrain_generator.sub_terrains.flat.proportion": 0.1,
+      "terrain.terrain_generator.sub_terrains.random_rough.proportion": 0.3,
+      "terrain.terrain_generator.sub_terrains.wave.proportion": 0.2,
+      "terrain.terrain_generator.sub_terrains.stairs.proportion": 0.2,
+      "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.2,
+      "terrain.terrain_generator.sub_terrains.random_rough.noise_range": [0.02, 0.08],
+      "terrain.terrain_generator.sub_terrains.wave.amplitude_range": [0.02, 0.08],
+      "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [0.03, 0.15],
+      "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [0.03, 0.15],
+    },
+    built_in: true,
+  },
+  {
+    id: "stairs-boxes",
+    name: "Stairs + Boxes",
+    description: "Focused obstacle profile for step and box-grid adaptation.",
+    values: {
+      "terrain.terrain_type": "generator",
+      "terrain.max_init_terrain_level": 2,
+      "terrain.terrain_generator.difficulty_range": [0.0, 0.25],
+      terrain_curriculum_enable: true,
+      terrain_curriculum_levels: [0.0, 0.1, 0.22, 0.38, 0.55],
+      "terrain.terrain_generator.sub_terrains.flat.proportion": 0.1,
+      "terrain.terrain_generator.sub_terrains.random_rough.proportion": 0.1,
+      "terrain.terrain_generator.sub_terrains.wave.proportion": 0.05,
+      "terrain.terrain_generator.sub_terrains.stairs.proportion": 0.4,
+      "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.35,
+      "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [0.02, 0.14],
+      "terrain.terrain_generator.sub_terrains.stairs.step_width": 0.25,
+      "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.4,
+      "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [0.02, 0.14],
+    },
+    built_in: true,
+  },
+];
+
+export const TERRAIN_DEFAULT_VALUES = {
+  "terrain.terrain_type": "generator",
+  "terrain.prim_path": "/World/ground",
+  "terrain.collision_group": -1,
+  "terrain.max_init_terrain_level": 1,
+  "terrain.debug_vis": false,
+  "terrain.physics_material.friction_combine_mode": "multiply",
+  "terrain.physics_material.restitution_combine_mode": "multiply",
+  "terrain.physics_material.static_friction": 1.2,
+  "terrain.physics_material.dynamic_friction": 1.0,
+  terrain_curriculum_enable: true,
+  terrain_curriculum_levels: [0.0, 0.08, 0.2, 0.35, 0.55],
+  "terrain.terrain_generator.size": [6.0, 6.0],
+  "terrain.terrain_generator.border_width": 3.0,
+  "terrain.terrain_generator.border_height": 1.0,
+  "terrain.terrain_generator.num_rows": 6,
+  "terrain.terrain_generator.num_cols": 12,
+  "terrain.terrain_generator.curriculum": true,
+  "terrain.terrain_generator.color_scheme": "none",
+  "terrain.terrain_generator.horizontal_scale": 0.1,
+  "terrain.terrain_generator.vertical_scale": 0.005,
+  "terrain.terrain_generator.slope_threshold": 0.75,
+  "terrain.terrain_generator.difficulty_range": [0.0, 0.15],
+  "terrain.terrain_generator.use_cache": false,
+  "terrain.terrain_generator.cache_dir": "/tmp/isaaclab/terrains",
+  "terrain.terrain_generator.sub_terrains.flat.proportion": 0.2,
+  "terrain.terrain_generator.sub_terrains.random_rough.proportion": 0.25,
+  "terrain.terrain_generator.sub_terrains.random_rough.noise_range": [0.01, 0.06],
+  "terrain.terrain_generator.sub_terrains.random_rough.noise_step": 0.005,
+  "terrain.terrain_generator.sub_terrains.random_rough.border_width": 0.25,
+  "terrain.terrain_generator.sub_terrains.wave.proportion": 0.15,
+  "terrain.terrain_generator.sub_terrains.wave.amplitude_range": [0.01, 0.06],
+  "terrain.terrain_generator.sub_terrains.wave.num_waves": 2,
+  "terrain.terrain_generator.sub_terrains.wave.border_width": 0.25,
+  "terrain.terrain_generator.sub_terrains.stairs.proportion": 0.2,
+  "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [0.02, 0.12],
+  "terrain.terrain_generator.sub_terrains.stairs.step_width": 0.28,
+  "terrain.terrain_generator.sub_terrains.stairs.platform_width": 1.2,
+  "terrain.terrain_generator.sub_terrains.stairs.border_width": 0.25,
+  "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.2,
+  "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.45,
+  "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [0.02, 0.12],
+  "terrain.terrain_generator.sub_terrains.boxes.platform_width": 1.5,
+};
+
+export const TERRAIN_FIELDS = [
+  {
+    name: "Importer",
+    fields: [
+      { key: "terrain.terrain_type", label: "Terrain Type", type: "choice", choices: ["generator", "plane", "usd"], help: "Isaac terrain source." },
+      { key: "terrain.prim_path", label: "Prim Path", type: "string", help: "USD prim path used for the ground." },
+      { key: "terrain.collision_group", label: "Collision Group", type: "int", step: 1, help: "Collision group assigned to terrain." },
+      { key: "terrain.max_init_terrain_level", label: "Max Init Level", type: "int", step: 1, help: "Highest terrain row level available at reset." },
+      { key: "terrain.debug_vis", label: "Debug Origins", type: "bool", help: "Show terrain origin debug visualization." },
+    ],
+  },
+  {
+    name: "Physics Material",
+    fields: [
+      { key: "terrain.physics_material.friction_combine_mode", label: "Friction Combine", type: "choice", choices: ["average", "min", "multiply", "max"], help: "How terrain friction combines with robot materials." },
+      { key: "terrain.physics_material.restitution_combine_mode", label: "Restitution Combine", type: "choice", choices: ["average", "min", "multiply", "max"], help: "How bounce combines with robot materials." },
+      { key: "terrain.physics_material.static_friction", label: "Static Friction", type: "float", step: 0.01, help: "Static friction coefficient." },
+      { key: "terrain.physics_material.dynamic_friction", label: "Dynamic Friction", type: "float", step: 0.01, help: "Dynamic friction coefficient." },
+    ],
+  },
+  {
+    name: "Curriculum",
+    fields: [
+      { key: "terrain_curriculum_enable", label: "Terrain Curriculum", type: "bool", help: "Enable stage-based terrain difficulty updates." },
+      { key: "terrain_curriculum_levels", label: "Curriculum Levels", type: "list", step: 0.01, help: "Difficulty level per curriculum stage." },
+    ],
+  },
+  {
+    name: "Generator",
+    fields: [
+      { key: "terrain.terrain_generator.size", label: "Tile Size", type: "range", step: 0.1, help: "Sub-terrain tile width and length in meters." },
+      { key: "terrain.terrain_generator.border_width", label: "Border Width", type: "float", step: 0.1, help: "Outer terrain border width in meters." },
+      { key: "terrain.terrain_generator.border_height", label: "Border Height", type: "float", step: 0.1, help: "Outer terrain border height in meters." },
+      { key: "terrain.terrain_generator.num_rows", label: "Rows", type: "int", step: 1, help: "Terrain difficulty rows." },
+      { key: "terrain.terrain_generator.num_cols", label: "Columns", type: "int", step: 1, help: "Terrain variation columns." },
+      { key: "terrain.terrain_generator.curriculum", label: "Generator Curriculum", type: "bool", help: "Generate terrain rows in curriculum order." },
+      { key: "terrain.terrain_generator.color_scheme", label: "Color Scheme", type: "choice", choices: ["height", "random", "none"], help: "Terrain visual color scheme." },
+      { key: "terrain.terrain_generator.horizontal_scale", label: "Horizontal Scale", type: "float", step: 0.001, help: "Height-field XY discretization." },
+      { key: "terrain.terrain_generator.vertical_scale", label: "Vertical Scale", type: "float", step: 0.001, help: "Height-field Z discretization." },
+      { key: "terrain.terrain_generator.slope_threshold", label: "Slope Threshold", type: "float", step: 0.01, help: "Height-field slope correction threshold." },
+      { key: "terrain.terrain_generator.difficulty_range", label: "Difficulty Range", type: "range", step: 0.01, help: "Generated terrain difficulty min and max." },
+      { key: "terrain.terrain_generator.use_cache", label: "Use Cache", type: "bool", help: "Reuse generated terrain cache when available." },
+      { key: "terrain.terrain_generator.cache_dir", label: "Cache Dir", type: "string", help: "Terrain cache directory." },
+    ],
+  },
+  {
+    name: "Flat",
+    fields: [
+      { key: "terrain.terrain_generator.sub_terrains.flat.proportion", label: "Flat Proportion", type: "float", step: 0.01, help: "Sampling weight for flat terrain." },
+    ],
+  },
+  {
+    name: "Random Rough",
+    fields: [
+      { key: "terrain.terrain_generator.sub_terrains.random_rough.proportion", label: "Rough Proportion", type: "float", step: 0.01, help: "Sampling weight for random rough terrain." },
+      { key: "terrain.terrain_generator.sub_terrains.random_rough.noise_range", label: "Noise Range", type: "range", step: 0.001, help: "Min and max rough terrain height noise in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.random_rough.noise_step", label: "Noise Step", type: "float", step: 0.001, help: "Minimum height change between samples." },
+      { key: "terrain.terrain_generator.sub_terrains.random_rough.border_width", label: "Border Width", type: "float", step: 0.01, help: "Flat border around rough tile." },
+    ],
+  },
+  {
+    name: "Wave",
+    fields: [
+      { key: "terrain.terrain_generator.sub_terrains.wave.proportion", label: "Wave Proportion", type: "float", step: 0.01, help: "Sampling weight for wave terrain." },
+      { key: "terrain.terrain_generator.sub_terrains.wave.amplitude_range", label: "Amplitude Range", type: "range", step: 0.001, help: "Min and max wave amplitude in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.wave.num_waves", label: "Wave Count", type: "int", step: 1, help: "Number of waves per terrain tile." },
+      { key: "terrain.terrain_generator.sub_terrains.wave.border_width", label: "Border Width", type: "float", step: 0.01, help: "Flat border around wave tile." },
+    ],
+  },
+  {
+    name: "Stairs",
+    fields: [
+      { key: "terrain.terrain_generator.sub_terrains.stairs.proportion", label: "Stairs Proportion", type: "float", step: 0.01, help: "Sampling weight for pyramid stairs terrain." },
+      { key: "terrain.terrain_generator.sub_terrains.stairs.step_height_range", label: "Step Height Range", type: "range", step: 0.001, help: "Min and max stair height in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.stairs.step_width", label: "Step Width", type: "float", step: 0.01, help: "Stair tread width in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.stairs.platform_width", label: "Platform Width", type: "float", step: 0.1, help: "Central platform width in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.stairs.border_width", label: "Border Width", type: "float", step: 0.01, help: "Flat border around stairs tile." },
+    ],
+  },
+  {
+    name: "Boxes",
+    fields: [
+      { key: "terrain.terrain_generator.sub_terrains.boxes.proportion", label: "Boxes Proportion", type: "float", step: 0.01, help: "Sampling weight for random box grid terrain." },
+      { key: "terrain.terrain_generator.sub_terrains.boxes.grid_width", label: "Grid Width", type: "float", step: 0.01, help: "Random grid cell width in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.boxes.grid_height_range", label: "Grid Height Range", type: "range", step: 0.001, help: "Min and max random grid height in meters." },
+      { key: "terrain.terrain_generator.sub_terrains.boxes.platform_width", label: "Platform Width", type: "float", step: 0.1, help: "Central platform width in meters." },
+    ],
+  },
+];
+
 export const ACTIVE_JOB_STATUSES = new Set(["queued", "claimed", "running"]);
 export const GPU_JOB_TYPES = new Set(["start_training", "record_video", "export_onnx"]);
 export const ACTIVE_REFRESH_MS = 3_000;
-export const IDLE_REFRESH_MS = 15_000;
+export const IDLE_REFRESH_MS = 5_000;
 
 export function escapeHtml(value) {
   return String(value ?? "")
@@ -185,6 +403,83 @@ export function videoStateForRun(run = {}, artifacts = []) {
   return { state: "missing", artifact: null };
 }
 
+export function checkpointIteration(path = "") {
+  const match = String(path || "").match(/model_(\d+)\.pt(?:$|[?#])/);
+  return match ? Number(match[1]) : null;
+}
+
+export function checkpointArtifactsForRun(run = {}, artifacts = []) {
+  const byPath = new Map();
+  if (run.latest_checkpoint) {
+    byPath.set(String(run.latest_checkpoint), {
+      run_id: run.id,
+      kind: "checkpoint",
+      local_path: String(run.latest_checkpoint),
+      path: String(run.latest_checkpoint),
+      iteration: checkpointIteration(run.latest_checkpoint),
+    });
+  }
+  artifacts
+    .filter((artifact) => artifact.run_id === run.id && artifact.kind === "checkpoint")
+    .forEach((artifact) => {
+      const path = String(artifact.local_path || artifact.path || "");
+      if (!path) return;
+      byPath.set(path, { ...artifact, iteration: checkpointIteration(path) });
+    });
+  return [...byPath.values()].sort((left, right) => {
+    const leftIteration = Number.isFinite(left.iteration) ? left.iteration : -1;
+    const rightIteration = Number.isFinite(right.iteration) ? right.iteration : -1;
+    if (leftIteration !== rightIteration) return rightIteration - leftIteration;
+    return String(right.created_at || "").localeCompare(String(left.created_at || ""));
+  });
+}
+
+export function checkpointOptionsForRun(run = {}, artifacts = []) {
+  return checkpointArtifactsForRun(run, artifacts).map((artifact) => {
+    const path = String(artifact.local_path || artifact.path || "");
+    const iteration = checkpointIteration(path);
+    const label = Number.isFinite(iteration) ? `Iteration ${iteration}` : path.split("/").pop() || "Checkpoint";
+    return { path, iteration, label };
+  });
+}
+
+export function videoArtifactForCheckpoint(run = {}, artifacts = [], checkpoint = "") {
+  const iteration = checkpointIteration(checkpoint);
+  const videos = artifacts
+    .filter((artifact) => artifact.run_id === run.id && artifact.kind === "video" && artifact.storage_path)
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  if (Number.isFinite(iteration)) {
+    const pattern = new RegExp(`model_${iteration}(?:\\D|$)`);
+    const exact = videos.find((artifact) => pattern.test(`${artifact.storage_path || ""} ${artifact.local_path || ""}`));
+    if (exact) return exact;
+  }
+  if (checkpoint && run.latest_checkpoint && String(checkpoint) === String(run.latest_checkpoint)) {
+    return videos[0] || null;
+  }
+  return null;
+}
+
+export function hasVideoRecordForCheckpoint(run = {}, artifacts = [], checkpoint = "") {
+  if (videoArtifactForCheckpoint(run, artifacts, checkpoint)) return true;
+  const iteration = checkpointIteration(checkpoint);
+  if (!Number.isFinite(iteration)) return hasAnyVideoRecord(run, artifacts);
+  const pattern = new RegExp(`model_${iteration}(?:\\D|$)`);
+  return Boolean(run.latest_video && pattern.test(String(run.latest_video))) || artifacts.some((artifact) => (
+    artifact.run_id === run.id
+    && artifact.kind === "video"
+    && pattern.test(`${artifact.local_path || ""} ${artifact.storage_path || ""}`)
+  ));
+}
+
+export function videoStateForCheckpoint(run = {}, artifacts = [], checkpoint = "") {
+  const selectedCheckpoint = checkpoint || run.latest_checkpoint || checkpointOptionsForRun(run, artifacts)[0]?.path || "";
+  const artifact = videoArtifactForCheckpoint(run, artifacts, selectedCheckpoint);
+  if (artifact) return { state: "ready", artifact, checkpoint: selectedCheckpoint };
+  if (hasVideoRecordForCheckpoint(run, artifacts, selectedCheckpoint)) return { state: "uploading", artifact: null, checkpoint: selectedCheckpoint };
+  if (selectedCheckpoint) return { state: "recordable", artifact: null, checkpoint: selectedCheckpoint };
+  return { state: "missing", artifact: null, checkpoint: "" };
+}
+
 export function shouldReplaceVideoPanel({
   currentState = "",
   currentStorage = "",
@@ -231,8 +526,9 @@ export function formatRelativeTime(iso, now = Date.now()) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-export function buildTrainingJob({ machineId, params, preset, role, userId }) {
+export function buildTrainingJob({ machineId, params, preset, terrainPreset, role, userId }) {
   const rewardValues = preset?.values && typeof preset.values === "object" ? preset.values : {};
+  const terrainValues = terrainPreset?.values && typeof terrainPreset.values === "object" ? terrainPreset.values : {};
   return {
     machine_id: machineId || null,
     type: "start_training",
@@ -243,17 +539,19 @@ export function buildTrainingJob({ machineId, params, preset, role, userId }) {
       headless: true,
       reward_preset_id: preset?.id || "baseline",
       reward_overrides: rewardValues,
+      terrain_preset_id: terrainPreset?.id || "baseline",
+      terrain_overrides: terrainValues,
     },
   };
 }
 
-export function buildActionJob({ machineId, type, runId, role, userId }) {
+export function buildActionJob({ machineId, type, runId, role, userId, payload = {} }) {
   return {
     machine_id: machineId || null,
     type,
     actor_id: userId || null,
     actor_role: role || "viewer",
-    payload: { run_id: runId },
+    payload: { run_id: runId, ...payload },
   };
 }
 
@@ -266,4 +564,8 @@ export function normalizePreset(raw) {
     built_in: Boolean(raw?.built_in),
     updated_at: raw?.updated_at || raw?.created_at || "",
   };
+}
+
+export function normalizeTerrainPreset(raw) {
+  return normalizePreset(raw);
 }

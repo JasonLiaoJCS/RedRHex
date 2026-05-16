@@ -54,6 +54,18 @@ class ProcessRegistryTests(unittest.TestCase):
                     proc.wait(timeout=8)
                 time.sleep(0.1)
 
+    def test_terrain_override_file_is_written_and_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            registry = ProcessRegistry(paths, HistoryStore(paths))
+            registry._write_terrain_override({"terrain.terrain_type": "plane", "terrain_curriculum_enable": False})
+            self.assertTrue(paths.terrain_override_file.exists())
+            text = paths.terrain_override_file.read_text(encoding="utf-8")
+            self.assertIn("terrain.terrain_type", text)
+            registry._write_terrain_override({})
+            self.assertFalse(paths.terrain_override_file.exists())
+
     def test_video_recording_process_uses_headless_video_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -216,6 +228,28 @@ class ProcessRegistryTests(unittest.TestCase):
                 registry.stop(result["id"])
                 if proc:
                     proc.wait(timeout=8)
+
+    def test_training_command_match_rejects_conflicting_args(self):
+        recorded = (
+            "/IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py "
+            "--task Template-Redrhex-Direct-v0 --num_envs 4 --max_iterations 10 --device cuda:0 --headless"
+        )
+        observed = (
+            "bash /IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py "
+            "--task Template-Redrhex-Direct-v0 --num_envs 4 --max_iterations 1 --device cuda:0 --headless"
+        )
+        self.assertFalse(ProcessRegistry._training_commands_match(recorded, observed))
+
+    def test_training_command_match_accepts_same_core_args(self):
+        recorded = (
+            "/IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py "
+            "--task Template-Redrhex-Direct-v0 --num_envs 4 --max_iterations 10 --device cuda:0 --headless"
+        )
+        observed = (
+            "python scripts/rsl_rl/train.py "
+            "--device cuda:0 --max_iterations 10 --num_envs 4 --task Template-Redrhex-Direct-v0"
+        )
+        self.assertTrue(ProcessRegistry._training_commands_match(recorded, observed))
 
     def test_running_isaac_processes_includes_onnx_exports(self):
         with tempfile.TemporaryDirectory() as tmp:

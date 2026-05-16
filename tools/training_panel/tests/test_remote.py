@@ -39,6 +39,7 @@ class FakeClient:
         self.claim_calls = 0
         self.upserts = []
         self.select_rows = []
+        self.deletes = []
         self.uploads = []
         self.claim_gpu_locked = []
         self.raise_on_artifacts_upsert = False
@@ -65,6 +66,9 @@ class FakeClient:
 
     def select(self, table, query=None):
         return self.select_rows
+
+    def delete(self, table, query=None):
+        self.deletes.append((table, query))
 
     def upload_storage_object(self, bucket, object_path, file_path, **kwargs):
         self.uploads.append((bucket, object_path, file_path, kwargs))
@@ -159,6 +163,8 @@ class RemoteTests(unittest.TestCase):
     def test_remote_roles(self):
         self.assertFalse(role_allows("viewer", "start_training"))
         self.assertTrue(role_allows("operator", "export_onnx"))
+        self.assertTrue(role_allows("operator", "tensorboard"))
+        self.assertTrue(role_allows("operator", "compact_run"))
         self.assertFalse(role_allows("operator", "delete_run"))
         self.assertTrue(role_allows("admin", "delete_run"))
 
@@ -197,6 +203,21 @@ class RemoteTests(unittest.TestCase):
         )
         self.assertEqual({item["kind"] for item in artifacts}, {"checkpoint", "video", "onnx"})
         self.assertTrue(all(item.get("local_path") for item in artifacts))
+
+    def test_run_artifacts_include_checkpoint_and_video_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "run_one"
+            video_dir = log_dir / "videos" / "play"
+            video_dir.mkdir(parents=True)
+            for iteration in (10, 20):
+                (log_dir / f"model_{iteration}.pt").write_text("checkpoint", encoding="utf-8")
+            (video_dir / "model_10_video.mp4").write_bytes(b"mp4")
+            artifacts = run_artifacts({"id": "run_one", "log_dir": str(log_dir)})
+            paths = {Path(item["local_path"]).name for item in artifacts}
+            self.assertIn("model_10.pt", paths)
+            self.assertIn("model_20.pt", paths)
+            self.assertIn("model_10_video.mp4", paths)
 
     def test_completion_event_and_discord_payload(self):
         event = completion_event_from_run(
@@ -272,9 +293,43 @@ class RemoteTests(unittest.TestCase):
             executor = self._make_executor(Path(tmp))
             executor.processes.running_for_run = MagicMock(return_value=[])
             executor.history.compact_run = MagicMock(return_value={"deleted": 0})
-            result = executor.execute({"type": "compact_run", "actor_role": "admin", "payload": {"run_id": "run_x"}})
+            result = executor.execute({"type": "compact_run", "actor_role": "operator", "payload": {"run_id": "run_x"}})
             executor.history.compact_run.assert_called_once()
             self.assertEqual(result.local_run_id, "run_x")
+
+    def test_executor_starts_tensorboard_for_run_log_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executor = self._make_executor(root)
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "run_x"
+            log_dir.mkdir(parents=True)
+            executor.history.add_run({"id": "run_x", "latest_checkpoint": str(log_dir / "model_1.pt"), "log_dir": str(log_dir)})
+            executor.processes.start_tensorboard = MagicMock(return_value={"id": "tensorboard_6006", "url": "http://127.0.0.1:6006"})
+            result = executor.execute({"type": "tensorboard", "actor_role": "operator", "payload": {"run_id": "run_x", "host": "0.0.0.0"}})
+            executor.processes.start_tensorboard.assert_called_once()
+            self.assertEqual(executor.processes.start_tensorboard.call_args.kwargs["logdir"], log_dir)
+            self.assertEqual(result.process_id, "tensorboard_6006")
+
+    def test_executor_records_video_for_requested_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executor = self._make_executor(root)
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "run_x"
+            log_dir.mkdir(parents=True)
+            checkpoint_5 = log_dir / "model_5.pt"
+            checkpoint_20 = log_dir / "model_20.pt"
+            checkpoint_5.write_text("checkpoint", encoding="utf-8")
+            checkpoint_20.write_text("checkpoint", encoding="utf-8")
+            executor.history.add_run({"id": "run_x", "latest_checkpoint": str(checkpoint_20), "log_dir": str(log_dir)})
+            executor.processes.start_video_recording = MagicMock(return_value={"id": "video_1"})
+            result = executor.execute({
+                "type": "record_video",
+                "actor_role": "operator",
+                "payload": {"run_id": "run_x", "checkpoint_iteration": 5},
+            })
+            executor.processes.start_video_recording.assert_called_once()
+            self.assertEqual(executor.processes.start_video_recording.call_args.kwargs["checkpoint"], str(checkpoint_5))
+            self.assertEqual(result.payload["checkpoint_iteration"], 5)
 
     def test_executor_delete_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -388,6 +443,29 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(run["display_name"], "new")
             self.assertEqual(run["folder"], "team")
             self.assertEqual(history.get_note("run_one"), "new note")
+
+    def test_worker_sync_deletes_tombstoned_remote_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            paths.ensure_dirs()
+            executor = FakeExecutor()
+            executor.sync_runs_payload = MagicMock(return_value=[])
+            history = executor.history = RemoteJobExecutor(paths).history
+            log_dir = paths.rsl_rl_log_root / "2026_deleted_run"
+            log_dir.mkdir(parents=True)
+            (log_dir / "events.out.tfevents.test").write_text("x", encoding="utf-8")
+            history.patch_run_metadata("panel_deleted", log_dir=str(log_dir), source="training_panel")
+            history.delete_run("panel_deleted", confirm=True, delete_logs=False)
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
+            client = FakeClient()
+            worker = RemoteWorker(config, paths, client, executor=executor)
+
+            worker.sync_runs()
+
+            self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.panel_deleted"}), client.deletes)
+            self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.2026_deleted_run"}), client.deletes)
+            self.assertIn(("runs", {"machine_id": "eq.lab-pc", "log_dir": f"eq.{log_dir}"}), client.deletes)
 
     def test_worker_uploads_latest_video_and_records_storage_path(self):
         with tempfile.TemporaryDirectory() as tmp:

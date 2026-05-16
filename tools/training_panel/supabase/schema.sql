@@ -1,4 +1,4 @@
--- RedRHex Training Panel V2.1 Supabase schema
+-- RedRHex Training Panel V2.1.1 Supabase schema
 -- Apply in the Supabase SQL editor, then configure Row Level Security policies
 -- for your team's auth provider.
 
@@ -75,6 +75,32 @@ values
   ('baseline', 'Baseline', 'The current default reward configuration. Good starting point for comparison runs.', '{}'::jsonb, true),
   ('speed-focus', 'Speed Focus', 'Emphasises forward velocity and tracking. Faster but may be less stable.', '{"rew_scale_forward_vel":5.0,"rew_scale_vel_tracking":6.0,"rew_scale_ang_vel_tracking":3.5,"rew_scale_orientation":-0.1,"rew_scale_base_height":-0.1}'::jsonb, true),
   ('stability-focus', 'Stability Focus', 'Strongly penalises tilting and height deviation for early stability.', '{"rew_scale_forward_vel":1.5,"rew_scale_vel_tracking":2.0,"rew_scale_orientation":-0.6,"rew_scale_base_height":-0.6,"rew_scale_lin_vel_z":-0.3,"rew_scale_alive":0.3}'::jsonb, true)
+on conflict (id) do update
+set name = excluded.name,
+    description = excluded.description,
+    values = excluded.values,
+    built_in = true,
+    updated_at = now();
+
+create table if not exists public.terrain_presets (
+  id text primary key,
+  name text not null,
+  description text not null default '',
+  values jsonb not null default '{}',
+  built_in boolean not null default false,
+  created_by uuid references auth.users(id),
+  updated_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+insert into public.terrain_presets (id, name, description, values, built_in)
+values
+  ('baseline', 'Baseline', 'The current terrain defaults from redrhex_env_cfg.py.', '{}'::jsonb, true),
+  ('flat-debug', 'Flat Debug', 'For quick debugging on a plane with terrain curriculum disabled.', '{"terrain.terrain_type":"plane","terrain.max_init_terrain_level":0,"terrain_curriculum_enable":false,"terrain_curriculum_levels":[0.0]}'::jsonb, true),
+  ('mild-mixed', 'Mild Mixed', 'A gentle rough/wave/stairs/boxes mix for early terrain training.', '{"terrain.terrain_type":"generator","terrain.max_init_terrain_level":1,"terrain.terrain_generator.difficulty_range":[0.0,0.10],"terrain_curriculum_enable":true,"terrain_curriculum_levels":[0.0,0.05,0.10,0.16,0.24],"terrain.terrain_generator.sub_terrains.random_rough.noise_range":[0.005,0.035],"terrain.terrain_generator.sub_terrains.wave.amplitude_range":[0.005,0.035],"terrain.terrain_generator.sub_terrains.stairs.step_height_range":[0.01,0.07],"terrain.terrain_generator.sub_terrains.boxes.grid_height_range":[0.01,0.07]}'::jsonb, true),
+  ('rough-mixed', 'Rough Mixed', 'A stronger mixed-terrain profile for robustness work.', '{"terrain.terrain_type":"generator","terrain.max_init_terrain_level":2,"terrain.terrain_generator.difficulty_range":[0.0,0.30],"terrain_curriculum_enable":true,"terrain_curriculum_levels":[0.0,0.12,0.28,0.45,0.70],"terrain.terrain_generator.sub_terrains.flat.proportion":0.10,"terrain.terrain_generator.sub_terrains.random_rough.proportion":0.30,"terrain.terrain_generator.sub_terrains.wave.proportion":0.20,"terrain.terrain_generator.sub_terrains.stairs.proportion":0.20,"terrain.terrain_generator.sub_terrains.boxes.proportion":0.20,"terrain.terrain_generator.sub_terrains.random_rough.noise_range":[0.02,0.08],"terrain.terrain_generator.sub_terrains.wave.amplitude_range":[0.02,0.08],"terrain.terrain_generator.sub_terrains.stairs.step_height_range":[0.03,0.15],"terrain.terrain_generator.sub_terrains.boxes.grid_height_range":[0.03,0.15]}'::jsonb, true),
+  ('stairs-boxes', 'Stairs + Boxes', 'Focused obstacle profile for step and box-grid adaptation.', '{"terrain.terrain_type":"generator","terrain.max_init_terrain_level":2,"terrain.terrain_generator.difficulty_range":[0.0,0.25],"terrain_curriculum_enable":true,"terrain_curriculum_levels":[0.0,0.10,0.22,0.38,0.55],"terrain.terrain_generator.sub_terrains.flat.proportion":0.10,"terrain.terrain_generator.sub_terrains.random_rough.proportion":0.10,"terrain.terrain_generator.sub_terrains.wave.proportion":0.05,"terrain.terrain_generator.sub_terrains.stairs.proportion":0.40,"terrain.terrain_generator.sub_terrains.boxes.proportion":0.35,"terrain.terrain_generator.sub_terrains.stairs.step_height_range":[0.02,0.14],"terrain.terrain_generator.sub_terrains.stairs.step_width":0.25,"terrain.terrain_generator.sub_terrains.boxes.grid_width":0.40,"terrain.terrain_generator.sub_terrains.boxes.grid_height_range":[0.02,0.14]}'::jsonb, true)
 on conflict (id) do update
 set name = excluded.name,
     description = excluded.description,
@@ -181,6 +207,11 @@ create trigger set_reward_presets_updated_at
   before update on public.reward_presets
   for each row execute function public.set_redrhex_updated_at();
 
+drop trigger if exists set_terrain_presets_updated_at on public.terrain_presets;
+create trigger set_terrain_presets_updated_at
+  before update on public.terrain_presets
+  for each row execute function public.set_redrhex_updated_at();
+
 drop trigger if exists set_machines_updated_at on public.machines;
 create trigger set_machines_updated_at
   before update on public.machines
@@ -198,9 +229,9 @@ begin
     from public.jobs
     where status = 'queued'
       and (machine_id = p_machine_id or machine_id is null)
-      and (not p_gpu_locked or type = 'stop_process')
+      and (not p_gpu_locked or type in ('stop_process', 'tensorboard'))
     order by
-      case when type = 'stop_process' then 0 else 1 end,
+      case when type in ('stop_process', 'tensorboard') then 0 else 1 end,
       created_at asc
     for update skip locked
     limit 1
@@ -225,6 +256,7 @@ alter table public.artifacts enable row level security;
 alter table public.proxy_sessions enable row level security;
 alter table public.notification_settings enable row level security;
 alter table public.reward_presets enable row level security;
+alter table public.terrain_presets enable row level security;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('redrhex-videos', 'redrhex-videos', false, 1073741824, array['video/mp4'])
@@ -243,6 +275,11 @@ drop policy if exists "operators can create jobs" on public.jobs;
 drop policy if exists "reward presets readable by authenticated users" on public.reward_presets;
 drop policy if exists "operators can create reward presets" on public.reward_presets;
 drop policy if exists "operators can update custom reward presets" on public.reward_presets;
+drop policy if exists "operators can delete custom reward presets" on public.reward_presets;
+drop policy if exists "terrain presets readable by authenticated users" on public.terrain_presets;
+drop policy if exists "operators can create terrain presets" on public.terrain_presets;
+drop policy if exists "operators can update custom terrain presets" on public.terrain_presets;
+drop policy if exists "operators can delete custom terrain presets" on public.terrain_presets;
 drop policy if exists "run_events readable by authenticated users" on public.run_events;
 drop policy if exists "machine can upsert own row" on public.machines;
 drop policy if exists "machine can upsert own runs" on public.runs;
@@ -323,6 +360,60 @@ create policy "operators can update custom reward presets" on public.reward_pres
     )
   );
 
+create policy "operators can delete custom reward presets" on public.reward_presets
+  for delete to authenticated
+  using (
+    built_in = false
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid()
+        and p.role in ('operator', 'admin')
+    )
+  );
+
+create policy "terrain presets readable by authenticated users" on public.terrain_presets
+  for select to authenticated using (true);
+
+create policy "operators can create terrain presets" on public.terrain_presets
+  for insert to authenticated
+  with check (
+    exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid()
+        and p.role in ('operator', 'admin')
+    )
+  );
+
+create policy "operators can update custom terrain presets" on public.terrain_presets
+  for update to authenticated
+  using (
+    built_in = false
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid()
+        and p.role in ('operator', 'admin')
+    )
+  )
+  with check (
+    built_in = false
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid()
+        and p.role in ('operator', 'admin')
+    )
+  );
+
+create policy "operators can delete custom terrain presets" on public.terrain_presets
+  for delete to authenticated
+  using (
+    built_in = false
+    and exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid()
+        and p.role in ('operator', 'admin')
+    )
+  );
+
 -- run_events: missing SELECT policy (RLS enabled above but no policy = deny all).
 create policy "run_events readable by authenticated users" on public.run_events
   for select to authenticated using (true);
@@ -355,3 +446,4 @@ create index if not exists idx_jobs_status          on public.jobs(status);
 create index if not exists idx_artifacts_run_id     on public.artifacts(run_id);
 create index if not exists idx_run_events_run_id    on public.run_events(run_id);
 create index if not exists idx_reward_presets_builtin on public.reward_presets(built_in);
+create index if not exists idx_terrain_presets_builtin on public.terrain_presets(built_in);

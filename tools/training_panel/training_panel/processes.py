@@ -94,8 +94,9 @@ class ProcessRegistry:
         script_argv = training_argv(params)
         shell = shell_for_isaaclab(self.paths, script_argv)
         log_file = self.paths.process_log_dir / f"{run_id}.log"
-        # Write reward overrides before spawning so train.py reads them on startup
+        # Write panel overrides before spawning so train.py reads them on startup.
         self._write_reward_override(params.reward_overrides)
+        self._write_terrain_override(params.terrain_overrides)
         record = {
             "id": run_id,
             "source": "training_panel",
@@ -108,6 +109,8 @@ class ProcessRegistry:
             "log_dir": None,
             "reward_preset_id": params.reward_preset_id,
             "reward_overrides": params.reward_overrides,
+            "terrain_preset_id": params.terrain_preset_id,
+            "terrain_overrides": params.terrain_overrides,
         }
         self.history.add_run(record)
         spawned = self._spawn_shell(run_id, shell, log_file)
@@ -137,6 +140,16 @@ class ProcessRegistry:
         import json as _json
         override_file = self.paths.reward_override_file
         if overrides:
+            override_file.parent.mkdir(parents=True, exist_ok=True)
+            override_file.write_text(_json.dumps(overrides, indent=2), encoding="utf-8")
+        elif override_file.exists():
+            override_file.unlink()
+
+    def _write_terrain_override(self, overrides: dict) -> None:
+        import json as _json
+        override_file = self.paths.terrain_override_file
+        if overrides:
+            override_file.parent.mkdir(parents=True, exist_ok=True)
             override_file.write_text(_json.dumps(overrides, indent=2), encoding="utf-8")
         elif override_file.exists():
             override_file.unlink()
@@ -296,6 +309,8 @@ class ProcessRegistry:
             video_preset=params.preset,
             video_params=params.to_dict(),
             video_length=params.length,
+            video_checkpoint=str(checkpoint),
+            video_checkpoint_iteration=self._checkpoint_iteration(checkpoint),
         )
         thread = threading.Thread(
             target=self._monitor_video,
@@ -313,6 +328,8 @@ class ProcessRegistry:
             "attach_command": spawned.attach_command,
             "exit_file": spawned.exit_file,
             "video_params": params.to_dict(),
+            "checkpoint": str(checkpoint),
+            "checkpoint_iteration": self._checkpoint_iteration(checkpoint),
         }
 
     def start_onnx_export(self, run_id: str, checkpoint: str, device: str = "cuda:0") -> dict:
@@ -766,12 +783,16 @@ class ProcessRegistry:
     def _training_commands_match(recorded_command: str, process_command: str) -> bool:
         if not recorded_command or "scripts/rsl_rl/train.py" not in process_command:
             return False
-        keys = ("--task", "--num_envs", "--max_iterations", "--device")
+        keys = ("--task", "--num_envs", "--max_iterations", "--device", "--seed", "--checkpoint")
         matched = 0
         for key in keys:
             recorded = ProcessRegistry._arg_value(recorded_command, key)
             observed = ProcessRegistry._arg_value(process_command, key)
-            if recorded and observed and recorded == observed:
+            if not recorded or not observed:
+                continue
+            if recorded != observed:
+                return False
+            if recorded == observed:
                 matched += 1
         return matched >= 3
 
@@ -1048,6 +1069,8 @@ class ProcessRegistry:
         run = self.history.get_run(source_run_id) or {}
         log_dir = Path(run["log_dir"]) if run.get("log_dir") else None
         video = latest_video(log_dir) if log_dir and log_dir.exists() else None
+        if video:
+            video = self._tag_video_with_checkpoint(Path(video), video_id, run)
         self.history.update_run(
             source_run_id,
             video_status="completed" if returncode == 0 and video else "failed",
@@ -1057,6 +1080,29 @@ class ProcessRegistry:
             has_video=bool(video),
             video_error=None if returncode == 0 and video else "Video process finished but no MP4 was produced.",
         )
+
+    @staticmethod
+    def _checkpoint_iteration(checkpoint: str | Path) -> int | None:
+        match = re.search(r"model_(\d+)\.pt$", str(checkpoint or ""))
+        return int(match.group(1)) if match else None
+
+    def _tag_video_with_checkpoint(self, video: Path, video_id: str, run: dict) -> str:
+        iteration = run.get("video_checkpoint_iteration") or self._checkpoint_iteration(str(run.get("video_checkpoint") or ""))
+        if not iteration or not video.is_file():
+            return str(video)
+        if f"model_{iteration}" in video.name:
+            return str(video)
+        safe_video_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_id).strip("._-") or "video"
+        target = video.with_name(f"model_{iteration}_{safe_video_id}{video.suffix}")
+        counter = 2
+        while target.exists() and target != video:
+            target = video.with_name(f"model_{iteration}_{safe_video_id}_{counter}{video.suffix}")
+            counter += 1
+        try:
+            video.rename(target)
+            return str(target)
+        except OSError:
+            return str(video)
 
     def _monitor_onnx(self, source_run_id: str, onnx_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()

@@ -55,7 +55,8 @@ def test_create_preset_generates_unique_ids(store):
 
 def test_update_preset_changes_values(store):
     p = store.create_preset("Edit Me", "original desc", {"rew_scale_alive": 0.5})
-    updated = store.update_preset(p["id"], values={"rew_scale_alive": 1.0}, description="updated desc")
+    updated = store.update_preset(p["id"], values={"rew_scale_alive": 1.0}, name="Renamed", description="updated desc")
+    assert updated["name"] == "Renamed"
     assert updated["values"]["rew_scale_alive"] == 1.0
     assert updated["description"] == "updated desc"
 

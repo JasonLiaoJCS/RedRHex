@@ -48,6 +48,7 @@ docker/.container.cfg
 docker/artifacts/
 *.tmp
 tools/training_panel/active_reward_override.json
+tools/training_panel/active_terrain_override.json
 
 # Doc Outputs
 **/docs/_build/*

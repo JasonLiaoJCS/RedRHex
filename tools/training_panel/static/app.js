@@ -34,7 +34,16 @@ const state = {
   activePresetOverrides: {},
   selectedPresetId: null,
   rewardDefaults: {},
+  // Terrain / presets
+  terrainPresets: [],
+  activeTerrainPresetId: "baseline",
+  activeTerrainPresetOverrides: {},
+  selectedTerrainPresetId: null,
+  terrainDefaults: {},
+  terrainSchema: [],
   remoteStatus: null,
+  activityEvents: [],
+  activityAnalytics: null,
   // Comparison (Module 6)
   comparisonRun: null,
   comparisonMode: false,
@@ -170,6 +179,11 @@ function setStatus(message, linkUrl = "") {
   }
 }
 
+function setTerrainStatus(message) {
+  const status = $("#terrain-status");
+  if (status) status.textContent = message;
+}
+
 function setView(name) {
   document.querySelectorAll(".nav-button").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === name);
@@ -180,7 +194,9 @@ function setView(name) {
   const titles = {
     train: ["Train", "Start a controlled RSL-RL run with the repo defaults."],
     rewards: ["Rewards", "Tune reward weights with presets and see which settings each run used."],
+    terrain: ["Terrain", "Tune terrain generator, curriculum, and sub-terrain mix with presets."],
     history: ["History", "Review runs, notes, checkpoints, TensorBoard, and playbacks."],
+    activity: ["Activity", "See team run requests, panel actions, and lightweight usage analytics."],
     access: ["Control Center", "Manage local access, V2.1 remote worker status, and remote launch acceptance."],
   };
   $("#view-title").textContent = titles[name][0];
@@ -196,6 +212,8 @@ function formData(form) {
   // Include active reward preset
   data.reward_preset_id = state.activePresetId || "baseline";
   data.reward_overrides = state.activePresetOverrides || {};
+  data.terrain_preset_id = state.activeTerrainPresetId || "baseline";
+  data.terrain_overrides = state.activeTerrainPresetOverrides || {};
   return data;
 }
 
@@ -212,8 +230,14 @@ function renderKvGrid(selector, rows) {
     .join("");
 }
 
-function remoteStatusPill(label, className) {
-  return `<span class="status-badge ${className}">${escapeHtml(label)}</span>`;
+function remoteStatusPill(label, value, className, detail = "") {
+  return `
+    <div class="control-status-card ${className}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+    </div>
+  `;
 }
 
 async function loadRemoteStatus() {
@@ -228,10 +252,10 @@ async function loadRemoteStatus() {
   const strip = $("#remote-status-strip");
   if (strip) {
     strip.innerHTML = [
-      remoteStatusPill(status.configured ? "Configured" : "Needs Setup", status.configured ? "status-completed" : "status-interrupted"),
-      remoteStatusPill(status.worker_running ? "Worker Running" : "Worker Stopped", status.worker_running ? "status-running" : "muted-pill"),
-      remoteStatusPill(status.accept_jobs ? "Accepting Jobs" : "Paused", status.accept_jobs ? "status-completed" : "status-interrupted"),
-      remoteStatusPill(status.active_isaac_process_count ? "GPU Busy" : "GPU Free", status.active_isaac_process_count ? "status-running" : "status-completed"),
+      remoteStatusPill("Setup", status.configured ? "Configured" : "Needs Setup", status.configured ? "status-completed" : "status-interrupted", status.env_file_exists ? "env file found" : "env file missing"),
+      remoteStatusPill("Worker", status.worker_running ? "Running" : "Stopped", status.worker_running ? "status-running" : "muted-pill", status.worker_runtime_mode || status.worker_mode || "tmux"),
+      remoteStatusPill("Remote Launch", status.accept_jobs ? "Accepting Jobs" : "Paused", status.accept_jobs ? "status-completed" : "status-interrupted", status.remote_web_url || "RedRHex To Go"),
+      remoteStatusPill("Isaac/GPU", status.active_isaac_process_count ? "Busy" : "Free", status.active_isaac_process_count ? "status-running" : "status-completed", `${status.active_process_count || 0} active process${Number(status.active_process_count || 0) === 1 ? "" : "es"}`),
     ].join("");
   }
 
@@ -691,6 +715,11 @@ function renderRuns() {
             : run.reward_diff_count > 0
               ? `<small><span class="reward-diff-badge">${escapeHtml(String(run.reward_diff_count))} reward override${run.reward_diff_count !== 1 ? "s" : ""}</span></small>`
               : ""}
+          ${run.terrain_preset_id && run.terrain_preset_id !== "baseline"
+            ? `<small><span class="terrain-diff-badge">terrain: ${escapeHtml(run.terrain_preset_id)}</span></small>`
+            : run.terrain_diff_count > 0
+              ? `<small><span class="terrain-diff-badge">${escapeHtml(String(run.terrain_diff_count))} terrain override${run.terrain_diff_count !== 1 ? "s" : ""}</span></small>`
+              : ""}
           <small>${escapeHtml(checkpointSummary(run))}${videoText ? ` · ${escapeHtml(videoText)}` : ""}${onnxText ? ` · ${escapeHtml(onnxText)}` : ""}${escapeHtml(runStatusDetail(run))}${run.has_notes ? " <strong>+ notes</strong>" : ""}</small>
           <div class="run-actions">
             <button type="button" data-action="tensorboard" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTensorboard)} data-tooltip="Open metrics">TensorBoard</button>
@@ -859,6 +888,8 @@ function renderRunDetails() {
     rows.push(["ONNX", onnxText]);
     if (run.reward_preset_id && run.reward_preset_id !== "baseline")
       rows.push(["Reward preset", run.reward_preset_id]);
+    if (run.terrain_preset_id && run.terrain_preset_id !== "baseline")
+      rows.push(["Terrain preset", run.terrain_preset_id]);
     if (run.convergence_detected)
       rows.push(["Converged", `iter ${run.convergence_iteration} (Δ ${run.convergence_improvement_pct?.toFixed(1)}%)`]);
     infoGrid.innerHTML = rows
@@ -971,9 +1002,12 @@ async function selectRun(runId) {
   // Hide reward panel until loaded
   const rewardPanel = $("#reward-config-panel");
   if (rewardPanel) rewardPanel.hidden = true;
+  const terrainPanel = $("#terrain-config-panel");
+  if (terrainPanel) terrainPanel.hidden = true;
   const [notesData] = await Promise.all([
     api(`/api/runs/${encodeURIComponent(runId)}/notes`),
     run.log_dir ? loadRewardConfigForRun(runId) : Promise.resolve(),
+    run.log_dir ? loadTerrainConfigForRun(runId) : Promise.resolve(),
   ]);
   if (!state.selectedRun || state.selectedRun.id !== runId) return;
   $("#notes-editor").value = notesData.notes;
@@ -1206,6 +1240,7 @@ async function startTraining(event) {
     $("#train-status").textContent = `Started ${run.id} with pid ${run.pid}`;
     markHistoryUnread(run.id);
     await loadRuns();
+    await loadActivity();
   } catch (error) {
     $("#train-status").textContent = error.message;
   }
@@ -1238,6 +1273,7 @@ async function saveName() {
   state.renameDirty = false;
   state.renameDraftRunId = null;
   await loadRuns();
+  await loadActivity();
   state.selectedRun = findRun(runId) || data.run || state.selectedRun;
   renderRunDetails();
   renderRuns();
@@ -1485,7 +1521,7 @@ function formatDeletePreview(preview) {
     "It will remove these repo-owned files/directories:",
     paths,
     "",
-    `To confirm, type this exact run id: ${preview.id}`,
+    "Click OK to delete. This cannot be undone.",
   ].join("\n");
 }
 
@@ -1496,14 +1532,13 @@ async function deleteSelectedRun() {
   }
   const runId = state.selectedRun.id;
   const preview = await api(`/api/runs/${encodeURIComponent(runId)}/delete-preview`);
-  const confirmation = window.prompt(formatDeletePreview(preview), "");
-  if (confirmation === null) {
+  if (!window.confirm(formatDeletePreview(preview))) {
     setStatus("Delete cancelled.");
     return;
   }
   const result = await api(`/api/runs/${encodeURIComponent(runId)}/delete`, {
     method: "POST",
-    body: JSON.stringify({ confirmation, delete_logs: true }),
+    body: JSON.stringify({ confirm: true, delete_logs: true }),
   });
   state.selectedRun = null;
   state.debugTarget = null;
@@ -1514,7 +1549,65 @@ async function deleteSelectedRun() {
   $("#debug-status").textContent = "";
   renderVideoPanel(null);
   await loadRuns();
+  await loadActivity();
   setStatus(`Deleted ${result.run_id}. Removed ${result.deleted_paths.length} log/note path(s).`);
+}
+
+function formatBulkDeletePreview(preview) {
+  const lines = [];
+  for (const run of preview.runs || []) {
+    const label = run.display_name || run.id;
+    lines.push(`- ${label}: ${(run.paths || []).length} path(s)`);
+  }
+  if (preview.missing && preview.missing.length) {
+    lines.push(`Missing: ${preview.missing.join(", ")}`);
+  }
+  return [
+    `This permanently deletes ${preview.run_count || 0} selected run(s).`,
+    `Repo-owned paths to remove: ${preview.path_count || 0}`,
+    "",
+    lines.join("\n") || "- No matching runs found.",
+    "",
+    "Click OK to delete. This cannot be undone.",
+  ].join("\n");
+}
+
+async function deleteSelectedRuns() {
+  const runIds = [...state.selectedRunIds];
+  if (!runIds.length) {
+    setStatus("Select one or more runs first.");
+    return;
+  }
+  const preview = await api("/api/runs/delete-preview", {
+    method: "POST",
+    body: JSON.stringify({ run_ids: runIds, delete_logs: true }),
+  });
+  if (!preview.run_count) {
+    setStatus("No selected runs can be deleted.");
+    return;
+  }
+  if (!window.confirm(formatBulkDeletePreview(preview))) {
+    setStatus("Bulk delete cancelled.");
+    return;
+  }
+  const result = await api("/api/runs/delete", {
+    method: "POST",
+    body: JSON.stringify({ run_ids: runIds, delete_logs: true, confirm: true }),
+  });
+  state.selectedRunIds.clear();
+  if (state.selectedRun && result.run_ids.includes(state.selectedRun.id)) {
+    state.selectedRun = null;
+    state.debugTarget = null;
+    state.lastDebug = null;
+    $("#notes-editor").value = "";
+    $("#debug-command").textContent = "";
+    $("#debug-log").textContent = "";
+    $("#debug-status").textContent = "";
+    renderVideoPanel(null);
+  }
+  await loadRuns();
+  await loadActivity();
+  setStatus(`Deleted ${result.deleted_count} run${result.deleted_count === 1 ? "" : "s"}. Removed ${result.deleted_paths.length} log/note path(s).`);
 }
 
 async function handleRunAction(action, runId, processId = "") {
@@ -1662,11 +1755,49 @@ function renderRewardEditor(preset, defaults, isEditable) {
   }).join("");
 
   $("#reward-categories").innerHTML = html;
+  updateCategoryToggleButton("#reward-categories", "#preset-collapse-all-btn");
 }
 
 function toggleRewardCategory(header) {
   header.classList.toggle("collapsed");
   header.nextElementSibling.classList.toggle("collapsed");
+  updateCategoryToggleButton("#reward-categories", "#preset-collapse-all-btn");
+}
+
+function allCategoryBodiesCollapsed(containerSelector) {
+  const container = $(containerSelector);
+  if (!container) return false;
+  const bodies = Array.from(container.querySelectorAll(".reward-category-body"));
+  return bodies.length > 0 && bodies.every((body) => body.classList.contains("collapsed"));
+}
+
+function updateCategoryToggleButton(containerSelector, buttonSelector) {
+  const button = $(buttonSelector);
+  const container = $(containerSelector);
+  if (!button || !container) return;
+  const hasCategories = container.querySelector(".reward-category-body") !== null;
+  button.disabled = !hasCategories;
+  button.textContent = allCategoryBodiesCollapsed(containerSelector) ? "Expand All" : "Collapse All";
+}
+
+function setCategoryGroupCollapsed(containerSelector, collapsed) {
+  const container = $(containerSelector);
+  if (!container) return;
+  container.querySelectorAll(".reward-category").forEach((category) => {
+    const header = category.querySelector(".reward-category-header");
+    const body = category.querySelector(".reward-category-body");
+    if (header) header.classList.toggle("collapsed", collapsed);
+    if (body) body.classList.toggle("collapsed", collapsed);
+  });
+}
+
+function toggleCategoryGroupCollapsed(containerSelector, buttonSelector) {
+  setCategoryGroupCollapsed(containerSelector, !allCategoryBodiesCollapsed(containerSelector));
+  updateCategoryToggleButton(containerSelector, buttonSelector);
+}
+
+function toggleRewardCategoriesCollapsed() {
+  toggleCategoryGroupCollapsed("#reward-categories", "#preset-collapse-all-btn");
 }
 
 function renderPresets() {
@@ -1679,7 +1810,7 @@ function renderPresets() {
       <div class="preset-card-desc">${escapeHtml(p.description)}</div>
     </div>`
   ).join("");
-  document.querySelectorAll(".preset-card").forEach((card) => {
+  document.querySelectorAll(".preset-card[data-preset-id]").forEach((card) => {
     card.addEventListener("click", () => selectPresetForEdit(card.dataset.presetId));
   });
   // Update training form indicator
@@ -1696,6 +1827,16 @@ function selectPresetForEdit(presetId) {
 
   $("#reward-editor-title").textContent = preset.name;
   $("#reward-editor-desc").textContent = preset.description;
+  const nameInput = $("#reward-profile-name");
+  const descInput = $("#reward-profile-description");
+  if (nameInput) {
+    nameInput.value = preset.name || "";
+    nameInput.disabled = Boolean(preset.built_in);
+  }
+  if (descInput) {
+    descInput.value = preset.description || "";
+    descInput.disabled = Boolean(preset.built_in);
+  }
   const builtInBadge = $("#preset-builtin-badge");
   builtInBadge.hidden = !preset.built_in;
 
@@ -1705,6 +1846,7 @@ function selectPresetForEdit(presetId) {
   activateBtn.textContent = isActive ? "✓ Active for Training" : "Use for Training";
   activateBtn.style.fontWeight = isActive ? "900" : "";
 
+  $("#preset-collapse-all-btn").disabled = false;
   $("#preset-duplicate-btn").disabled = false;
   $("#preset-delete-btn").disabled = preset.built_in;
   $("#preset-save-btn").disabled = preset.built_in;
@@ -1756,6 +1898,7 @@ async function activatePreset(presetId) {
   state.activePresetOverrides = active ? (active.values || {}) : {};
   renderPresets();
   if (state.selectedPresetId === presetId) selectPresetForEdit(presetId);
+  await loadActivity();
 }
 
 async function duplicatePreset(sourcePresetId) {
@@ -1777,6 +1920,7 @@ async function deletePreset(presetId) {
   if (!window.confirm(`Delete preset "${preset.name}"? This cannot be undone.`)) return;
   await api(`/api/presets/${encodeURIComponent(presetId)}/delete`, { method: "POST", body: JSON.stringify({}) });
   await loadRewardsPage();
+  await loadActivity();
 }
 
 async function savePresetChanges(presetId) {
@@ -1791,14 +1935,23 @@ async function savePresetChanges(presetId) {
   });
   await api(`/api/presets/${encodeURIComponent(presetId)}/update`, {
     method: "POST",
-    body: JSON.stringify({ values }),
+    body: JSON.stringify({
+      name: $("#reward-profile-name")?.value || preset.name,
+      description: $("#reward-profile-description")?.value || "",
+      values,
+    }),
   });
   // Reload and re-select
-  state.presets = (await api("/api/presets")).presets;
+  const presetData = await api("/api/presets");
+  state.presets = presetData.presets;
+  state.activePresetId = presetData.active_preset_id || state.activePresetId;
+  const active = state.presets.find((p) => p.id === state.activePresetId);
+  state.activePresetOverrides = active ? (active.values || {}) : {};
   const updated = state.presets.find((p) => p.id === presetId);
   if (updated) {
     renderPresets();
     selectPresetForEdit(presetId);
+    await loadActivity();
   }
 }
 
@@ -1811,6 +1964,301 @@ async function createNewPreset() {
   });
   await loadRewardsPage();
   selectPresetForEdit(preset.id);
+  await loadActivity();
+}
+
+// ============================================================
+// Terrain & Presets Page
+// ============================================================
+
+const TERRAIN_CATEGORY_ORDER = [
+  "Importer", "Physics Material", "Curriculum", "Generator",
+  "Flat", "Random Rough", "Wave", "Stairs", "Boxes",
+];
+
+function terrainMeta(key) {
+  return state.terrainSchema.find((item) => item.key === key) || { key, label: key, category: "Other", type: "string" };
+}
+
+function terrainValueString(value) {
+  if (Array.isArray(value)) return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function parseTerrainInput(input, meta) {
+  if (meta.type === "bool") return input.checked;
+  if (meta.type === "int") {
+    const parsed = parseInt(input.value, 10);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  if (meta.type === "float") {
+    const parsed = parseFloat(input.value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  if (meta.type === "range" || meta.type === "list") {
+    const raw = input.value.trim();
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map((item) => Number(item)) : parsed;
+    } catch {
+      return raw.split(",").map((item) => Number(item.trim())).filter((item) => !Number.isNaN(item));
+    }
+  }
+  return input.value;
+}
+
+function terrainInputHtml(key, value, meta, isEditable) {
+  const disabled = isEditable ? "" : "disabled";
+  const valueText = escapeHtml(terrainValueString(value));
+  if (!isEditable) return `<code class="terrain-value-code">${valueText}</code>`;
+  if (meta.type === "bool") {
+    return `<input class="terrain-row-input" data-key="${escapeHtml(key)}" data-type="bool" type="checkbox" ${value ? "checked" : ""} ${disabled} />`;
+  }
+  if (meta.type === "choice") {
+    const choices = meta.choices || [];
+    return `<select class="terrain-row-input" data-key="${escapeHtml(key)}" data-type="${escapeHtml(meta.type)}" ${disabled}>
+      ${choices.map((choice) => `<option value="${escapeHtml(choice)}" ${String(value) === String(choice) ? "selected" : ""}>${escapeHtml(choice)}</option>`).join("")}
+    </select>`;
+  }
+  if (meta.type === "int" || meta.type === "float") {
+    const step = meta.step || (meta.type === "int" ? 1 : 0.01);
+    return `<input class="terrain-row-input" data-key="${escapeHtml(key)}" data-type="${escapeHtml(meta.type)}" type="number" step="${escapeHtml(String(step))}" value="${valueText}" ${disabled} />`;
+  }
+  return `<input class="terrain-row-input terrain-wide-input" data-key="${escapeHtml(key)}" data-type="${escapeHtml(meta.type)}" value="${valueText}" ${disabled} />`;
+}
+
+function renderTerrainEditor(preset, defaults, schema, isEditable) {
+  const categories = {};
+  for (const meta of schema) {
+    const cat = meta.category || "Other";
+    if (!categories[cat]) categories[cat] = [];
+    const key = meta.key;
+    const currentValue = (preset.values && preset.values[key] !== undefined)
+      ? preset.values[key]
+      : (defaults[key] !== undefined ? defaults[key] : "");
+    const isOverridden = preset.values && key in preset.values;
+    categories[cat].push({ key, meta, value: currentValue, isOverridden });
+  }
+  const orderedCategories = [
+    ...TERRAIN_CATEGORY_ORDER,
+    ...Object.keys(categories).filter((cat) => !TERRAIN_CATEGORY_ORDER.includes(cat)).sort(),
+  ];
+  const html = orderedCategories.map((cat) => {
+    const rows = categories[cat] || [];
+    if (!rows.length) return "";
+    const rowsHtml = rows.map(({ key, meta, value, isOverridden }) => {
+      const overrideMark = isOverridden ? ` <span style="color:var(--amber);font-size:11px;">●</span>` : "";
+      return `
+        <div class="reward-row terrain-row">
+          <div class="reward-row-meta">
+            <div class="reward-row-label">${escapeHtml(meta.label || key)}${overrideMark}</div>
+            <div class="reward-row-desc">${escapeHtml(meta.description || "")}</div>
+            <div class="reward-row-varname">${escapeHtml(key)}</div>
+          </div>
+          <code class="terrain-value-code">${escapeHtml(terrainValueString(value))}</code>
+          <div>${terrainInputHtml(key, value, meta, isEditable)}</div>
+        </div>`;
+    }).join("");
+    return `
+      <div class="reward-category">
+        <div class="reward-category-header" onclick="toggleTerrainCategory(this)">
+          <span class="category-arrow">▼</span> ${escapeHtml(cat)}
+        </div>
+        <div class="reward-category-body">${rowsHtml}</div>
+      </div>`;
+  }).join("");
+  $("#terrain-categories").innerHTML = html;
+  updateCategoryToggleButton("#terrain-categories", "#terrain-preset-collapse-all-btn");
+}
+
+function toggleTerrainCategory(header) {
+  header.classList.toggle("collapsed");
+  header.nextElementSibling.classList.toggle("collapsed");
+  updateCategoryToggleButton("#terrain-categories", "#terrain-preset-collapse-all-btn");
+}
+
+function toggleTerrainCategoriesCollapsed() {
+  toggleCategoryGroupCollapsed("#terrain-categories", "#terrain-preset-collapse-all-btn");
+}
+
+function renderTerrainPresets() {
+  const { terrainPresets, activeTerrainPresetId, selectedTerrainPresetId } = state;
+  $("#terrain-preset-list").innerHTML = terrainPresets.map((p) => `
+    <div class="preset-card ${p.id === selectedTerrainPresetId ? "selected" : ""} ${p.id === activeTerrainPresetId ? "active-for-training" : ""}"
+         data-terrain-preset-id="${escapeHtml(p.id)}"
+         title="${escapeHtml(p.description)}">
+      <div class="preset-card-name">${escapeHtml(p.name)}</div>
+      <div class="preset-card-desc">${escapeHtml(p.description)}</div>
+    </div>`
+  ).join("");
+  document.querySelectorAll(".preset-card[data-terrain-preset-id]").forEach((card) => {
+    card.addEventListener("click", () => selectTerrainPresetForEdit(card.dataset.terrainPresetId));
+  });
+  const activePreset = terrainPresets.find((p) => p.id === activeTerrainPresetId) || { name: activeTerrainPresetId };
+  const el = $("#train-active-terrain-preset-name");
+  if (el) el.textContent = activePreset.name || activeTerrainPresetId;
+}
+
+function selectTerrainPresetForEdit(presetId) {
+  const preset = state.terrainPresets.find((p) => p.id === presetId);
+  if (!preset) return;
+  state.selectedTerrainPresetId = presetId;
+  renderTerrainPresets();
+  $("#terrain-editor-title").textContent = preset.name;
+  $("#terrain-editor-desc").textContent = preset.description;
+  const nameInput = $("#terrain-profile-name");
+  const descInput = $("#terrain-profile-description");
+  if (nameInput) {
+    nameInput.value = preset.name || "";
+    nameInput.disabled = Boolean(preset.built_in);
+  }
+  if (descInput) {
+    descInput.value = preset.description || "";
+    descInput.disabled = Boolean(preset.built_in);
+  }
+  $("#terrain-preset-builtin-badge").hidden = !preset.built_in;
+  const isActive = preset.id === state.activeTerrainPresetId;
+  const activateBtn = $("#terrain-preset-activate-btn");
+  activateBtn.disabled = false;
+  activateBtn.textContent = isActive ? "✓ Active for Training" : "Use for Training";
+  activateBtn.style.fontWeight = isActive ? "900" : "";
+  $("#terrain-preset-collapse-all-btn").disabled = false;
+  $("#terrain-preset-duplicate-btn").disabled = false;
+  $("#terrain-preset-delete-btn").disabled = preset.built_in;
+  $("#terrain-preset-save-btn").disabled = preset.built_in;
+  renderTerrainEditor(preset, state.terrainDefaults, state.terrainSchema, !preset.built_in);
+}
+
+async function loadTerrainPage() {
+  let presetsData;
+  let terrainData;
+  try {
+    [presetsData, terrainData] = await Promise.all([
+      api("/api/terrain/presets"),
+      api("/api/terrain"),
+    ]);
+  } catch (error) {
+    state.terrainPresets = [];
+    state.terrainDefaults = {};
+    state.terrainSchema = [];
+    state.activeTerrainPresetOverrides = {};
+    $("#terrain-preset-list").innerHTML = `<article class="empty-panel">Terrain API is unavailable. Restart the local panel so the backend reloads the terrain feature.</article>`;
+    $("#terrain-categories").innerHTML = "";
+    $("#terrain-files").innerHTML = "";
+    $("#terrain-values").innerHTML = "";
+    $("#terrain-preset-activate-btn").disabled = true;
+    $("#terrain-preset-collapse-all-btn").disabled = true;
+    $("#terrain-preset-duplicate-btn").disabled = true;
+    $("#terrain-preset-delete-btn").disabled = true;
+    $("#terrain-preset-save-btn").disabled = true;
+    setTerrainStatus(error.message);
+    return;
+  }
+  setTerrainStatus("");
+  state.terrainPresets = presetsData.presets || [];
+  state.activeTerrainPresetId = presetsData.active_preset_id || "baseline";
+  state.terrainDefaults = terrainData.terrain_defaults || {};
+  state.terrainSchema = terrainData.field_schema || [];
+  const active = state.terrainPresets.find((p) => p.id === state.activeTerrainPresetId);
+  state.activeTerrainPresetOverrides = active ? (active.values || {}) : {};
+  renderTerrainPresets();
+  if (terrainData.files) {
+    $("#terrain-files").innerHTML = terrainData.files.map((file) => `
+      <article class="card">
+        <strong>${escapeHtml(file.title)}</strong>
+        <small>${escapeHtml(file.why)}</small>
+        <small>${escapeHtml(file.absolute_path)}</small>
+        <span class="pill">${file.exists ? "found" : "missing"}</span>
+      </article>`).join("");
+  }
+  if (terrainData.terrain_values) {
+    $("#terrain-values").innerHTML = terrainData.terrain_values.map((item) => `
+      <div class="scale-row">
+        <div><strong>${escapeHtml(item.key)}</strong><small>${escapeHtml(item.relative_path)}</small></div>
+        <code>${escapeHtml(terrainValueString(item.value))}</code>
+        <small>${escapeHtml(terrainMeta(item.key).category || "Terrain")}</small>
+      </div>`).join("");
+  }
+  if (state.activeTerrainPresetId) selectTerrainPresetForEdit(state.activeTerrainPresetId);
+}
+
+async function activateTerrainPreset(presetId) {
+  await api("/api/terrain/presets/activate", { method: "POST", body: JSON.stringify({ preset_id: presetId }) });
+  state.activeTerrainPresetId = presetId;
+  const active = state.terrainPresets.find((p) => p.id === presetId);
+  state.activeTerrainPresetOverrides = active ? (active.values || {}) : {};
+  renderTerrainPresets();
+  if (state.selectedTerrainPresetId === presetId) selectTerrainPresetForEdit(presetId);
+  await loadActivity();
+}
+
+async function duplicateTerrainPreset(sourcePresetId) {
+  const source = state.terrainPresets.find((p) => p.id === sourcePresetId);
+  if (!source) return;
+  const name = window.prompt(`Name for the new terrain preset (copy of ${source.name}):`, `${source.name} (copy)`);
+  if (!name) return;
+  const newPreset = await api("/api/terrain/presets", {
+    method: "POST",
+    body: JSON.stringify({ name, description: source.description, values: source.values }),
+  });
+  await loadTerrainPage();
+  selectTerrainPresetForEdit(newPreset.id);
+}
+
+async function deleteTerrainPreset(presetId) {
+  const preset = state.terrainPresets.find((p) => p.id === presetId);
+  if (!preset || preset.built_in) return;
+  if (!window.confirm(`Delete terrain preset "${preset.name}"? This cannot be undone.`)) return;
+  await api(`/api/terrain/presets/${encodeURIComponent(presetId)}/delete`, { method: "POST", body: JSON.stringify({}) });
+  await loadTerrainPage();
+  await loadActivity();
+}
+
+async function saveTerrainPresetChanges(presetId) {
+  const preset = state.terrainPresets.find((p) => p.id === presetId);
+  if (!preset || preset.built_in) return;
+  const values = {};
+  document.querySelectorAll("#terrain-categories .terrain-row-input").forEach((input) => {
+    const key = input.dataset.key;
+    if (!key) return;
+    values[key] = parseTerrainInput(input, terrainMeta(key));
+  });
+  await api(`/api/terrain/presets/${encodeURIComponent(presetId)}/update`, {
+    method: "POST",
+    body: JSON.stringify({
+      name: $("#terrain-profile-name")?.value || preset.name,
+      description: $("#terrain-profile-description")?.value || "",
+      values,
+    }),
+  });
+  const presetData = await api("/api/terrain/presets");
+  state.terrainPresets = presetData.presets;
+  state.activeTerrainPresetId = presetData.active_preset_id || state.activeTerrainPresetId;
+  const active = state.terrainPresets.find((p) => p.id === state.activeTerrainPresetId);
+  state.activeTerrainPresetOverrides = active ? (active.values || {}) : {};
+  const updated = state.terrainPresets.find((p) => p.id === presetId);
+  if (updated) {
+    renderTerrainPresets();
+    selectTerrainPresetForEdit(presetId);
+    await loadActivity();
+    setTerrainStatus("Terrain preset saved.");
+  }
+}
+
+async function createNewTerrainPreset() {
+  const name = window.prompt("New terrain preset name:");
+  if (!name || !name.trim()) return;
+  const preset = await api("/api/terrain/presets", {
+    method: "POST",
+    body: JSON.stringify({ name: name.trim(), description: "", values: {} }),
+  });
+  await loadTerrainPage();
+  selectTerrainPresetForEdit(preset.id);
+  await loadActivity();
+  setTerrainStatus(`Created terrain preset ${preset.name}.`);
 }
 
 // Run detail: reward config panel
@@ -1839,6 +2287,41 @@ async function loadRewardConfigForRun(runId) {
         <span class="diff-name">${escapeHtml(meta.label || item.name)}</span>
         <span class="diff-value">${item.yaml_value}</span>
         <span class="diff-baseline">← default: ${item.default_value !== null ? item.default_value : "?"}</span>
+        ${deltaHtml}
+      </div>`;
+    }).join("");
+    content.innerHTML = presetLine + rows;
+    panel.hidden = false;
+  } catch {
+    panel.hidden = true;
+  }
+}
+
+async function loadTerrainConfigForRun(runId) {
+  const panel = $("#terrain-config-panel");
+  const content = $("#terrain-config-content");
+  if (!panel || !content) return;
+  try {
+    const data = await api(`/api/runs/${encodeURIComponent(runId)}/terrain-config`);
+    if (!data.changed || data.changed.length === 0) {
+      content.innerHTML = `<p class="muted-copy">All terrain values are at default for this run.</p>`;
+      panel.hidden = false;
+      return;
+    }
+    const presetLine = data.preset_id && data.preset_id !== "baseline"
+      ? `<p class="muted-copy">Preset: <strong>${escapeHtml(data.preset_id)}</strong></p>`
+      : "";
+    const rows = data.changed.map((item) => {
+      const meta = terrainMeta(item.name);
+      const delta = item.delta_pct !== null ? item.delta_pct : null;
+      const dir = delta !== null ? (delta > 0 ? "up" : "down") : "";
+      const deltaHtml = delta !== null
+        ? `<span class="diff-delta ${dir}">${delta > 0 ? "+" : ""}${delta}%</span>`
+        : "";
+      return `<div class="reward-diff-row">
+        <span class="diff-name">${escapeHtml(meta.label || item.name)}</span>
+        <span class="diff-value">${escapeHtml(terrainValueString(item.yaml_value))}</span>
+        <span class="diff-baseline">← default: ${escapeHtml(terrainValueString(item.default_value !== null ? item.default_value : "?"))}</span>
         ${deltaHtml}
       </div>`;
     }).join("");
@@ -1891,6 +2374,8 @@ function renderComparisonPanel(runA, runB) {
     comparisonRowHtml("Checkpoint iter", iterA !== null ? iterA : "—", iterB !== null ? iterB : "—"),
     comparisonRowHtml("Reward preset", runA.reward_preset_id || "baseline", runB.reward_preset_id || "baseline"),
     comparisonRowHtml("Reward overrides", runA.reward_diff_count || 0, runB.reward_diff_count || 0),
+    comparisonRowHtml("Terrain preset", runA.terrain_preset_id || "baseline", runB.terrain_preset_id || "baseline"),
+    comparisonRowHtml("Terrain overrides", runA.terrain_diff_count || 0, runB.terrain_diff_count || 0),
     comparisonRowHtml("Return code", runA.returncode, runB.returncode),
     comparisonRowHtml("Has notes", runA.has_notes ? "Yes" : "No", runB.has_notes ? "Yes" : "No"),
     comparisonRowHtml("Has video", runA.has_video ? "Yes" : "No", runB.has_video ? "Yes" : "No"),
@@ -1930,10 +2415,12 @@ function updateBulkToolbar() {
   const count = $("#bulk-selected-count");
   const move = $("#move-selected-runs");
   const clear = $("#clear-selected-runs");
+  const deleteButton = $("#delete-selected-runs");
   const selectedCount = state.selectedRunIds.size;
   if (count) count.textContent = `${selectedCount} selected`;
   if (move) move.disabled = selectedCount === 0;
   if (clear) clear.disabled = selectedCount === 0;
+  if (deleteButton) deleteButton.disabled = selectedCount === 0;
 }
 
 function toggleRunSelection(runId, checked) {
@@ -2005,6 +2492,7 @@ function renderFolderSidebar() {
       return `<div class="folder-item ${active}" data-folder="${escapeHtml(f)}">
         <span class="folder-name">${escapeHtml(f)}</span>
         <span class="folder-count">${folderCounts[f] || 0}</span>
+        <button type="button" class="folder-rename-button" data-folder="${escapeHtml(f)}" data-tooltip="Rename folder">Rename</button>
         <button type="button" class="folder-delete-button" data-folder="${escapeHtml(f)}" data-tooltip="Remove folder">×</button>
       </div>`;
     })
@@ -2037,6 +2525,12 @@ function renderFolderSidebar() {
       deleteFolder(button.dataset.folder).catch(handleActionError);
     });
   });
+  sidebar.querySelectorAll(".folder-rename-button").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      promptRenameFolder(button.dataset.folder).catch(handleActionError);
+    });
+  });
   sidebar.querySelectorAll(".folder-item").forEach((item) => {
     item.addEventListener("click", () => {
       const raw = item.dataset.folder;
@@ -2065,7 +2559,30 @@ async function deleteFolder(folderName) {
   if (state.activeFolder === folder) state.activeFolder = "";
   await loadRuns();
   await loadFolders();
+  await loadActivity();
   setStatus(`Removed folder ${folder}. Moved ${data.moved_count || 0} run${data.moved_count === 1 ? "" : "s"} to Uncategorized.`);
+}
+
+async function renameFolder(oldName, newName) {
+  const data = await api("/api/folders/rename", {
+    method: "POST",
+    body: JSON.stringify({ old_name: oldName, new_name: newName }),
+  });
+  state.folders = data.folders || state.folders;
+  if (state.activeFolder === oldName) state.activeFolder = data.new_folder;
+  await loadRuns();
+  await loadFolders();
+  await loadActivity();
+  setStatus(`Renamed folder ${data.old_folder} to ${data.new_folder}.`);
+  return data;
+}
+
+async function promptRenameFolder(folderName) {
+  const oldName = String(folderName || "").trim();
+  if (!oldName) return;
+  const nextName = window.prompt("Rename folder:", oldName);
+  if (!nextName || !nextName.trim() || nextName.trim() === oldName) return;
+  await renameFolder(oldName, nextName.trim());
 }
 
 function renderFolderOptions() {
@@ -2103,6 +2620,7 @@ async function createFolder(folderName) {
   });
   state.folders = data.folders || state.folders;
   await loadFolders();
+  await loadActivity();
   setStatus(`Created folder ${data.folder}.`);
   return data.folder;
 }
@@ -2115,8 +2633,75 @@ async function promptCreateFolder() {
   if (bulkSelect) bulkSelect.value = folder;
 }
 
+// ============================================================
+// Activity Log
+// ============================================================
+
+function analyticsList(items) {
+  if (!items || !items.length) return "No data yet";
+  return items.slice(0, 3).map((item) => `${item[0]} (${item[1]})`).join(" · ");
+}
+
+function activityCard(label, value, detail) {
+  return `
+    <article class="activity-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+      <small>${escapeHtml(detail || "")}</small>
+    </article>
+  `;
+}
+
+function renderActivity() {
+  const analytics = state.activityAnalytics || {};
+  const cards = $("#activity-analytics");
+  if (cards) {
+    cards.innerHTML = [
+      activityCard("Events", analytics.total_events || 0, "local and remote"),
+      activityCard("Run Starts", analytics.run_starts || 0, analyticsList(analytics.most_used_profiles)),
+      activityCard("Deletes", analytics.deletes || 0, "single and bulk cleanup"),
+      activityCard("Members", (analytics.requests_by_member || []).length, analyticsList(analytics.requests_by_member)),
+    ].join("");
+  }
+  const events = $("#activity-events");
+  if (!events) return;
+  if (!state.activityEvents.length) {
+    events.innerHTML = `<article class="empty-panel">No activity recorded yet.</article>`;
+    return;
+  }
+  events.innerHTML = state.activityEvents.map((event) => {
+    const payload = event.payload || {};
+    const detail = [
+      event.subject_id || payload.run_id || payload.job_id || "",
+      event.status || payload.status || "",
+    ].filter(Boolean).join(" · ");
+    return `
+      <article class="activity-event ${event.source === "remote" ? "remote" : "local"}">
+        <div>
+          <strong>${escapeHtml(event.summary || event.event_type)}</strong>
+          <small>${escapeHtml(event.actor_name || event.actor_role || "Local panel")} · ${escapeHtml(formatRelativeTime(event.created_at))}</small>
+          ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+        </div>
+        <span class="status-badge ${event.source === "remote" ? "status-running" : "muted-pill"}">${escapeHtml(event.source || "local")}</span>
+      </article>
+    `;
+  }).join("");
+}
+
+async function loadActivity() {
+  try {
+    const data = await api("/api/activity?limit=80");
+    state.activityEvents = data.events || [];
+    state.activityAnalytics = data.analytics || {};
+  } catch {
+    state.activityEvents = [];
+    state.activityAnalytics = {};
+  }
+  renderActivity();
+}
+
 async function refreshAll() {
-  await Promise.all([loadSystem(), loadRemoteStatus(), loadConvergenceSettings(), loadRewardsPage()]);
+  await Promise.all([loadSystem(), loadRemoteStatus(), loadConvergenceSettings(), loadRewardsPage(), loadTerrainPage(), loadActivity()]);
   await loadRuns();
   await loadFolders();
   if (state.selectedRun) setDebugTarget({ type: "run", id: state.selectedRun.id });
@@ -2248,6 +2833,7 @@ async function compactSelectedRun() {
     body: JSON.stringify({ confirmation }),
   });
   await loadRuns();
+  await loadActivity();
   setStatus(`Compacted ${result.run_id}. Deleted ${result.deleted_paths.length} checkpoint(s), freed ${formatBytes(result.bytes_freed)}.`);
 }
 
@@ -2316,6 +2902,22 @@ $("#preset-delete-btn").addEventListener("click", () => {
 $("#preset-save-btn").addEventListener("click", () => {
   if (state.selectedPresetId) savePresetChanges(state.selectedPresetId).catch(handleActionError);
 });
+$("#preset-collapse-all-btn").addEventListener("click", toggleRewardCategoriesCollapsed);
+
+// Terrain page event listeners
+$("#terrain-preset-activate-btn").addEventListener("click", () => {
+  if (state.selectedTerrainPresetId) activateTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
+});
+$("#terrain-preset-duplicate-btn").addEventListener("click", () => {
+  if (state.selectedTerrainPresetId) duplicateTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
+});
+$("#terrain-preset-delete-btn").addEventListener("click", () => {
+  if (state.selectedTerrainPresetId) deleteTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
+});
+$("#terrain-preset-save-btn").addEventListener("click", () => {
+  if (state.selectedTerrainPresetId) saveTerrainPresetChanges(state.selectedTerrainPresetId).catch(handleActionError);
+});
+$("#terrain-preset-collapse-all-btn").addEventListener("click", toggleTerrainCategoriesCollapsed);
 // Search / filter / sort toolbar
 const runSearch = $("#run-search");
 const statusFilterEl = $("#status-filter");
@@ -2325,6 +2927,7 @@ if (statusFilterEl) statusFilterEl.addEventListener("change", () => { state.stat
 if (sortRunsEl) sortRunsEl.addEventListener("change", () => { state.sortKey = sortRunsEl.value; renderRuns(); });
 
 $("#new-preset-btn").addEventListener("click", () => createNewPreset().catch(handleActionError));
+$("#new-terrain-preset-btn").addEventListener("click", () => createNewTerrainPreset().catch(handleActionError));
 const newFolderBtn = $("#new-folder-btn");
 if (newFolderBtn) newFolderBtn.addEventListener("click", () => promptCreateFolder().catch(handleActionError));
 const folderSelect = $("#run-folder-select");
@@ -2335,8 +2938,14 @@ const clearSelectedBtn = $("#clear-selected-runs");
 if (clearSelectedBtn) clearSelectedBtn.addEventListener("click", clearRunSelection);
 const moveSelectedBtn = $("#move-selected-runs");
 if (moveSelectedBtn) moveSelectedBtn.addEventListener("click", () => moveSelectedRunsToFolder().catch(handleActionError));
+const deleteSelectedBtn = $("#delete-selected-runs");
+if (deleteSelectedBtn) deleteSelectedBtn.addEventListener("click", () => deleteSelectedRuns().catch(handleActionError));
 const trainChangePreset = $("#train-change-preset");
 if (trainChangePreset) trainChangePreset.addEventListener("click", () => setView("rewards"));
+const trainChangeTerrainPreset = $("#train-change-terrain-preset");
+if (trainChangeTerrainPreset) trainChangeTerrainPreset.addEventListener("click", () => setView("terrain"));
+const activityRefresh = $("#activity-refresh");
+if (activityRefresh) activityRefresh.addEventListener("click", () => loadActivity().catch(handleActionError));
 const remoteEnable = $("#remote-enable");
 if (remoteEnable) remoteEnable.addEventListener("click", () => saveRemoteAcceptance(true).catch(handleActionError));
 const remoteDisable = $("#remote-disable");

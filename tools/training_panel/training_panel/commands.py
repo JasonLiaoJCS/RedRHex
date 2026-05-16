@@ -50,6 +50,16 @@ VIDEO_PRESETS = {
 }
 
 
+def _normalize_override_value(value: object) -> object:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_normalize_override_value(item) for item in value]
+    return value
+
+
 @dataclass
 class TrainingParams:
     task: str = DEFAULT_TASK
@@ -62,10 +72,13 @@ class TrainingParams:
     checkpoint: str | None = None
     reward_preset_id: str = "baseline"
     reward_overrides: dict = field(default_factory=dict)
+    terrain_preset_id: str = "baseline"
+    terrain_overrides: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainingParams":
         raw_overrides = data.get("reward_overrides") or {}
+        raw_terrain_overrides = data.get("terrain_overrides") or {}
         params = cls(
             task=str(data.get("task") or DEFAULT_TASK),
             num_envs=int(data.get("num_envs") or 4),
@@ -77,6 +90,8 @@ class TrainingParams:
             checkpoint=str(data["checkpoint"]) if data.get("checkpoint") else None,
             reward_preset_id=str(data.get("reward_preset_id") or "baseline"),
             reward_overrides={str(k): float(v) for k, v in raw_overrides.items()},
+            terrain_preset_id=str(data.get("terrain_preset_id") or "baseline"),
+            terrain_overrides={str(k): _normalize_override_value(v) for k, v in raw_terrain_overrides.items()},
         )
         params.validate()
         return params

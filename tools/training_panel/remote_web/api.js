@@ -1,5 +1,5 @@
 import { SUPABASE_ANON_KEY, SUPABASE_URL, VIDEO_BUCKET } from "./config.js";
-import { BUILT_IN_REWARD_PRESETS } from "./core.js";
+import { BUILT_IN_REWARD_PRESETS, BUILT_IN_TERRAIN_PRESETS } from "./core.js";
 
 const TOKEN_KEY = "redrhex_child_access_token";
 const REFRESH_KEY = "redrhex_child_refresh_token";
@@ -114,6 +114,13 @@ export async function update(table, filterQuery, payload) {
   });
 }
 
+export async function remove(table, filterQuery) {
+  return supabaseFetch(`/rest/v1/${table}?${filterQuery}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=representation" },
+  });
+}
+
 export async function upsert(table, payload, onConflict = "id") {
   return supabaseFetch(`/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`, {
     method: "POST",
@@ -141,15 +148,18 @@ export async function createSignedVideoUrl(storagePath, expiresIn = 3600) {
 
 export async function loadRemoteSnapshot(machineId) {
   const encodedMachine = encodeURIComponent(machineId);
-  const [machines, jobs, runs, artifactsResult, presetsResult] = await Promise.all([
+  const [machines, jobs, runs, artifactsResult, presetsResult, terrainPresetsResult, profilesResult] = await Promise.all([
     select("machines", `select=*&order=heartbeat_at.desc`),
     select("jobs", `select=*&order=created_at.desc&limit=60`),
     select("runs", `select=*&order=created_at.desc&limit=120`),
     optionalSelect("artifacts", `select=*&order=created_at.desc&limit=200`),
     optionalSelect("reward_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
+    optionalSelect("terrain_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
+    optionalSelect("profiles", `select=id,email,display_name,role`),
   ]);
   const artifacts = artifactsResult.rows;
   const presets = presetsResult.ok ? presetsResult.rows : BUILT_IN_REWARD_PRESETS;
+  const terrainPresets = terrainPresetsResult.ok ? terrainPresetsResult.rows : BUILT_IN_TERRAIN_PRESETS;
   return {
     machines,
     machine: machines.find((machine) => machine.machine_id === machineId) || machines[0] || null,
@@ -157,14 +167,19 @@ export async function loadRemoteSnapshot(machineId) {
     jobs: jobs.filter((job) => !job.machine_id || job.machine_id === machineId || job.claimed_by === machineId),
     runs: runs.filter((run) => !run.machine_id || run.machine_id === machineId || machineId === ""),
     artifacts: artifacts.filter((artifact) => !artifact.machine_id || artifact.machine_id === machineId || machineId === ""),
+    profiles: profilesResult.rows,
     presets,
+    terrainPresets,
     encodedMachine,
     schema: {
       artifacts: artifactsResult.ok,
       rewardPresets: presetsResult.ok,
+      terrainPresets: terrainPresetsResult.ok,
       warnings: [
         artifactsResult.ok ? "" : `Artifacts table unavailable: ${artifactsResult.error}`,
         presetsResult.ok ? "" : `Reward presets table unavailable: ${presetsResult.error}`,
+        terrainPresetsResult.ok ? "" : `Terrain presets table unavailable: ${terrainPresetsResult.error}`,
+        profilesResult.ok ? "" : `Profiles table unavailable: ${profilesResult.error}`,
       ].filter(Boolean),
     },
   };

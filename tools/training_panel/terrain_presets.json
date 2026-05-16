@@ -1,0 +1,144 @@
+{
+  "active_preset_id": "baseline",
+  "presets": [
+    {
+      "id": "baseline",
+      "name": "Baseline",
+      "description": "The current terrain defaults from redrhex_env_cfg.py.",
+      "built_in": true,
+      "values": {}
+    },
+    {
+      "id": "flat-debug",
+      "name": "Flat Debug",
+      "description": "For quick debugging on a plane with terrain curriculum disabled.",
+      "built_in": true,
+      "values": {
+        "terrain.terrain_type": "plane",
+        "terrain.max_init_terrain_level": 0,
+        "terrain_curriculum_enable": false,
+        "terrain_curriculum_levels": [
+          0.0
+        ]
+      }
+    },
+    {
+      "id": "mild-mixed",
+      "name": "Mild Mixed",
+      "description": "A gentle rough/wave/stairs/boxes mix for early terrain training.",
+      "built_in": true,
+      "values": {
+        "terrain.terrain_type": "generator",
+        "terrain.max_init_terrain_level": 1,
+        "terrain.terrain_generator.difficulty_range": [
+          0.0,
+          0.1
+        ],
+        "terrain_curriculum_enable": true,
+        "terrain_curriculum_levels": [
+          0.0,
+          0.05,
+          0.1,
+          0.16,
+          0.24
+        ],
+        "terrain.terrain_generator.sub_terrains.random_rough.noise_range": [
+          0.005,
+          0.035
+        ],
+        "terrain.terrain_generator.sub_terrains.wave.amplitude_range": [
+          0.005,
+          0.035
+        ],
+        "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [
+          0.01,
+          0.07
+        ],
+        "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [
+          0.01,
+          0.07
+        ]
+      }
+    },
+    {
+      "id": "rough-mixed",
+      "name": "Rough Mixed",
+      "description": "A stronger mixed-terrain profile for robustness work.",
+      "built_in": true,
+      "values": {
+        "terrain.terrain_type": "generator",
+        "terrain.max_init_terrain_level": 2,
+        "terrain.terrain_generator.difficulty_range": [
+          0.0,
+          0.3
+        ],
+        "terrain_curriculum_enable": true,
+        "terrain_curriculum_levels": [
+          0.0,
+          0.12,
+          0.28,
+          0.45,
+          0.7
+        ],
+        "terrain.terrain_generator.sub_terrains.flat.proportion": 0.1,
+        "terrain.terrain_generator.sub_terrains.random_rough.proportion": 0.3,
+        "terrain.terrain_generator.sub_terrains.wave.proportion": 0.2,
+        "terrain.terrain_generator.sub_terrains.stairs.proportion": 0.2,
+        "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.2,
+        "terrain.terrain_generator.sub_terrains.random_rough.noise_range": [
+          0.02,
+          0.08
+        ],
+        "terrain.terrain_generator.sub_terrains.wave.amplitude_range": [
+          0.02,
+          0.08
+        ],
+        "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [
+          0.03,
+          0.15
+        ],
+        "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [
+          0.03,
+          0.15
+        ]
+      }
+    },
+    {
+      "id": "stairs-boxes",
+      "name": "Stairs + Boxes",
+      "description": "Focused obstacle profile for step and box-grid adaptation.",
+      "built_in": true,
+      "values": {
+        "terrain.terrain_type": "generator",
+        "terrain.max_init_terrain_level": 2,
+        "terrain.terrain_generator.difficulty_range": [
+          0.0,
+          0.25
+        ],
+        "terrain_curriculum_enable": true,
+        "terrain_curriculum_levels": [
+          0.0,
+          0.1,
+          0.22,
+          0.38,
+          0.55
+        ],
+        "terrain.terrain_generator.sub_terrains.flat.proportion": 0.1,
+        "terrain.terrain_generator.sub_terrains.random_rough.proportion": 0.1,
+        "terrain.terrain_generator.sub_terrains.wave.proportion": 0.05,
+        "terrain.terrain_generator.sub_terrains.stairs.proportion": 0.4,
+        "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.35,
+        "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [
+          0.02,
+          0.14
+        ],
+        "terrain.terrain_generator.sub_terrains.stairs.step_width": 0.25,
+        "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.4,
+        "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [
+          0.02,
+          0.14
+        ]
+      }
+    }
+  ]
+}

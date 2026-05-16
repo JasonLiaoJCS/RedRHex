@@ -194,6 +194,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if _applied:
             print(f"[INFO] Training panel reward overrides applied: {', '.join(_applied)}")
 
+    # Apply terrain overrides written by the training panel (if any)
+    _terrain_override_file = Path(__file__).parents[2] / "tools" / "training_panel" / "active_terrain_override.json"
+    if _terrain_override_file.exists():
+        import json as _json
+        from tools.training_panel.training_panel.terrain import apply_terrain_overrides
+
+        _terrain_overrides = _json.loads(_terrain_override_file.read_text(encoding="utf-8"))
+        _applied = apply_terrain_overrides(env_cfg, _terrain_overrides)
+        if _applied:
+            print(f"[INFO] Training panel terrain overrides applied: {', '.join(_applied)}")
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 

@@ -62,6 +62,10 @@ class PanelPaths:
         return self.panel_log_root / "runs.json"
 
     @property
+    def activity_file(self) -> Path:
+        return self.panel_log_root / "activity.jsonl"
+
+    @property
     def remote_state_file(self) -> Path:
         return self.panel_log_root / "remote_state.json"
 
@@ -76,6 +80,10 @@ class PanelPaths:
     @property
     def reward_override_file(self) -> Path:
         return self.repo_root / "tools" / "training_panel" / "active_reward_override.json"
+
+    @property
+    def terrain_override_file(self) -> Path:
+        return self.repo_root / "tools" / "training_panel" / "active_terrain_override.json"
 
     def ensure_dirs(self) -> None:
         self.panel_log_root.mkdir(parents=True, exist_ok=True)

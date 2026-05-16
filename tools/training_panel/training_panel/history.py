@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import PanelPaths
 from .rewards import read_reward_scales_from_yaml, reward_defaults, reward_diff
+from .terrain import read_terrain_values_from_yaml, terrain_defaults, terrain_diff
 
 MODEL_RE = re.compile(r"model_(\d+)\.pt$")
 
@@ -83,11 +84,12 @@ class HistoryStore:
         self.paths.ensure_dirs()
 
     def _load_data(self) -> dict:
-        data = _read_json(self.paths.history_file, {"runs": [], "folders": []})
+        data = _read_json(self.paths.history_file, {"runs": [], "folders": [], "deleted_runs": []})
         if not isinstance(data, dict):
-            data = {"runs": [], "folders": []}
+            data = {"runs": [], "folders": [], "deleted_runs": []}
         data.setdefault("runs", [])
         data.setdefault("folders", [])
+        data.setdefault("deleted_runs", [])
         return data
 
     def _save_data(self, data: dict) -> None:
@@ -106,10 +108,69 @@ class HistoryStore:
     def _note_path(self, run_id: str) -> Path:
         return self.paths.notes_dir / f"{_safe_note_id(run_id)}.md"
 
+    def _deleted_run_matches(self, entry: Any, run_id: str, log_dir: str | None = None) -> bool:
+        if isinstance(entry, str):
+            return entry == run_id
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("id") == run_id:
+            return True
+        if log_dir and entry.get("log_dir") == log_dir:
+            return True
+        if log_dir and entry.get("log_dir_name") == Path(log_dir).name:
+            return True
+        return False
+
+    def _is_deleted_run(self, data: dict, run_id: str, log_dir: str | None = None) -> bool:
+        return any(self._deleted_run_matches(entry, run_id, log_dir) for entry in data.get("deleted_runs", []))
+
+    def _forget_deleted_run(self, data: dict, run_id: str, log_dir: str | None = None) -> None:
+        data["deleted_runs"] = [
+            entry for entry in data.get("deleted_runs", []) if not self._deleted_run_matches(entry, run_id, log_dir)
+        ]
+
+    def _prune_deleted_run_records(self, data: dict, run_id: str, log_dir: str | None = None) -> None:
+        data["runs"] = [
+            record
+            for record in data.get("runs", [])
+            if not self._deleted_run_matches({"id": record.get("id"), "log_dir": record.get("log_dir")}, run_id, log_dir)
+        ]
+
+    def _remember_deleted_run(self, data: dict, run_id: str, run: dict | None = None, log_dir: str | None = None) -> None:
+        existing = list(data.get("deleted_runs", []))
+        if any(self._deleted_run_matches(entry, run_id, log_dir) for entry in existing):
+            data["deleted_runs"] = existing
+            return
+        entry = {
+            "id": run_id,
+            "deleted_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        source = (run or {}).get("source")
+        if source:
+            entry["source"] = source
+        resolved_log_dir = log_dir or (run or {}).get("log_dir")
+        if resolved_log_dir:
+            entry["log_dir"] = str(resolved_log_dir)
+            entry["log_dir_name"] = Path(str(resolved_log_dir)).name
+        existing.append(entry)
+        data["deleted_runs"] = existing
+
+    def deleted_run_tombstones(self) -> list[dict]:
+        tombstones = []
+        for entry in self._load_data().get("deleted_runs", []):
+            if isinstance(entry, str):
+                tombstones.append({"id": entry})
+            elif isinstance(entry, dict) and entry.get("id"):
+                tombstones.append(dict(entry))
+        return tombstones
+
     def add_run(self, record: dict) -> None:
-        records = self._load_records()
+        data = self._load_data()
+        self._forget_deleted_run(data, str(record.get("id") or ""), str(record.get("log_dir") or "") or None)
+        records = list(data.get("runs", []))
         records.append(record)
-        self._save_records(records)
+        data["runs"] = records
+        self._save_data(data)
 
     def update_run(self, run_id: str, **updates: Any) -> None:
         records = self._load_records()
@@ -121,6 +182,11 @@ class HistoryStore:
         self._save_records(records)
 
     def patch_run_metadata(self, run_id: str, **updates: Any) -> dict:
+        data = self._load_data()
+        if self._is_deleted_run(data, run_id, str(updates.get("log_dir") or "") or None):
+            self._prune_deleted_run_records(data, run_id, str(updates.get("log_dir") or "") or None)
+            self._save_data(data)
+            return {"id": run_id, "deleted": True, **updates}
         records = self._load_records()
         now = datetime.now().isoformat(timespec="seconds")
         for record in records:
@@ -192,6 +258,41 @@ class HistoryStore:
         self._save_data(data)
         return {"folder": folder, "removed": removed, "moved_count": moved_count}
 
+    def rename_folder(self, old_name: str, new_name: str) -> dict:
+        old_folder = old_name.strip()
+        new_folder = new_name.strip()
+        if not old_folder:
+            raise ValueError("folder name is required")
+        if not new_folder:
+            raise ValueError("new folder name is required")
+        if len(new_folder) > 80:
+            raise ValueError("folder name must be 80 characters or fewer")
+        if old_folder == new_folder:
+            return {"old_folder": old_folder, "new_folder": new_folder, "renamed": False, "moved_count": 0}
+
+        existing = self.get_folders()
+        if old_folder not in existing:
+            raise ValueError("folder not found")
+        if any(folder.lower() == new_folder.lower() and folder != old_folder for folder in existing):
+            raise ValueError("folder already exists")
+
+        data = self._load_data()
+        folders = {str(folder).strip() for folder in data.get("folders", []) if str(folder).strip()}
+        folders.discard(old_folder)
+        folders.add(new_folder)
+        now = datetime.now().isoformat(timespec="seconds")
+        moved_count = 0
+        records = []
+        for record in data.get("runs", []):
+            if record.get("folder") == old_folder:
+                record = {**record, "folder": new_folder, "updated_at": now}
+                moved_count += 1
+            records.append(record)
+        data["folders"] = sorted(folders, key=str.lower)
+        data["runs"] = records
+        self._save_data(data)
+        return {"old_folder": old_folder, "new_folder": new_folder, "renamed": True, "moved_count": moved_count}
+
     def link_run_to_log(self, run_id: str, log_dir: str, status: str, returncode: int | None) -> dict:
         records = self._load_records()
         now = datetime.now().isoformat(timespec="seconds")
@@ -207,7 +308,14 @@ class HistoryStore:
                 primary = record
                 continue
             if is_duplicate:
-                for key in ("folder", "display_name", "reward_preset_id", "reward_overrides"):
+                for key in (
+                    "folder",
+                    "display_name",
+                    "reward_preset_id",
+                    "reward_overrides",
+                    "terrain_preset_id",
+                    "terrain_overrides",
+                ):
                     if record.get(key) and key not in duplicate_metadata:
                         duplicate_metadata[key] = record[key]
                 continue
@@ -237,10 +345,20 @@ class HistoryStore:
         return self.get_run(run_id) or {"id": run_id, "display_name": name}
 
     def get_note(self, run_id: str) -> str:
+        if self._is_deleted_run(self._load_data(), run_id):
+            return ""
         path = self._note_path(run_id)
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def set_note(self, run_id: str, text: str) -> None:
+        data = self._load_data()
+        if self._is_deleted_run(data, run_id):
+            self._prune_deleted_run_records(data, run_id)
+            note_path = self._note_path(run_id)
+            if note_path.exists():
+                note_path.unlink()
+            self._save_data(data)
+            return
         self.paths.ensure_dirs()
         path = self._note_path(run_id)
         path.write_text(text, encoding="utf-8")
@@ -276,7 +394,8 @@ class HistoryStore:
         return runs
 
     def list_runs(self) -> list[dict]:
-        records = self._load_records()
+        data = self._load_data()
+        records = list(data.get("runs", []))
         discovered_runs = self.discover_rsl_runs()
         discovered_by_id = {run["id"]: run for run in discovered_runs}
         discovered_by_log_dir = {run.get("log_dir"): run for run in discovered_runs if run.get("log_dir")}
@@ -284,6 +403,8 @@ class HistoryStore:
         represented_ids = set()
         represented_log_dirs = set()
         for record in records:
+            if self._is_deleted_run(data, str(record.get("id") or ""), str(record.get("log_dir") or "") or None):
+                continue
             discovered = discovered_by_id.get(record.get("id")) or discovered_by_log_dir.get(record.get("log_dir"))
             merged_record = {**(discovered or {}), **record}
             merged.append(merged_record)
@@ -293,10 +414,13 @@ class HistoryStore:
             represented_ids.add(record.get("id"))
             represented_log_dirs.add(record.get("log_dir"))
         for discovered in discovered_runs:
+            if self._is_deleted_run(data, str(discovered.get("id") or ""), str(discovered.get("log_dir") or "") or None):
+                continue
             if discovered["id"] in represented_ids or discovered.get("log_dir") in represented_log_dirs:
                 continue
             merged.append(discovered)
         defaults = reward_defaults(self.paths.repo_root)
+        terrain_current_defaults = terrain_defaults(self.paths.repo_root)
         for record in merged:
             run_id = record.get("id", "")
             note_text = self.get_note(run_id)
@@ -317,8 +441,15 @@ class HistoryStore:
                     record["reward_diff_count"] = len(diff["changed"])
                 else:
                     record.setdefault("reward_diff_count", 0)
+                if env_yaml.exists() and terrain_current_defaults:
+                    yaml_terrain = read_terrain_values_from_yaml(env_yaml)
+                    terrain_config_diff = terrain_diff(yaml_terrain, terrain_current_defaults)
+                    record["terrain_diff_count"] = len(terrain_config_diff["changed"])
+                else:
+                    record.setdefault("terrain_diff_count", 0)
             else:
                 record.setdefault("reward_diff_count", 0)
+                record.setdefault("terrain_diff_count", 0)
         return sorted(merged, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def find_latest_log_after(self, start_time: float) -> str | None:
@@ -413,6 +544,25 @@ class HistoryStore:
             **diff,
         }
 
+    def get_terrain_config_for_run(self, run_id: str) -> dict | None:
+        """Return terrain diff between this run's saved params/env.yaml and current defaults."""
+        run = self.get_run(run_id)
+        if not run or not run.get("log_dir"):
+            return None
+        log_dir = Path(run["log_dir"])
+        env_yaml = log_dir / "params" / "env.yaml"
+        if not env_yaml.exists():
+            return None
+        defaults = terrain_defaults(self.paths.repo_root)
+        yaml_values = read_terrain_values_from_yaml(env_yaml)
+        diff = terrain_diff(yaml_values, defaults)
+        return {
+            "run_id": run_id,
+            "preset_id": run.get("terrain_preset_id"),
+            "env_yaml": str(env_yaml),
+            **diff,
+        }
+
     def get_folders(self) -> list[str]:
         """Return sorted list of explicit and run-assigned folder names."""
         data = self._load_data()
@@ -432,29 +582,76 @@ class HistoryStore:
         if not run:
             return None
         paths = []
+        seen_paths: set[str] = set()
         log_dir = Path(run["log_dir"]) if run.get("log_dir") else None
         process_log = Path(run["process_log"]) if run.get("process_log") else None
         note_path = self._note_path(run_id)
-        if log_dir and log_dir.exists():
-            paths.append({"kind": "rsl_rl_log_dir", "path": str(log_dir), "is_dir": True})
-        if process_log and process_log.exists():
-            paths.append({"kind": "panel_process_log", "path": str(process_log), "is_dir": False})
-        if note_path.exists():
-            paths.append({"kind": "panel_note", "path": str(note_path), "is_dir": False})
+
+        def add_path(kind: str, path: Path | None, is_dir: bool = False) -> None:
+            if not path or not path.exists():
+                return
+            path_text = str(path)
+            if path_text in seen_paths:
+                return
+            seen_paths.add(path_text)
+            paths.append({"kind": kind, "path": path_text, "is_dir": is_dir})
+
+        add_path("rsl_rl_log_dir", log_dir, is_dir=True)
+        add_path("panel_process_log", process_log)
+        add_path("panel_exit_file", Path(run["exit_file"]) if run.get("exit_file") else None)
+        add_path("panel_video_process_log", Path(run["video_process_log"]) if run.get("video_process_log") else None)
+        add_path("panel_video_exit_file", Path(run["video_exit_file"]) if run.get("video_exit_file") else None)
+        add_path("panel_onnx_process_log", Path(run["onnx_process_log"]) if run.get("onnx_process_log") else None)
+        add_path("panel_onnx_exit_file", Path(run["onnx_exit_file"]) if run.get("onnx_exit_file") else None)
+        add_path("panel_note", note_path)
         return {
             "id": run_id,
             "display_name": run.get("display_name"),
             "status": run.get("status"),
             "source": run.get("source"),
+            "log_dir": str(log_dir) if log_dir else None,
             "paths": paths,
             "history_record": True,
             "requires_confirmation": run_id,
             "warning": "This permanently removes the run from the panel and deletes the listed repo-owned log/note files.",
         }
 
-    def delete_run(self, run_id: str, confirmation: str, delete_logs: bool = True) -> dict:
-        if confirmation != run_id:
+    def bulk_delete_preview(self, run_ids: list[str], delete_logs: bool = True) -> dict:
+        cleaned_ids = []
+        seen: set[str] = set()
+        for raw_id in run_ids:
+            run_id = str(raw_id or "").strip()
+            if run_id and run_id not in seen:
+                cleaned_ids.append(run_id)
+                seen.add(run_id)
+        if not cleaned_ids:
+            raise ValueError("at least one run_id is required")
+
+        previews = []
+        missing = []
+        total_paths = 0
+        for run_id in cleaned_ids:
+            preview = self.delete_preview(run_id)
+            if not preview:
+                missing.append(run_id)
+                continue
+            preview["delete_logs"] = delete_logs
+            previews.append(preview)
+            total_paths += len(preview.get("paths") or [])
+        return {
+            "run_ids": cleaned_ids,
+            "runs": previews,
+            "missing": missing,
+            "run_count": len(previews),
+            "path_count": total_paths,
+            "delete_logs": delete_logs,
+            "warning": "This permanently removes selected runs from the panel and deletes repo-owned log/note files.",
+        }
+
+    def delete_run(self, run_id: str, confirmation: str = "", delete_logs: bool = True, confirm: bool = False) -> dict:
+        if not confirm and confirmation != run_id:
             raise ValueError("Type the exact run id to confirm deletion")
+        run = self.get_run(run_id)
         preview = self.delete_preview(run_id)
         if not preview:
             raise ValueError("Run not found")
@@ -473,15 +670,36 @@ class HistoryStore:
                     path.unlink()
                 deleted_paths.append(str(path))
 
-        records = self._load_records()
+        data = self._load_data()
+        records = list(data.get("runs", []))
         log_dir = next((item["path"] for item in preview["paths"] if item["kind"] == "rsl_rl_log_dir"), None)
         kept = [
             record
             for record in records
             if record.get("id") != run_id and (not log_dir or record.get("log_dir") != log_dir)
         ]
-        self._save_records(kept)
+        data["runs"] = kept
+        self._remember_deleted_run(data, run_id, run=run, log_dir=log_dir or preview.get("log_dir"))
+        self._save_data(data)
         return {"deleted": True, "run_id": run_id, "deleted_paths": deleted_paths}
+
+    def bulk_delete_runs(self, run_ids: list[str], delete_logs: bool = True, confirm: bool = False) -> dict:
+        if not confirm:
+            raise ValueError("confirm must be true for bulk deletion")
+        preview = self.bulk_delete_preview(run_ids, delete_logs=delete_logs)
+        deleted = []
+        deleted_paths = []
+        for item in preview["runs"]:
+            result = self.delete_run(str(item["id"]), delete_logs=delete_logs, confirm=True)
+            deleted.append(result["run_id"])
+            deleted_paths.extend(result["deleted_paths"])
+        return {
+            "deleted": True,
+            "run_ids": deleted,
+            "missing": preview["missing"],
+            "deleted_paths": deleted_paths,
+            "deleted_count": len(deleted),
+        }
 
     def compact_preview(self, run_id: str) -> dict:
         run = self.get_run(run_id)

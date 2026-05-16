@@ -97,6 +97,32 @@ class HistoryTests(unittest.TestCase):
             self.assertNotIn("Archive", store.get_folders())
             self.assertIsNone(listed["2026_run"].get("folder"))
 
+    def test_rename_folder_updates_assigned_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026_run"
+            run.mkdir(parents=True)
+            (run / "model_0.pt").write_text("x", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+            store.assign_runs_to_folder(["2026_run"], "Drafts")
+
+            result = store.rename_folder("Drafts", "Reviewed")
+            listed = {item["id"]: item for item in store.list_runs()}
+
+            self.assertTrue(result["renamed"])
+            self.assertEqual(result["moved_count"], 1)
+            self.assertIn("Reviewed", store.get_folders())
+            self.assertNotIn("Drafts", store.get_folders())
+            self.assertEqual(listed["2026_run"]["folder"], "Reviewed")
+
+    def test_rename_folder_rejects_duplicate_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoryStore(self.make_paths(Path(tmp)))
+            store.create_folder("A")
+            store.create_folder("B")
+            with self.assertRaises(ValueError):
+                store.rename_folder("A", "B")
+
     def test_assign_discovered_run_to_folder_persists_after_list_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -177,6 +203,103 @@ class HistoryTests(unittest.TestCase):
             self.assertFalse(run.exists())
             self.assertEqual(store.get_run("failed_run"), None)
             self.assertEqual(store.get_note("failed_run"), "")
+
+    def test_delete_run_can_use_boolean_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "logs" / "rsl_rl" / "redrhex_wheg" / "failed_run"
+            run.mkdir(parents=True)
+            (run / "events.out.tfevents.test").write_text("x", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+
+            result = store.delete_run("failed_run", confirm=True)
+
+            self.assertTrue(result["deleted"])
+            self.assertFalse(run.exists())
+
+    def test_delete_run_tombstone_prevents_metadata_recreation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            store.add_run({"id": "failed_panel_run", "source": "training_panel", "created_at": "2026-05-16T12:00:00"})
+
+            result = store.delete_run("failed_panel_run", confirm=True)
+            store.patch_run_metadata("failed_panel_run", display_name="remote rename")
+            store.set_note("failed_panel_run", "remote note")
+
+            self.assertTrue(result["deleted"])
+            self.assertIsNone(store.get_run("failed_panel_run"))
+            self.assertEqual(store.get_note("failed_panel_run"), "")
+            self.assertFalse(any(record.get("id") == "failed_panel_run" for record in store._load_data()["runs"]))
+
+    def test_delete_run_removes_panel_sidecar_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            process_log = root / "logs" / "training_panel" / "process_logs" / "panel_run.log"
+            exit_file = root / "logs" / "training_panel" / "process_logs" / "panel_run.exit"
+            video_log = root / "logs" / "training_panel" / "process_logs" / "video_run.log"
+            for path in (process_log, exit_file, video_log):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+            store.add_run(
+                {
+                    "id": "failed_panel_run",
+                    "source": "training_panel",
+                    "created_at": "2026-05-16T12:00:00",
+                    "process_log": str(process_log),
+                    "exit_file": str(exit_file),
+                    "video_process_log": str(video_log),
+                }
+            )
+
+            preview = store.delete_preview("failed_panel_run")
+            kinds = {item["kind"] for item in preview["paths"]}
+            result = store.delete_run("failed_panel_run", confirm=True)
+
+            self.assertIn("panel_process_log", kinds)
+            self.assertIn("panel_exit_file", kinds)
+            self.assertIn("panel_video_process_log", kinds)
+            self.assertEqual(len(result["deleted_paths"]), 3)
+            self.assertFalse(process_log.exists())
+            self.assertFalse(exit_file.exists())
+            self.assertFalse(video_log.exists())
+
+    def test_bulk_delete_preview_and_confirm_delete_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for run_id in ("run_a", "run_b"):
+                run = root / "logs" / "rsl_rl" / "redrhex_wheg" / run_id
+                run.mkdir(parents=True)
+                (run / "events.out.tfevents.test").write_text("x", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+
+            preview = store.bulk_delete_preview(["run_a", "run_b"], delete_logs=True)
+            self.assertEqual(preview["run_count"], 2)
+            self.assertEqual(preview["path_count"], 2)
+
+            with self.assertRaises(ValueError):
+                store.bulk_delete_runs(["run_a", "run_b"], confirm=False)
+
+            result = store.bulk_delete_runs(["run_a", "run_b"], confirm=True)
+            self.assertEqual(result["deleted_count"], 2)
+            self.assertEqual(store.get_run("run_a"), None)
+            self.assertEqual(store.get_run("run_b"), None)
+
+    def test_bulk_delete_running_guard_groups_active_processes(self):
+        class FakeProcesses:
+            def running_for_run(self, run_id):
+                if run_id == "run_b":
+                    return [{"id": "proc_b", "source_run_id": "run_b", "kind": "training"}]
+                return []
+
+        handler = object.__new__(PanelHandler)
+        handler.state = type("FakeState", (), {"processes": FakeProcesses()})()
+
+        self.assertEqual(
+            handler._running_by_run(["run_a", "run_b"]),
+            {"run_b": [{"id": "proc_b", "source_run_id": "run_b", "kind": "training"}]},
+        )
 
     def test_compact_preview_keeps_highest_iteration_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:

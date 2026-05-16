@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.training_panel.training_panel.commands import VideoParams, export_onnx_argv, play_argv, shell_for_command
+from tools.training_panel.training_panel.commands import TrainingParams, VideoParams, export_onnx_argv, play_argv, shell_for_command
 from tools.training_panel.training_panel.config import PanelPaths
 
 
@@ -63,6 +63,26 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--export_policy_only", argv)
         self.assertEqual(argv[argv.index("--device") + 1], "cuda:0")
         self.assertEqual(argv[argv.index("--checkpoint") + 1], "/tmp/model_10.pt")
+
+    def test_training_params_accept_terrain_overrides(self):
+        params = TrainingParams.from_dict(
+            {
+                "task": "Template-Redrhex-Direct-v0",
+                "num_envs": 4,
+                "max_iterations": 1,
+                "device": "cuda:0",
+                "terrain_preset_id": "flat-debug",
+                "terrain_overrides": {
+                    "terrain.terrain_type": "plane",
+                    "terrain_curriculum_enable": False,
+                    "terrain_curriculum_levels": [0.0],
+                },
+            }
+        )
+        self.assertEqual(params.terrain_preset_id, "flat-debug")
+        self.assertEqual(params.terrain_overrides["terrain.terrain_type"], "plane")
+        self.assertEqual(params.terrain_overrides["terrain_curriculum_enable"], False)
+        self.assertEqual(params.terrain_overrides["terrain_curriculum_levels"], [0.0])
 
 
 if __name__ == "__main__":

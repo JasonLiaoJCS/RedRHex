@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .commands import DEFAULT_VIDEO_PRESET, TrainingParams, VideoParams
 from .config import PanelPaths
-from .history import HistoryStore
+from .history import HistoryStore, checkpoint_inventory
 from .processes import ProcessRegistry
 from .remote_config import (
     RemoteConfig,
@@ -28,8 +28,37 @@ def _storage_safe(value: str) -> str:
     return safe or "run"
 
 
+def _checkpoint_iteration(path: str) -> int | None:
+    match = re.search(r"model_(\d+)\.pt$", str(path or ""))
+    return int(match.group(1)) if match else None
+
+
 def run_artifacts(run: dict) -> list[dict]:
     artifacts = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_artifact(kind: str, path: str | None) -> None:
+        if not path:
+            return
+        local_path = str(path)
+        key = (kind, local_path)
+        if key in seen:
+            return
+        seen.add(key)
+        artifact = {
+            "kind": kind,
+            "path": local_path,
+            "local_path": local_path,
+            "run_id": run.get("id"),
+        }
+        try:
+            file_path = Path(local_path)
+            if file_path.is_file():
+                artifact["bytes"] = file_path.stat().st_size
+        except OSError:
+            pass
+        artifacts.append(artifact)
+
     mapping = {
         "checkpoint": run.get("latest_checkpoint"),
         "video": run.get("latest_video"),
@@ -37,21 +66,16 @@ def run_artifacts(run: dict) -> list[dict]:
         "process_log": run.get("process_log"),
     }
     for kind, path in mapping.items():
-        if path:
-            local_path = str(path)
-            artifact = {
-                "kind": kind,
-                "path": local_path,
-                "local_path": local_path,
-                "run_id": run.get("id"),
-            }
-            try:
-                file_path = Path(local_path)
-                if file_path.is_file():
-                    artifact["bytes"] = file_path.stat().st_size
-            except OSError:
-                pass
-            artifacts.append(artifact)
+        add_artifact(kind, path)
+    log_dir = Path(str(run.get("log_dir") or ""))
+    if log_dir.is_dir():
+        for _, checkpoint in checkpoint_inventory(log_dir):
+            add_artifact("checkpoint", str(checkpoint))
+        video_dir = log_dir / "videos" / "play"
+        if video_dir.is_dir():
+            for video in sorted(video_dir.glob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True):
+                if video.is_file():
+                    add_artifact("video", str(video))
     return artifacts
 
 
@@ -122,20 +146,35 @@ class RemoteJobExecutor:
 
         if job_type in {"record_video", "export_onnx"}:
             run = self._run_with_checkpoint(str(payload.get("run_id") or ""))
+            checkpoint = self._checkpoint_for_payload(run, payload)
             if job_type == "record_video":
                 result = self.processes.start_video_recording(
                     run_id=str(run["id"]),
-                    checkpoint=str(run["latest_checkpoint"]),
+                    checkpoint=str(checkpoint),
                     device=str(payload.get("device") or "cuda:0"),
                     video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
                 )
             else:
                 result = self.processes.start_onnx_export(
                     run_id=str(run["id"]),
-                    checkpoint=str(run["latest_checkpoint"]),
+                    checkpoint=str(checkpoint),
                     device=str(payload.get("device") or "cuda:0"),
                 )
+            result["checkpoint"] = str(checkpoint)
+            result["checkpoint_iteration"] = _checkpoint_iteration(str(checkpoint))
             return RemoteJobResult(local_run_id=str(run["id"]), process_id=result.get("id"), payload=result)
+
+        if job_type == "tensorboard":
+            run_id = str(payload.get("run_id") or "")
+            run = self.history.get_run(run_id) or {}
+            log_dir = Path(str(run.get("log_dir") or self.paths.rsl_rl_log_root))
+            result = self.processes.start_tensorboard(
+                host=str(payload.get("host") or "0.0.0.0"),
+                port=int(payload["port"]) if payload.get("port") else None,
+                logdir=log_dir,
+                source_run_id=run_id or None,
+            )
+            return RemoteJobResult(local_run_id=run_id or None, process_id=result.get("id"), payload=result)
 
         if job_type == "compact_run":
             run_id = str(payload.get("run_id") or "")
@@ -162,6 +201,37 @@ class RemoteJobExecutor:
         if not run or not run.get("latest_checkpoint"):
             raise ValueError("No checkpoint found for run")
         return run
+
+    def _checkpoint_for_payload(self, run: dict, payload: dict) -> Path:
+        requested = str(payload.get("checkpoint") or "").strip()
+        log_dir_value = str(run.get("log_dir") or "")
+        log_dir = Path(log_dir_value) if log_dir_value else None
+        if requested:
+            checkpoint = Path(requested).expanduser()
+            if not checkpoint.is_absolute() and log_dir:
+                checkpoint = log_dir / checkpoint
+            if not checkpoint.is_file():
+                raise ValueError(f"Checkpoint does not exist: {checkpoint}")
+            if log_dir and log_dir.is_dir():
+                try:
+                    resolved = checkpoint.resolve()
+                    resolved_log = log_dir.resolve()
+                    if resolved != resolved_log and resolved_log not in resolved.parents:
+                        raise ValueError("Checkpoint must be inside the selected run log directory")
+                except OSError as exc:
+                    raise ValueError(f"Checkpoint could not be resolved: {checkpoint}") from exc
+            return checkpoint
+        iteration = payload.get("checkpoint_iteration")
+        if iteration is not None and log_dir and log_dir.is_dir():
+            try:
+                target_iteration = int(iteration)
+            except (TypeError, ValueError):
+                raise ValueError("checkpoint_iteration must be an integer") from None
+            for checkpoint_iteration, checkpoint in checkpoint_inventory(log_dir):
+                if checkpoint_iteration == target_iteration:
+                    return checkpoint
+            raise ValueError(f"No checkpoint found for iteration {target_iteration}")
+        return Path(str(run["latest_checkpoint"]))
 
     def sync_runs_payload(self) -> list[dict]:
         runs = self.history.list_runs()
@@ -252,6 +322,7 @@ class RemoteWorker:
 
     def sync_runs(self) -> list[dict]:
         self.pull_remote_run_metadata()
+        self.sync_deleted_runs()
         runs = []
         artifacts = []
         artifact_errors = []
@@ -277,6 +348,37 @@ class RemoteWorker:
         if artifact_errors:
             self.last_sync_error = "; ".join(artifact_errors[-3:])
         return runs
+
+    def sync_deleted_runs(self) -> int:
+        deleted_count = 0
+        for tombstone in self.history.deleted_run_tombstones():
+            for query in self._deleted_run_queries(tombstone):
+                self.client.delete("runs", query=query)
+                deleted_count += 1
+        return deleted_count
+
+    def _deleted_run_queries(self, tombstone: dict) -> list[dict]:
+        queries = []
+        seen: set[tuple[tuple[str, str], ...]] = set()
+
+        def add(query: dict) -> None:
+            normalized = tuple(sorted((str(key), str(value)) for key, value in query.items()))
+            if normalized in seen:
+                return
+            seen.add(normalized)
+            queries.append(query)
+
+        run_id = str(tombstone.get("id") or "").strip()
+        log_dir = str(tombstone.get("log_dir") or "").strip()
+        log_dir_name = str(tombstone.get("log_dir_name") or "").strip()
+        base = {"machine_id": f"eq.{self.config.machine_id}"}
+        if run_id:
+            add({**base, "id": f"eq.{run_id}"})
+        if log_dir_name and log_dir_name != run_id:
+            add({**base, "id": f"eq.{log_dir_name}"})
+        if log_dir:
+            add({**base, "log_dir": f"eq.{log_dir}"})
+        return queries
 
     def sync_if_due(self, force: bool = False) -> str:
         now = time.time()

@@ -8,10 +8,11 @@ import shutil
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from tools.training_panel import __version__
 
+from .activity import ActivityStore
 from .commands import DEFAULT_TASK, DEFAULT_VIDEO_PRESET, VIDEO_PRESETS, TrainingParams, VideoParams
 from .config import PanelPaths
 from .history import HistoryStore
@@ -20,10 +21,12 @@ from .processes import ProcessRegistry, ProcessStartError
 from .remote_config import RemoteStateStore
 from .remote_manager import RemoteWorkerManager
 from .rewards import reward_defaults, reward_file_index
+from .terrain import TerrainPresetStore, terrain_defaults, terrain_file_index
 
 
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 _PRESET_FILE = Path(__file__).resolve().parents[1] / "reward_presets.json"
+_TERRAIN_PRESET_FILE = Path(__file__).resolve().parents[1] / "terrain_presets.json"
 
 
 def route_id(path: str) -> str:
@@ -47,6 +50,8 @@ class PanelState:
         self.history = HistoryStore(paths)
         self.processes = ProcessRegistry(paths, self.history)
         self.presets = PresetStore(_PRESET_FILE)
+        self.terrain_presets = TerrainPresetStore(_TERRAIN_PRESET_FILE)
+        self.activity = ActivityStore(paths)
         self.remote_state = RemoteStateStore(paths.remote_state_file)
         self.remote_worker = RemoteWorkerManager(paths, self.remote_state)
         self.remote_worker.autostart_if_enabled()
@@ -73,6 +78,15 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "ssh_tunnel_hint": "ssh -L 8080:127.0.0.1:8080 user@host",
                 }
             )
+        if parsed.path == "/api/activity":
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["80"])[0])
+            except ValueError:
+                limit = 80
+            limit = max(1, min(limit, 200))
+            include_remote = query.get("remote", ["1"])[0] not in {"0", "false", "False"}
+            return self._json(self.state.activity.snapshot(limit=limit, include_remote=include_remote))
         if parsed.path == "/api/remote/status":
             processes = self.state.processes.list_processes()
             active_isaac = self.state.processes.running_isaac_processes()
@@ -106,6 +120,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             if config is None:
                 return self._json({"error": "No reward config found for run"}, status=404)
             return self._json(config)
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/terrain-config"):
+            run_id = route_id(parsed.path)
+            config = self.state.history.get_terrain_config_for_run(run_id)
+            if config is None:
+                return self._json({"error": "No terrain config found for run"}, status=404)
+            return self._json(config)
         if parsed.path == "/api/folders":
             return self._json({"folders": self.state.history.get_folders()})
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/video"):
@@ -127,6 +147,21 @@ class PanelHandler(BaseHTTPRequestHandler):
             return self._json(reward_file_index(self.state.paths.repo_root))
         if parsed.path == "/api/rewards/defaults":
             return self._json(reward_defaults(self.state.paths.repo_root))
+        if parsed.path == "/api/terrain":
+            return self._json(terrain_file_index(self.state.paths.repo_root))
+        if parsed.path == "/api/terrain/defaults":
+            return self._json(terrain_defaults(self.state.paths.repo_root))
+        if parsed.path == "/api/terrain/presets":
+            return self._json({
+                "presets": self.state.terrain_presets.list_presets(),
+                "active_preset_id": self.state.terrain_presets.get_active_preset_id(),
+            })
+        if parsed.path.startswith("/api/terrain/presets/") and not parsed.path.endswith("/update") and not parsed.path.endswith("/delete"):
+            preset_id = route_id2(parsed.path)
+            preset = self.state.terrain_presets.get_preset(preset_id)
+            if not preset:
+                return self._json({"error": "Terrain preset not found"}, status=404)
+            return self._json(preset)
         if parsed.path == "/api/presets":
             return self._json({
                 "presets": self.state.presets.list_presets(),
@@ -159,7 +194,19 @@ class PanelHandler(BaseHTTPRequestHandler):
             payload = self._payload()
             if parsed.path == "/api/training/start":
                 params = TrainingParams.from_dict(payload)
-                return self._json(self.state.processes.start_training(params), status=201)
+                run = self.state.processes.start_training(params)
+                self._record_activity(
+                    "training_start",
+                    summary=f"Started training {run.get('id')}",
+                    subject_id=str(run.get("id") or ""),
+                    payload={
+                        "run_id": run.get("id"),
+                        "reward_preset_id": params.reward_preset_id,
+                        "terrain_preset_id": params.terrain_preset_id,
+                        "params": params.to_dict(),
+                    },
+                )
+                return self._json(run, status=201)
             if parsed.path == "/api/remote/settings":
                 state = self.state.remote_worker.save_settings(payload)
                 return self._json({"saved": True, "remote_state": state, "status": self.state.remote_worker.status()})
@@ -176,6 +223,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 if not name:
                     return self._json({"error": "name is required"}, status=400)
                 preset = self.state.presets.create_preset(name, description, values)
+                self._record_activity(
+                    "reward_preset_create",
+                    summary=f"Created reward profile {preset.get('name')}",
+                    subject_id=str(preset.get("id") or ""),
+                    payload={"reward_preset_id": preset.get("id")},
+                )
                 return self._json(preset, status=201)
             if parsed.path.startswith("/api/presets/") and parsed.path.endswith("/update"):
                 preset_id = route_id(parsed.path)
@@ -190,6 +243,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                     preset = self.state.presets.update_preset(preset_id, **updates)
                 except (KeyError, ValueError) as exc:
                     return self._json({"error": str(exc)}, status=400)
+                self._record_activity(
+                    "reward_preset_edit",
+                    summary=f"Edited reward profile {preset.get('name')}",
+                    subject_id=preset_id,
+                    payload={"reward_preset_id": preset_id},
+                )
                 return self._json(preset)
             if parsed.path.startswith("/api/presets/") and parsed.path.endswith("/delete"):
                 preset_id = route_id(parsed.path)
@@ -197,6 +256,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                     deleted = self.state.presets.delete_preset(preset_id)
                 except ValueError as exc:
                     return self._json({"error": str(exc)}, status=400)
+                if deleted:
+                    self._record_activity(
+                        "reward_preset_delete",
+                        summary=f"Deleted reward profile {preset_id}",
+                        subject_id=preset_id,
+                        payload={"reward_preset_id": preset_id},
+                    )
                 return self._json({"deleted": deleted})
             if parsed.path == "/api/presets/activate":
                 preset_id = str(payload.get("preset_id") or "")
@@ -204,21 +270,151 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self.state.presets.set_active_preset(preset_id)
                 except KeyError as exc:
                     return self._json({"error": str(exc)}, status=404)
+                self._record_activity(
+                    "reward_preset_activate",
+                    summary=f"Activated reward profile {preset_id}",
+                    subject_id=preset_id,
+                    payload={"reward_preset_id": preset_id},
+                )
+                return self._json({"active_preset_id": preset_id})
+            if parsed.path == "/api/terrain/presets":
+                name = str(payload.get("name") or "").strip()
+                description = str(payload.get("description") or "").strip()
+                values = dict(payload.get("values") or {})
+                if not name:
+                    return self._json({"error": "name is required"}, status=400)
+                preset = self.state.terrain_presets.create_preset(name, description, values)
+                self._record_activity(
+                    "terrain_preset_create",
+                    summary=f"Created terrain profile {preset.get('name')}",
+                    subject_id=str(preset.get("id") or ""),
+                    payload={"terrain_preset_id": preset.get("id")},
+                )
+                return self._json(preset, status=201)
+            if parsed.path.startswith("/api/terrain/presets/") and parsed.path.endswith("/update"):
+                preset_id = route_id2(parsed.path)
+                updates: dict = {}
+                if "name" in payload:
+                    updates["name"] = str(payload["name"])
+                if "description" in payload:
+                    updates["description"] = str(payload["description"])
+                if "values" in payload:
+                    updates["values"] = dict(payload["values"])
+                try:
+                    preset = self.state.terrain_presets.update_preset(preset_id, **updates)
+                except (KeyError, ValueError) as exc:
+                    return self._json({"error": str(exc)}, status=400)
+                self._record_activity(
+                    "terrain_preset_edit",
+                    summary=f"Edited terrain profile {preset.get('name')}",
+                    subject_id=preset_id,
+                    payload={"terrain_preset_id": preset_id},
+                )
+                return self._json(preset)
+            if parsed.path.startswith("/api/terrain/presets/") and parsed.path.endswith("/delete"):
+                preset_id = route_id2(parsed.path)
+                try:
+                    deleted = self.state.terrain_presets.delete_preset(preset_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, status=400)
+                if deleted:
+                    self._record_activity(
+                        "terrain_preset_delete",
+                        summary=f"Deleted terrain profile {preset_id}",
+                        subject_id=preset_id,
+                        payload={"terrain_preset_id": preset_id},
+                    )
+                return self._json({"deleted": deleted})
+            if parsed.path == "/api/terrain/presets/activate":
+                preset_id = str(payload.get("preset_id") or "")
+                try:
+                    self.state.terrain_presets.set_active_preset(preset_id)
+                except KeyError as exc:
+                    return self._json({"error": str(exc)}, status=404)
+                self._record_activity(
+                    "terrain_preset_activate",
+                    summary=f"Activated terrain profile {preset_id}",
+                    subject_id=preset_id,
+                    payload={"terrain_preset_id": preset_id},
+                )
                 return self._json({"active_preset_id": preset_id})
             if parsed.path == "/api/training/stop":
                 run_id = str(payload.get("run_id") or "")
-                return self._json({"stopped": self.state.processes.stop(run_id)})
+                stopped = self.state.processes.stop(run_id)
+                if stopped:
+                    self._record_activity("process_stop", summary=f"Stopped process {run_id}", subject_id=run_id)
+                return self._json({"stopped": stopped})
             if parsed.path == "/api/folders":
                 folder = self.state.history.create_folder(str(payload.get("name") or ""))
+                self._record_activity("folder_create", summary=f"Created folder {folder}", subject_id=folder)
                 return self._json({"folder": folder, "folders": self.state.history.get_folders()}, status=201)
             if parsed.path == "/api/folders/delete":
                 result = self.state.history.delete_folder(str(payload.get("folder") or payload.get("name") or ""))
+                self._record_activity(
+                    "folder_delete",
+                    summary=f"Removed folder {result.get('folder')}",
+                    subject_id=str(result.get("folder") or ""),
+                    payload=result,
+                )
+                return self._json({**result, "folders": self.state.history.get_folders()})
+            if parsed.path == "/api/folders/rename":
+                result = self.state.history.rename_folder(
+                    str(payload.get("old_name") or payload.get("folder") or ""),
+                    str(payload.get("new_name") or payload.get("name") or ""),
+                )
+                self._record_activity(
+                    "folder_rename",
+                    summary=f"Renamed folder {result.get('old_folder')} to {result.get('new_folder')}",
+                    subject_id=str(result.get("new_folder") or ""),
+                    payload=result,
+                )
                 return self._json({**result, "folders": self.state.history.get_folders()})
             if parsed.path == "/api/folders/assign":
                 return self._json(self._assign_folders(payload))
+            if parsed.path == "/api/runs/delete-preview":
+                run_ids = payload.get("run_ids") or []
+                if not isinstance(run_ids, list):
+                    return self._json({"error": "run_ids must be a list"}, status=400)
+                return self._json(
+                    self.state.history.bulk_delete_preview(
+                        [str(run_id) for run_id in run_ids],
+                        delete_logs=bool(payload.get("delete_logs", True)),
+                    )
+                )
+            if parsed.path == "/api/runs/delete":
+                run_ids = payload.get("run_ids") or []
+                if not isinstance(run_ids, list):
+                    return self._json({"error": "run_ids must be a list"}, status=400)
+                running_by_run = self._running_by_run([str(run_id) for run_id in run_ids])
+                if running_by_run:
+                    return self._json(
+                        {"error": "Stop running processes for selected runs before deleting them", "processes": running_by_run},
+                        status=409,
+                    )
+                result = self.state.history.bulk_delete_runs(
+                    [str(run_id) for run_id in run_ids],
+                    delete_logs=bool(payload.get("delete_logs", True)),
+                    confirm=bool(payload.get("confirm")),
+                )
+                remote_deleted = self._sync_remote_deleted_runs()
+                if remote_deleted is not None:
+                    result["remote_delete_requests"] = remote_deleted
+                self._record_activity(
+                    "bulk_run_delete",
+                    summary=f"Deleted {result.get('deleted_count', 0)} selected runs",
+                    payload=result,
+                )
+                return self._json(result)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/stop"):
                 run_id = route_id(parsed.path)
                 stopped = self.state.processes.stop_all_for_run(run_id)
+                if stopped:
+                    self._record_activity(
+                        "run_process_stop",
+                        summary=f"Stopped processes for {run_id}",
+                        subject_id=run_id,
+                        payload={"stopped_ids": stopped},
+                    )
                 return self._json({"stopped": bool(stopped), "stopped_ids": stopped})
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/folder"):
                 run_id = route_id(parsed.path)
@@ -235,15 +431,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                         {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
                         status=409,
                     )
-                return self._json(
-                    self.state.processes.start_video_recording(
-                        run_id=run_id,
-                        checkpoint=str(run["latest_checkpoint"]),
-                        device=str(payload.get("device") or "cuda:0"),
-                        video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
-                    ),
-                    status=201,
+                result = self.state.processes.start_video_recording(
+                    run_id=run_id,
+                    checkpoint=str(run["latest_checkpoint"]),
+                    device=str(payload.get("device") or "cuda:0"),
+                    video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
                 )
+                self._record_activity("video_record_start", summary=f"Started video recording for {run_id}", subject_id=run_id, payload=result)
+                return self._json(result, status=201)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-onnx"):
                 run_id = route_id(parsed.path)
                 run = self.state.history.get_run(run_id)
@@ -255,14 +450,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                         {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
                         status=409,
                     )
-                return self._json(
-                    self.state.processes.start_onnx_export(
-                        run_id=run_id,
-                        checkpoint=str(run["latest_checkpoint"]),
-                        device=str(payload.get("device") or "cuda:0"),
-                    ),
-                    status=201,
+                result = self.state.processes.start_onnx_export(
+                    run_id=run_id,
+                    checkpoint=str(run["latest_checkpoint"]),
+                    device=str(payload.get("device") or "cuda:0"),
                 )
+                self._record_activity("onnx_export_start", summary=f"Started ONNX export for {run_id}", subject_id=run_id, payload=result)
+                return self._json(result, status=201)
             if parsed.path == "/api/open-location":
                 return self._json(self._open_location(str(payload.get("path") or "")))
             if parsed.path == "/api/tensorboard/start":
@@ -272,6 +466,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/rename"):
                 run_id = route_id(parsed.path)
                 record = self.state.history.rename_run(run_id, str(payload.get("display_name") or ""))
+                self._record_activity(
+                    "run_rename",
+                    summary=f"Renamed run {run_id}",
+                    subject_id=run_id,
+                    payload={"display_name": record.get("display_name")},
+                )
                 return self._json({"saved": True, "run": record})
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/tensorboard"):
                 run_id = route_id(parsed.path)
@@ -280,14 +480,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                     return self._json({"error": "No log directory found for run"}, status=404)
                 host = str(payload.get("host") or "127.0.0.1")
                 port = int(payload["port"]) if payload.get("port") else None
-                return self._json(
-                    self.state.processes.start_tensorboard(
-                        host=host,
-                        port=port,
-                        logdir=Path(str(run["log_dir"])),
-                        source_run_id=run_id,
-                    )
+                result = self.state.processes.start_tensorboard(
+                    host=host,
+                    port=port,
+                    logdir=Path(str(run["log_dir"])),
+                    source_run_id=run_id,
                 )
+                self._record_activity("tensorboard_start", summary=f"Started TensorBoard for {run_id}", subject_id=run_id, payload=result)
+                return self._json(result)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/delete"):
                 run_id = route_id(parsed.path)
                 running = self.state.processes.running_for_run(run_id)
@@ -296,13 +496,22 @@ class PanelHandler(BaseHTTPRequestHandler):
                         {"error": "Stop running processes for this run before deleting it", "processes": running},
                         status=409,
                     )
-                return self._json(
-                    self.state.history.delete_run(
-                        run_id,
-                        confirmation=str(payload.get("confirmation") or ""),
-                        delete_logs=bool(payload.get("delete_logs", True)),
-                    )
+                result = self.state.history.delete_run(
+                    run_id,
+                    confirmation=str(payload.get("confirmation") or ""),
+                    delete_logs=bool(payload.get("delete_logs", True)),
+                    confirm=bool(payload.get("confirm")),
                 )
+                remote_deleted = self._sync_remote_deleted_runs()
+                if remote_deleted is not None:
+                    result["remote_delete_requests"] = remote_deleted
+                self._record_activity(
+                    "run_delete",
+                    summary=f"Deleted run {run_id}",
+                    subject_id=run_id,
+                    payload=result,
+                )
+                return self._json(result)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/compact"):
                 run_id = route_id(parsed.path)
                 running = self.state.processes.running_for_run(run_id)
@@ -311,12 +520,17 @@ class PanelHandler(BaseHTTPRequestHandler):
                         {"error": "Stop running processes for this run before compacting it", "processes": running},
                         status=409,
                     )
-                return self._json(
-                    self.state.history.compact_run(
-                        run_id,
-                        confirmation=str(payload.get("confirmation") or ""),
-                    )
+                result = self.state.history.compact_run(
+                    run_id,
+                    confirmation=str(payload.get("confirmation") or ""),
                 )
+                self._record_activity(
+                    "run_compact",
+                    summary=f"Compacted run {run_id}",
+                    subject_id=run_id,
+                    payload=result,
+                )
+                return self._json(result)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/notes"):
                 run_id = route_id(parsed.path)
                 self.state.history.set_note(run_id, str(payload.get("notes") or ""))
@@ -332,14 +546,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                         {"error": "Stop the active Isaac process before starting another Isaac action.", "processes": active_media},
                         status=409,
                     )
-                return self._json(
-                    self.state.processes.start_play(
-                        run_id=run_id,
-                        checkpoint=str(run["latest_checkpoint"]),
-                        device=str(payload.get("device") or "cuda:0"),
-                    ),
-                    status=201,
+                result = self.state.processes.start_play(
+                    run_id=run_id,
+                    checkpoint=str(run["latest_checkpoint"]),
+                    device=str(payload.get("device") or "cuda:0"),
                 )
+                self._record_activity("play_start", summary=f"Started play for {run_id}", subject_id=run_id, payload=result)
+                return self._json(result, status=201)
             if parsed.path == "/api/convergence/settings":
                 from dataclasses import asdict
                 from .convergence import PRESETS, apply_settings
@@ -368,6 +581,52 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _record_activity(
+        self,
+        event_type: str,
+        *,
+        summary: str = "",
+        subject_id: str = "",
+        payload: dict | None = None,
+    ) -> None:
+        try:
+            self.state.activity.record(
+                event_type,
+                summary=summary,
+                subject_id=subject_id,
+                payload=payload or {},
+            )
+        except Exception as exc:
+            print(f"[training-panel] activity log skipped: {exc}")
+
+    def _running_by_run(self, run_ids: list[str]) -> dict[str, list[dict]]:
+        running_by_run = {}
+        for run_id in run_ids:
+            running = self.state.processes.running_for_run(str(run_id))
+            if running:
+                running_by_run[str(run_id)] = running
+        return running_by_run
+
+    def _sync_remote_deleted_runs(self) -> int | None:
+        try:
+            from .remote_worker import RemoteWorker
+            from .supabase_client import SupabaseClient
+
+            config = self.state.remote_worker.config()
+            if not config.configured:
+                return None
+            client = SupabaseClient(config, timeout=5.0)
+            worker = RemoteWorker(
+                config,
+                self.state.paths,
+                client,
+                state_store=self.state.remote_state,
+            )
+            return worker.sync_deleted_runs()
+        except Exception as exc:
+            print(f"[training-panel] remote delete sync skipped: {exc}")
+            return None
 
     def _assign_folders(self, payload: dict) -> dict:
         raw_run_ids = payload.get("run_ids")

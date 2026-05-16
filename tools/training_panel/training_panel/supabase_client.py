@@ -116,6 +116,9 @@ class SupabaseClient:
     def update(self, table: str, payload: dict, query: dict, prefer: str = "return=representation"):
         return self.request("PATCH", table, body=payload, query=query, prefer=prefer)
 
+    def delete(self, table: str, query: dict, prefer: str = "return=minimal"):
+        return self.request("DELETE", table, query=query, prefer=prefer)
+
     def upsert(
         self,
         table: str,

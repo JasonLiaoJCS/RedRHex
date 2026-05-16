@@ -18,13 +18,14 @@ REMOTE_JOB_TYPES = {
     "stop_process",
     "record_video",
     "export_onnx",
+    "tensorboard",
     "compact_run",
     "delete_run",
 }
 
 ROLE_PERMISSIONS = {
     "viewer": set(),
-    "operator": {"start_training", "stop_process", "record_video", "export_onnx"},
+    "operator": {"start_training", "stop_process", "record_video", "export_onnx", "tensorboard", "compact_run"},
     "admin": set(REMOTE_JOB_TYPES),
 }
 
