@@ -417,6 +417,16 @@ html[data-theme="dark"] .danger-button:hover {
   color: var(--blue);
 }
 
+.status-queued {
+  background: #eef2ff;
+  color: #4338ca;
+}
+
+html[data-theme="dark"] .status-queued {
+  background: #272e5d;
+  color: #c7d2fe;
+}
+
 .status-failed {
   background: var(--failed-bg);
   color: var(--red-dark);
@@ -603,6 +613,17 @@ html[data-theme="dark"] .status-unknown {
   border-color: rgba(49, 94, 159, 0.48);
 }
 
+.run-card.deleting {
+  opacity: 0.46;
+  filter: grayscale(0.85);
+  background: var(--surface-2);
+  pointer-events: none;
+}
+
+.run-card.deleting .run-select-checkbox {
+  pointer-events: none;
+}
+
 .run-top {
   display: flex;
   gap: 10px;
@@ -682,6 +703,31 @@ html[data-theme="dark"] .status-unknown {
 .debug-heading .status-badge {
   margin-left: 8px;
   vertical-align: middle;
+}
+
+.console-block {
+  margin-top: 10px;
+}
+
+.console-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.console-label small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 /* ==============================
@@ -1420,11 +1466,16 @@ html[data-theme="dark"] .comparison-diff {
   max-height: 400px;
   overflow: auto;
   position: relative;
+  margin-top: 6px;
 }
 
 #debug-command:empty,
 #debug-log:empty {
   display: none;
+}
+
+#debug-command {
+  max-height: 220px;
 }
 
 .access-grid {
@@ -1915,12 +1966,6 @@ pre {
   background: color-mix(in srgb, var(--amber) 8%, var(--surface));
 }
 
-.preset-card.active-for-training .preset-card-name::after {
-  content: " ●";
-  color: var(--green);
-  font-size: 10px;
-}
-
 .preset-card-name {
   font-weight: 700;
   font-size: 14px;
@@ -2305,6 +2350,7 @@ pre {
 
 .terminal-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   align-items: center;
 }
@@ -2321,9 +2367,15 @@ pre {
 
 .terminal-grid pre {
   max-height: none;
+  margin-top: 6px;
 }
 
 #terminal-output {
   min-height: 62vh;
+  overflow: auto;
+}
+
+#terminal-command {
+  max-height: 220px;
   overflow: auto;
 }

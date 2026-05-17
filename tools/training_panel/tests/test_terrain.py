@@ -117,6 +117,17 @@ def test_terrain_file_index_reports_schema_and_files(tmp_path):
     assert index["files"][0]["exists"] is True
 
 
+def test_stairs_boxes_preset_grid_width_leaves_random_grid_border(tmp_path):
+    repo = make_repo(tmp_path)
+    preset = TerrainPresetStore(repo / "terrain_presets.json").get_preset("stairs-boxes")
+    grid_width = preset["values"]["terrain.terrain_generator.sub_terrains.boxes.grid_width"]
+    size = terrain_defaults(repo)["terrain.terrain_generator.size"]
+
+    border_width = float(size[0]) - int(float(size[0]) / grid_width) * grid_width
+
+    assert border_width > 0
+
+
 def test_reads_terrain_values_from_yaml_and_diffs(tmp_path):
     repo = make_repo(tmp_path)
     env_yaml = tmp_path / "env.yaml"
@@ -250,3 +261,31 @@ def test_apply_terrain_overrides_to_fake_env_cfg():
     assert env_cfg.terrain.terrain_generator.difficulty_range == (0.0, 0.3)
     assert env_cfg.terrain.terrain_generator.sub_terrains["stairs"].step_width == 0.35
     assert env_cfg.terrain_curriculum_enable is False
+
+
+def test_apply_terrain_overrides_adjusts_exact_box_grid_divisor():
+    env_cfg = SimpleNamespace(
+        terrain=SimpleNamespace(
+            terrain_type="generator",
+            terrain_generator=SimpleNamespace(
+                size=(6.0, 6.0),
+                sub_terrains={
+                    "boxes": SimpleNamespace(grid_width=0.45),
+                },
+            ),
+        ),
+    )
+    applied = apply_terrain_overrides(
+        env_cfg,
+        {
+            "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.4,
+        },
+    )
+    grid_width = env_cfg.terrain.terrain_generator.sub_terrains["boxes"].grid_width
+    border_width = 6.0 - int(6.0 / grid_width) * grid_width
+
+    assert grid_width == 0.396
+    assert border_width > 0
+    assert applied == [
+        "terrain.terrain_generator.sub_terrains.boxes.grid_width=0.396 (adjusted from 0.4)",
+    ]

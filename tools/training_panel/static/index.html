@@ -25,7 +25,7 @@
         <button class="nav-button" data-view="access">Control Center</button>
       </nav>
       <div class="sidebar-release">
-        <span class="release-version">Version 3.0.0</span>
+        <span class="release-version">Version 3.0.1</span>
         <span>Published by BioRoLa ABAD RHex Team</span>
         <span>Credits: Jason Liao and Jacob Yang</span>
       </div>
@@ -38,7 +38,7 @@
           <p id="view-subtitle">Start a controlled RSL-RL run with the repo defaults.</p>
         </div>
         <div class="topbar-actions">
-          <span class="release-chip">Training Panel V3.0.0</span>
+          <span class="release-chip">Training Panel V3.0.1</span>
           <button id="theme-toggle" class="ghost-button" type="button">Dark Mode</button>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -49,6 +49,10 @@
           <label>
             Task
             <input name="task" value="Template-Redrhex-Direct-v0" />
+          </label>
+          <label>
+            Run Name
+            <input name="display_name" maxlength="120" placeholder="optional" />
           </label>
           <label>
             Environments
@@ -103,7 +107,7 @@
             <p class="muted-copy">
               Pick a preset to configure reward weights before training.
               Built-in presets are read-only — duplicate to create a custom version.
-              The active preset (marked ●) is used when you click Start Training.
+              The selected preset is used when you click Start Training.
             </p>
           </div>
           <div id="preset-list" class="preset-list"></div>
@@ -130,7 +134,6 @@
             <div class="reward-editor-actions form-actions">
               <span id="preset-builtin-badge" class="status-badge muted-pill" hidden>Built-in</span>
               <button id="preset-collapse-all-btn" type="button" class="ghost-button" disabled>Collapse All</button>
-              <button id="preset-activate-btn" type="button" class="ghost-button" disabled>Use for Training</button>
               <button id="preset-duplicate-btn" type="button" class="ghost-button" disabled>Duplicate</button>
               <button id="preset-delete-btn" type="button" class="danger-button" disabled>Delete</button>
               <button id="preset-save-btn" type="button" class="primary-button" disabled>Save Changes</button>
@@ -162,7 +165,7 @@
             <p class="muted-copy">
               Pick a preset to configure terrain before training.
               Built-in presets are read-only — duplicate to create a custom version.
-              The active preset (marked ●) is used when you click Start Training.
+              The selected preset is used when you click Start Training.
             </p>
           </div>
           <div id="terrain-preset-list" class="preset-list"></div>
@@ -189,7 +192,6 @@
             <div class="reward-editor-actions form-actions">
               <span id="terrain-preset-builtin-badge" class="status-badge muted-pill" hidden>Built-in</span>
               <button id="terrain-preset-collapse-all-btn" type="button" class="ghost-button" disabled>Collapse All</button>
-              <button id="terrain-preset-activate-btn" type="button" class="ghost-button" disabled>Use for Training</button>
               <button id="terrain-preset-duplicate-btn" type="button" class="ghost-button" disabled>Duplicate</button>
               <button id="terrain-preset-delete-btn" type="button" class="danger-button" disabled>Delete</button>
               <button id="terrain-preset-save-btn" type="button" class="primary-button" disabled>Save Changes</button>
@@ -357,14 +359,26 @@
             <div class="form-actions compact-actions">
               <button type="button" id="debug-refresh" class="ghost-button small-button" data-tooltip="Refresh output">Refresh</button>
               <button type="button" id="copy-debug" class="ghost-button small-button" data-tooltip="Copy console output">Copy Output</button>
-              <button type="button" id="copy-attach" class="ghost-button small-button" hidden data-tooltip="Copy tmux attach command">Copy Attach</button>
+              <button type="button" id="copy-command" class="ghost-button small-button" hidden data-tooltip="Copy the launch command shown below">Copy Command</button>
               <button type="button" id="terminal-view" class="ghost-button small-button" data-tooltip="Pop out console">Pop Out</button>
               <button type="button" id="open-process-log-folder" class="ghost-button small-button" data-tooltip="Open the folder containing process log files (local only)">Log Folder</button>
-              <button type="button" id="stop-process" class="ghost-button small-button" data-tooltip="Stop selected console process">Stop Process</button>
+              <button type="button" id="stop-process" class="danger-button small-button" data-tooltip="Stop selected console process">Stop Process</button>
             </div>
             <div id="debug-status" class="debug-status"></div>
-            <pre id="debug-command"></pre>
-            <pre id="debug-log"></pre>
+            <div id="debug-command-block" class="console-block" hidden>
+              <div class="console-label">
+                <span>Launch Command</span>
+                <small>Command the panel used to start this process.</small>
+              </div>
+              <pre id="debug-command"></pre>
+            </div>
+            <div id="debug-log-block" class="console-block" hidden>
+              <div class="console-label">
+                <span>Process Output</span>
+                <small>Captured stdout/stderr from the selected process.</small>
+              </div>
+              <pre id="debug-log"></pre>
+            </div>
             <div id="notes-status" class="status-line"></div>
           </div>
           </div><!-- /details-panel-wrap -->

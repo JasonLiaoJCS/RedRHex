@@ -11,7 +11,7 @@ def default_repo_root() -> Path:
 
 
 def timestamp_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,10 @@ class PanelPaths:
         return self.panel_log_root / "process_logs"
 
     @property
+    def process_override_dir(self) -> Path:
+        return self.panel_log_root / "process_overrides"
+
+    @property
     def notes_dir(self) -> Path:
         return self.panel_log_root / "notes"
 
@@ -88,4 +92,5 @@ class PanelPaths:
     def ensure_dirs(self) -> None:
         self.panel_log_root.mkdir(parents=True, exist_ok=True)
         self.process_log_dir.mkdir(parents=True, exist_ok=True)
+        self.process_override_dir.mkdir(parents=True, exist_ok=True)
         self.notes_dir.mkdir(parents=True, exist_ok=True)

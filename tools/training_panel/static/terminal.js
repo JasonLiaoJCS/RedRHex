@@ -74,23 +74,24 @@ async function copyDebug() {
   const text = [
     $("#terminal-target").textContent,
     "",
-    "Command",
+    "Launch Command",
     $("#terminal-command").textContent,
     "",
-    "Output",
+    "Process Output",
     $("#terminal-output").textContent,
   ].join("\n");
   await copyText(text);
   $("#terminal-target").textContent = "Console output copied.";
 }
 
-async function copyAttach() {
-  if (!window.lastDebug || !window.lastDebug.attach_command) {
-    $("#terminal-target").textContent = "No tmux attach command is available for this process.";
+async function copyLaunchCommand() {
+  const command = window.lastDebug && window.lastDebug.command;
+  if (!command) {
+    $("#terminal-target").textContent = "No launch command is available for this process.";
     return;
   }
-  await copyText(window.lastDebug.attach_command);
-  $("#terminal-target").textContent = `Attach command copied: ${window.lastDebug.attach_command}`;
+  await copyText(command);
+  $("#terminal-target").textContent = "Launch command copied.";
 }
 
 function outputDiagnosis(output) {
@@ -128,7 +129,7 @@ function render(debug) {
   const live = isLive(debug);
   const startingHint =
     target.type === "run" && debug.status === "running"
-      ? "A panel process for this run is active. Use Stop here, or attach with the tmux command when available."
+      ? "A panel process for this run is active. Use Stop here, or wait for captured output to appear."
       : "";
   const capturedOutput = debug.log_tail ?? debug.process_log_tail ?? "";
   const output = capturedOutput || startingHint || debug.debug_hint || "";
@@ -139,7 +140,6 @@ function render(debug) {
   if (debug.pid) pieces.push(`pid ${debug.pid}`);
   if (debug.status) pieces.push(`status ${debug.status}`);
   if (debug.returncode !== undefined && debug.returncode !== null) pieces.push(`return ${debug.returncode}`);
-  if (debug.attach_command) pieces.push(`attach ${debug.attach_command}`);
   if (debug.process_log || debug.log_file) pieces.push(debug.process_log || debug.log_file);
   const diagnosis = outputDiagnosis(output);
   if (diagnosis) pieces.push(diagnosis);
@@ -147,6 +147,9 @@ function render(debug) {
   $("#terminal-live").textContent = live ? "Live" : "Snapshot";
   $("#terminal-live").className = live ? "status-badge live-pill" : "status-badge muted-pill";
   $("#terminal-command").textContent = debug.command || "";
+  $("#terminal-command-block").hidden = !debug.command;
+  $("#terminal-command-copy").hidden = !debug.command;
+  $("#terminal-command-copy").disabled = !debug.command;
   $("#terminal-output").textContent = output || "No terminal output captured yet.";
   $("#terminal-output").scrollTop = $("#terminal-output").scrollHeight;
   $("#terminal-stop").disabled = target.type === "process" ? !live : false;
@@ -192,7 +195,7 @@ $("#terminal-copy").addEventListener("click", () => copyDebug().catch((error) =>
   $("#terminal-live").className = "status-badge error-pill";
   $("#terminal-target").textContent = error.message;
 }));
-$("#terminal-attach").addEventListener("click", () => copyAttach().catch((error) => {
+$("#terminal-command-copy").addEventListener("click", () => copyLaunchCommand().catch((error) => {
   $("#terminal-live").textContent = "Error";
   $("#terminal-live").className = "status-badge error-pill";
   $("#terminal-target").textContent = error.message;

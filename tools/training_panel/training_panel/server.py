@@ -243,19 +243,27 @@ class PanelHandler(BaseHTTPRequestHandler):
             payload = self._payload()
             if parsed.path == "/api/training/start":
                 params = TrainingParams.from_dict(payload)
-                run = self.state.processes.start_training(params)
+                run = self.state.processes.queue_training(params)
+                queued = str(run.get("status") or "").lower() == "queued"
                 self._record_activity(
-                    "training_start",
-                    summary=f"Started training {run.get('id')}",
+                    "training_queue" if queued else "training_start",
+                    summary=f"{'Queued' if queued else 'Started'} training {run.get('id')}",
                     subject_id=str(run.get("id") or ""),
                     payload={
                         "run_id": run.get("id"),
+                        "status": run.get("status"),
                         "reward_preset_id": params.reward_preset_id,
                         "terrain_preset_id": params.terrain_preset_id,
                         "params": params.to_dict(),
                     },
                 )
                 return self._json(run, status=201)
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/cancel-queue"):
+                run_id = route_id(parsed.path)
+                cancelled = self.state.processes.cancel_queued_training(run_id)
+                if cancelled:
+                    self._record_activity("training_queue_cancel", summary=f"Cancelled queued training {run_id}", subject_id=run_id)
+                return self._json({"cancelled": cancelled, "run_id": run_id})
             if parsed.path == "/api/remote/settings":
                 state = self.state.remote_worker.save_settings(payload)
                 return self._json({"saved": True, "remote_state": state, "status": self.state.remote_worker.status()})
@@ -434,7 +442,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 run_ids = payload.get("run_ids") or []
                 if not isinstance(run_ids, list):
                     return self._json({"error": "run_ids must be a list"}, status=400)
-                running_by_run = self._running_by_run([str(run_id) for run_id in run_ids])
+                running_by_run = self._running_by_run_or_log_dir([str(run_id) for run_id in run_ids])
                 if running_by_run:
                     return self._json(
                         {"error": "Stop running processes for selected runs before deleting them", "processes": running_by_run},
@@ -445,7 +453,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     delete_logs=bool(payload.get("delete_logs", True)),
                     confirm=bool(payload.get("confirm")),
                 )
-                remote_deleted = self._sync_remote_deleted_runs()
+                remote_deleted = self._sync_remote_deleted_runs(result.get("run_ids") or [])
                 if remote_deleted is not None:
                     result["remote_delete_requests"] = remote_deleted
                 self._record_activity(
@@ -539,7 +547,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return self._json(result)
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/delete"):
                 run_id = route_id(parsed.path)
-                running = self.state.processes.running_for_run(run_id)
+                running = self._running_for_run_or_log_dir(run_id)
                 if running:
                     return self._json(
                         {"error": "Stop running processes for this run before deleting it", "processes": running},
@@ -551,7 +559,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     delete_logs=bool(payload.get("delete_logs", True)),
                     confirm=bool(payload.get("confirm")),
                 )
-                remote_deleted = self._sync_remote_deleted_runs()
+                remote_deleted = self._sync_remote_deleted_runs([run_id])
                 if remote_deleted is not None:
                     result["remote_delete_requests"] = remote_deleted
                 self._record_activity(
@@ -657,7 +665,29 @@ class PanelHandler(BaseHTTPRequestHandler):
                 running_by_run[str(run_id)] = running
         return running_by_run
 
-    def _sync_remote_deleted_runs(self) -> int | None:
+    def _running_for_run_or_log_dir(self, run_id: str) -> list[dict]:
+        running = list(self.state.processes.running_for_run(str(run_id)))
+        seen = {str(process.get("run_id")) for process in running}
+        preview = self.state.history.delete_preview(str(run_id))
+        for item in (preview or {}).get("paths") or []:
+            if item.get("kind") != "rsl_rl_log_dir":
+                continue
+            for process in self.state.processes.running_for_log_dir(item.get("path") or ""):
+                process_id = str(process.get("run_id"))
+                if process_id not in seen:
+                    running.append(process)
+                    seen.add(process_id)
+        return running
+
+    def _running_by_run_or_log_dir(self, run_ids: list[str]) -> dict[str, list[dict]]:
+        running_by_run = {}
+        for run_id in run_ids:
+            running = self._running_for_run_or_log_dir(str(run_id))
+            if running:
+                running_by_run[str(run_id)] = running
+        return running_by_run
+
+    def _sync_remote_deleted_runs(self, run_ids: list[str] | None = None) -> int | None:
         try:
             from .remote_worker import RemoteWorker
             from .supabase_client import SupabaseClient
@@ -672,7 +702,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 client,
                 state_store=self.state.remote_state,
             )
-            return worker.sync_deleted_runs()
+            tombstones = None
+            if run_ids is not None:
+                tombstones = self.state.history.deleted_run_tombstones(run_ids=run_ids)
+            return worker.sync_deleted_runs(tombstones=tombstones)
         except Exception as exc:
             print(f"[training-panel] remote delete sync skipped: {exc}")
             return None

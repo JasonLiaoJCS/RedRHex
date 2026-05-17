@@ -20,9 +20,11 @@ const state = {
   statusFilter: "",
   sortKey: "newest",
   // Folders (Module 3)
-  activeFolder: null,
+  activeFolder: "",
   folders: [],
   selectedRunIds: new Set(),
+  isBulkDeleting: false,
+  pendingDeleteRunIds: new Set(),
   notifications: {
     initialized: false,
     knownRunIds: new Set(),
@@ -233,28 +235,76 @@ function currentRewardEditorValues() {
   return values;
 }
 
-function activeRewardOverridesForTraining() {
-  if (state.rewardDraftPreset && state.activePresetId === state.rewardDraftPreset.id) {
-    if (state.selectedPresetId === state.rewardDraftPreset.id) {
-      const values = currentRewardEditorValues();
-      if (Object.keys(values).length) state.rewardDraftPreset.values = values;
+function rewardPresetIdForTraining() {
+  if (state.selectedPresetId && rewardPresetById(state.selectedPresetId)) return state.selectedPresetId;
+  return state.activePresetId || "baseline";
+}
+
+function rewardOverridesForTraining() {
+  const presetId = rewardPresetIdForTraining();
+  const preset = rewardPresetById(presetId);
+  if (state.selectedPresetId === presetId && $("#reward-categories")?.children.length) {
+    const values = currentRewardEditorValues();
+    if (Object.keys(values).length) {
+      if (state.rewardDraftPreset && presetId === state.rewardDraftPreset.id) {
+        state.rewardDraftPreset.values = values;
+      }
+      return values;
     }
-    return state.rewardDraftPreset.values || {};
   }
-  return state.activePresetOverrides || {};
+  return preset?.values || state.activePresetOverrides || {};
+}
+
+function currentTerrainEditorValues() {
+  const values = {};
+  document.querySelectorAll("#terrain-categories .terrain-row-input").forEach((input) => {
+    const key = input.dataset.key;
+    if (!key) return;
+    values[key] = parseTerrainInput(input, terrainMeta(key));
+  });
+  return values;
+}
+
+function terrainPresetIdForTraining() {
+  if (state.selectedTerrainPresetId && state.terrainPresets.some((preset) => preset.id === state.selectedTerrainPresetId)) {
+    return state.selectedTerrainPresetId;
+  }
+  return state.activeTerrainPresetId || "baseline";
+}
+
+function terrainOverridesForTraining() {
+  const presetId = terrainPresetIdForTraining();
+  const preset = state.terrainPresets.find((item) => item.id === presetId);
+  if (state.selectedTerrainPresetId === presetId && $("#terrain-categories")?.children.length) {
+    const values = currentTerrainEditorValues();
+    if (Object.keys(values).length) return values;
+  }
+  return preset?.values || state.activeTerrainPresetOverrides || {};
+}
+
+function updateTrainingPresetIndicators() {
+  const rewardId = rewardPresetIdForTraining();
+  const rewardPreset = rewardPresetById(rewardId) || { name: rewardId };
+  const rewardEl = $("#train-active-preset-name");
+  if (rewardEl) rewardEl.textContent = rewardPreset.name || rewardId;
+
+  const terrainId = terrainPresetIdForTraining();
+  const terrainPreset = state.terrainPresets.find((preset) => preset.id === terrainId) || { name: terrainId };
+  const terrainEl = $("#train-active-terrain-preset-name");
+  if (terrainEl) terrainEl.textContent = terrainPreset.name || terrainId;
 }
 
 function formData(form) {
   const data = Object.fromEntries(new FormData(form).entries());
+  data.display_name = String(data.display_name || "").trim();
   data.headless = form.elements.headless.checked;
   data.resume = Boolean(data.checkpoint);
   data.num_envs = Number(data.num_envs);
   data.max_iterations = Number(data.max_iterations);
-  // Include active reward preset
-  data.reward_preset_id = state.activePresetId || "baseline";
-  data.reward_overrides = activeRewardOverridesForTraining();
-  data.terrain_preset_id = state.activeTerrainPresetId || "baseline";
-  data.terrain_overrides = state.activeTerrainPresetOverrides || {};
+  data.reward_preset_id = rewardPresetIdForTraining();
+  data.reward_overrides = rewardOverridesForTraining();
+  data.terrain_preset_id = terrainPresetIdForTraining();
+  data.terrain_overrides = terrainOverridesForTraining();
   if (state.rewardDraftPreset?.source_run_id && data.reward_preset_id === state.rewardDraftPreset.id) {
     data.tweak_source_run_id = state.rewardDraftPreset.source_run_id;
     data.tweak_source_label = state.rewardDraftPreset.source_label || state.rewardDraftPreset.source_run_id;
@@ -548,9 +598,10 @@ function formatDuration(createdAt, updatedAt) {
 function statusClass(status) {
   const normalized = String(status || "unknown").toLowerCase();
   if (normalized === "completed") return "status-completed";
+  if (normalized === "queued") return "status-queued";
   if (normalized === "running" || normalized === "stopping") return "status-running";
   if (normalized === "failed") return "status-failed";
-  if (normalized === "interrupted") return "status-interrupted";
+  if (normalized === "interrupted" || normalized === "cancelled") return "status-interrupted";
   return "status-unknown";
 }
 
@@ -631,8 +682,13 @@ function activeMediaProcess() {
   return state.activeProcesses.find((process) => ["play", "video", "onnx"].includes(process.kind)) || null;
 }
 
+function activeGpuProcess() {
+  return state.activeProcesses.find((process) => ["training", "play", "video", "onnx"].includes(process.kind)) || null;
+}
+
 function mediaLockMessage(process) {
   if (!process) return "";
+  if (process.kind === "training") return "Training is running. New training requests will be queued until the GPU is free.";
   if (process.kind === "video") return "Video recording is running. Stop recording before starting another Isaac action.";
   if (process.kind === "onnx") return "ONNX export is running. Stop it before starting playback or recording.";
   return "Playback is running. Stop Play before starting another Isaac action.";
@@ -719,11 +775,13 @@ function renderRuns() {
     updateBulkToolbar();
     return;
   }
-  const mediaProcess = activeMediaProcess();
+  const gpuProcess = activeGpuProcess();
   $("#runs").innerHTML = runs
     .map((run) => {
       const active = state.selectedRun && state.selectedRun.id === run.id ? "active" : "";
       const title = run.display_name || run.id;
+      const deleting = state.pendingDeleteRunIds.has(run.id);
+      const queued = String(run.status || "").toLowerCase() === "queued";
       const canTensorboard = Boolean(run.log_dir);
       const canCheckpoint = Boolean(run.latest_checkpoint);
       const playProcessId = activeProcessIdForRun(run.id, "play");
@@ -733,22 +791,22 @@ function renderRuns() {
       const timeSummary = runTimeSummary(run);
       const videoText = videoProcessId ? "recording video" : videoSummary(run);
       const onnxText = onnxProcessId ? "exporting ONNX" : onnxSummary(run);
-      const selected = state.selectedRunIds.has(run.id) ? "checked" : "";
+      const selected = state.selectedRunIds.has(run.id) || deleting ? "checked" : "";
       const playAction = playProcessId ? "stop-play" : "play";
       const playLabel = playProcessId ? "Stop Play" : "Play";
       const playProcessAttr = playProcessId ? `data-process-id="${escapeHtml(playProcessId)}"` : "";
-      const playDisabled = (!canCheckpoint && !playProcessId) || Boolean(mediaProcess && !playProcessId);
+      const playDisabled = queued || (!canCheckpoint && !playProcessId) || Boolean(gpuProcess && !playProcessId);
       const canTweak = !["running", "stopping"].includes(String(run.status || "").toLowerCase());
       const unread = state.notifications.unreadRunIds.has(run.id);
       return `
-        <article class="run-card ${active} ${unread ? "unread" : ""}" data-run-id="${escapeHtml(run.id)}">
-          <input class="run-select-checkbox" type="checkbox" data-run-id="${escapeHtml(run.id)}" ${selected} aria-label="Select ${escapeHtml(title)} for folder move" data-tooltip="Select for folder move">
+        <article class="run-card ${active} ${unread ? "unread" : ""} ${deleting ? "deleting" : ""}" data-run-id="${escapeHtml(run.id)}">
+          <input class="run-select-checkbox" type="checkbox" data-run-id="${escapeHtml(run.id)}" ${selected} ${deleting ? "disabled" : ""} aria-label="Select ${escapeHtml(title)} for folder move" data-tooltip="Select for folder move">
           <div class="run-top">
             <div class="run-title">
               ${unread ? `<span class="unread-dot" data-tooltip="Unread history update"></span>` : ""}
               <strong>${escapeHtml(title)}</strong>
             </div>
-            <span class="pill status-pill ${statusClass(run.status)}">${escapeHtml(run.status || "unknown")}</span>
+            <span class="pill status-pill ${deleting ? "status-unknown" : statusClass(run.status)}">${deleting ? "deleting" : escapeHtml(run.status || "unknown")}</span>
           </div>
           ${paramSummary ? `<small>${escapeHtml(paramSummary)}</small>` : ""}
           ${timeSummary ? `<small>${escapeHtml(timeSummary)}</small>` : ""}
@@ -763,18 +821,22 @@ function renderRuns() {
             : run.terrain_diff_count > 0
               ? `<small><span class="terrain-diff-badge">${escapeHtml(String(run.terrain_diff_count))} terrain override${run.terrain_diff_count !== 1 ? "s" : ""}</span></small>`
               : ""}
+          ${queued ? `<small>waiting for GPU queue</small>` : ""}
           <small>${escapeHtml(checkpointSummary(run))}${videoText ? ` · ${escapeHtml(videoText)}` : ""}${onnxText ? ` · ${escapeHtml(onnxText)}` : ""}${escapeHtml(runStatusDetail(run))}${run.has_notes ? " <strong>+ notes</strong>" : ""}</small>
           <div class="run-actions">
-            <button type="button" data-action="tensorboard" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTensorboard)} data-tooltip="Open metrics">TensorBoard</button>
-            <button type="button" data-action="${playAction}" data-run-id="${escapeHtml(run.id)}" ${playProcessAttr} ${runButtonDisabled(playDisabled)} data-tooltip="${playProcessId ? "Stop Isaac playback" : "Play checkpoint"}">${escapeHtml(playLabel)}</button>
-            <button type="button" data-action="resume" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canCheckpoint)} data-tooltip="Resume training from checkpoint">Resume to Train</button>
-            <button type="button" data-action="tweak" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(!canTweak)} data-tooltip="Copy this run into an editable reward tweak draft">Tweak</button>
-            <button type="button" data-action="console" data-run-id="${escapeHtml(run.id)}" data-tooltip="Show Process Console">Console</button>
+            <button type="button" data-action="tensorboard" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(deleting || !canTensorboard)} data-tooltip="Open metrics">TensorBoard</button>
+            <button type="button" data-action="${playAction}" data-run-id="${escapeHtml(run.id)}" ${playProcessAttr} ${runButtonDisabled(deleting || playDisabled)} data-tooltip="${playProcessId ? "Stop Isaac playback" : "Play checkpoint"}">${escapeHtml(playLabel)}</button>
+            <button type="button" data-action="resume" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(deleting || !canCheckpoint)} data-tooltip="Resume training from checkpoint">Resume to Train</button>
+            <button type="button" data-action="tweak" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(deleting || queued || !canTweak)} data-tooltip="Copy this run into an editable reward tweak draft">Tweak</button>
+            <button type="button" data-action="console" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(deleting)} data-tooltip="Show Process Console">Console</button>
+            ${queued
+              ? `<button type="button" data-action="cancel-queue" data-run-id="${escapeHtml(run.id)}" class="danger-button" ${runButtonDisabled(deleting)} data-tooltip="Cancel this queued training run">Cancel Queue</button>`
+              : ""}
             ${videoProcessId
-              ? `<button type="button" data-action="stop-video" data-run-id="${escapeHtml(run.id)}" data-process-id="${escapeHtml(videoProcessId)}" data-tooltip="Stop recording">Stop Recording</button>`
+              ? `<button type="button" data-action="stop-video" data-run-id="${escapeHtml(run.id)}" data-process-id="${escapeHtml(videoProcessId)}" ${runButtonDisabled(deleting)} data-tooltip="Stop recording">Stop Recording</button>`
               : ""}
             ${state.selectedRun && state.selectedRun.id !== run.id
-              ? `<button type="button" data-action="compare" data-run-id="${escapeHtml(run.id)}" data-tooltip="Compare with selected">Compare</button>`
+              ? `<button type="button" data-action="compare" data-run-id="${escapeHtml(run.id)}" ${runButtonDisabled(deleting)} data-tooltip="Compare with selected">Compare</button>`
               : ""}
           </div>
         </article>
@@ -851,9 +913,9 @@ function renderVideoPanel(run) {
     return;
   }
   panel.hidden = false;
-  const mediaProcess = activeMediaProcess();
+  const gpuProcess = activeGpuProcess();
   const videoProcessId = activeVideoProcessId(run);
-  $("#record-video").disabled = !hasCheckpoint || Boolean(mediaProcess);
+  $("#record-video").disabled = !hasCheckpoint || Boolean(gpuProcess);
   $("#stop-recording").hidden = !videoProcessId;
   $("#open-video-folder").hidden = !run.latest_video;
   $("#copy-video-path").hidden = !run.latest_video;
@@ -892,7 +954,7 @@ function renderVideoPanel(run) {
   }
   stateBadge.textContent = "Video Failed";
   stateBadge.className = "status-badge status-failed";
-  message.textContent = "Recording failed. Use the Process Console for logs and the tmux attach command.";
+  message.textContent = "Recording failed. Use the Process Console for the launch command and captured output.";
 }
 
 function renderRunDetails() {
@@ -904,7 +966,8 @@ function renderRunDetails() {
   const runName = $("#run-name");
   const playProcessId = run ? activeProcessIdForRun(run.id, "play") : "";
   const onnxProcessId = run ? activeOnnxProcessId(run) : "";
-  const mediaProcess = activeMediaProcess();
+  const gpuProcess = activeGpuProcess();
+  const queued = run ? String(run.status || "").toLowerCase() === "queued" : false;
 
   // Header
   $("#details-title").textContent = run ? run.display_name || run.id : "Run Details";
@@ -967,9 +1030,9 @@ function renderRunDetails() {
   $("#compact-run").disabled = !run || !run.log_dir || Boolean(run && activeProcessForRun(run.id));
   $("#open-run-folder").disabled = !run || !run.log_dir;
   $("#tensorboard-run").disabled = !run || !run.log_dir;
-  $("#play-run").disabled = !run || (!run.latest_checkpoint && !playProcessId) || Boolean(mediaProcess && !playProcessId);
+  $("#play-run").disabled = !run || queued || (!run.latest_checkpoint && !playProcessId) || Boolean(gpuProcess && !playProcessId);
   $("#play-run").textContent = playProcessId ? "Stop Play" : "Play";
-  $("#export-onnx").disabled = !run || !run.latest_checkpoint || Boolean(mediaProcess);
+  $("#export-onnx").disabled = !run || queued || !run.latest_checkpoint || Boolean(gpuProcess);
   $("#export-onnx").textContent = onnxProcessId ? "Exporting ONNX" : "Export ONNX";
   $("#copy-onnx-path").hidden = !run || !run.onnx_path;
   $("#copy-onnx-path").disabled = !run || !run.onnx_path;
@@ -979,9 +1042,9 @@ function renderRunDetails() {
   $("#tweak-run").disabled = !run || ["running", "stopping"].includes(String(run.status || "").toLowerCase());
   $("#stop-process").disabled = !state.debugTarget && !run;
 
-  const hasAttach = Boolean(state.lastDebug && state.lastDebug.attach_command);
-  $("#copy-attach").hidden = !hasAttach;
-  $("#copy-attach").disabled = !hasAttach;
+  const hasCommand = Boolean(state.lastDebug && state.lastDebug.command);
+  $("#copy-command").hidden = !hasCommand;
+  $("#copy-command").disabled = !hasCommand;
   $("#open-process-log-folder").disabled = !state.lastDebug || !(state.lastDebug.process_log || state.lastDebug.log_file);
 
   renderVideoPanel(run);
@@ -990,7 +1053,7 @@ function renderRunDetails() {
 function hasActiveRun() {
   return (
     Object.keys(state.activeProcessMap).length > 0 ||
-    state.runs.some((run) => run.status === "running" || run.status === "stopping" || run.video_status === "recording")
+    state.runs.some((run) => ["queued", "running", "stopping"].includes(run.status) || run.video_status === "recording")
   );
 }
 
@@ -1111,14 +1174,14 @@ async function copyDebugOutput() {
   setStatus("Console output copied.");
 }
 
-async function copyAttachCommand() {
-  const command = state.lastDebug && state.lastDebug.attach_command;
+async function copyLaunchCommand() {
+  const command = state.lastDebug && state.lastDebug.command;
   if (!command) {
-    setStatus("No tmux attach command is available for this process.");
+    setStatus("No launch command is available for this process.");
     return;
   }
   await copyText(command);
-  setStatus(`Attach command copied: ${command}`);
+  setStatus("Launch command copied.");
 }
 
 async function openLocation(path, label = "location") {
@@ -1222,7 +1285,6 @@ function renderDebug(debug) {
   if (debug.pid) rows.push(["PID", debug.pid]);
   if (debug.status) rows.push(["Status", debug.status]);
   if (debug.returncode !== undefined && debug.returncode !== null) rows.push(["Return", debug.returncode]);
-  if (debug.attach_command) rows.push(["Attach", debug.attach_command]);
   if (debug.process_log || debug.log_file) rows.push(["Log", debug.process_log || debug.log_file]);
   const diagnosis = outputDiagnosis(logTail);
   if (diagnosis) rows.push(["Hint", diagnosis]);
@@ -1234,8 +1296,12 @@ function renderDebug(debug) {
         .map(([key, value]) => `<span class="debug-kv"><strong>${escapeHtml(key)}:</strong> ${escapeHtml(String(value))}</span>`)
         .join("")
     : escapeHtml(debug.debug_hint || "No process selected.");
-  $("#debug-command").textContent = debug.command || "";
-  $("#debug-log").textContent = logTail || debug.debug_hint || "No terminal output captured yet.";
+  const commandText = debug.command || "";
+  const outputText = logTail || debug.debug_hint || "No terminal output captured yet.";
+  $("#debug-command").textContent = commandText;
+  $("#debug-command-block").hidden = !commandText;
+  $("#debug-log").textContent = outputText;
+  $("#debug-log-block").hidden = !outputText;
   $("#debug-log").scrollTop = $("#debug-log").scrollHeight;
   renderRunDetails();
 }
@@ -1282,7 +1348,11 @@ async function startTraining(event) {
       method: "POST",
       body: JSON.stringify(formData($("#train-form"))),
     });
-    $("#train-status").textContent = `Started ${run.id} with pid ${run.pid}`;
+    const runLabel = run.display_name ? `${run.display_name} (${run.id})` : run.id;
+    $("#train-status").textContent =
+      run.status === "queued"
+        ? `Queued ${runLabel}. It will start when the GPU is free.`
+        : `Started ${runLabel} with pid ${run.pid}`;
     markHistoryUnread(run.id);
     await loadRuns();
     await loadActivity();
@@ -1376,9 +1446,9 @@ async function startTensorBoardForRun(runId, pendingWindow) {
 }
 
 async function playRun(runId) {
-  const mediaProcess = activeMediaProcess();
-  if (mediaProcess) {
-    setStatus(mediaLockMessage(mediaProcess));
+  const gpuProcess = activeGpuProcess();
+  if (gpuProcess) {
+    setStatus(mediaLockMessage(gpuProcess));
     await loadRuns();
     return;
   }
@@ -1397,9 +1467,9 @@ async function recordVideo() {
     setStatus("Select a run first.");
     return;
   }
-  const mediaProcess = activeMediaProcess();
-  if (mediaProcess) {
-    setStatus(mediaLockMessage(mediaProcess));
+  const gpuProcess = activeGpuProcess();
+  if (gpuProcess) {
+    setStatus(mediaLockMessage(gpuProcess));
     await loadRuns();
     return;
   }
@@ -1422,9 +1492,9 @@ async function exportOnnx() {
     setStatus("Select a run first.");
     return;
   }
-  const mediaProcess = activeMediaProcess();
-  if (mediaProcess) {
-    setStatus(mediaLockMessage(mediaProcess));
+  const gpuProcess = activeGpuProcess();
+  if (gpuProcess) {
+    setStatus(mediaLockMessage(gpuProcess));
     await loadRuns();
     return;
   }
@@ -1576,26 +1646,39 @@ async function deleteSelectedRun() {
     return;
   }
   const runId = state.selectedRun.id;
-  const preview = await api(`/api/runs/${encodeURIComponent(runId)}/delete-preview`);
-  if (!window.confirm(formatDeletePreview(preview))) {
-    setStatus("Delete cancelled.");
-    return;
+  state.pendingDeleteRunIds.add(runId);
+  renderRuns();
+  try {
+    const preview = await api(`/api/runs/${encodeURIComponent(runId)}/delete-preview`);
+    if (!window.confirm(formatDeletePreview(preview))) {
+      setStatus("Delete cancelled.");
+      return;
+    }
+    const result = await api(`/api/runs/${encodeURIComponent(runId)}/delete`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, delete_logs: true }),
+    });
+    state.runs = state.runs.filter((run) => run.id !== result.run_id);
+    state.selectedRun = null;
+    state.debugTarget = null;
+    state.lastDebug = null;
+    $("#notes-editor").value = "";
+    $("#debug-command").textContent = "";
+    $("#debug-log").textContent = "";
+    $("#debug-command-block").hidden = true;
+    $("#debug-log-block").hidden = true;
+    $("#debug-status").textContent = "";
+    renderVideoPanel(null);
+    renderRuns();
+    await loadRuns();
+    await loadActivity();
+    setStatus(`Deleted ${result.run_id}. Removed ${result.deleted_paths.length} log/note path(s).`);
+  } catch (error) {
+    throw error;
+  } finally {
+    state.pendingDeleteRunIds.delete(runId);
+    renderRuns();
   }
-  const result = await api(`/api/runs/${encodeURIComponent(runId)}/delete`, {
-    method: "POST",
-    body: JSON.stringify({ confirm: true, delete_logs: true }),
-  });
-  state.selectedRun = null;
-  state.debugTarget = null;
-  state.lastDebug = null;
-  $("#notes-editor").value = "";
-  $("#debug-command").textContent = "";
-  $("#debug-log").textContent = "";
-  $("#debug-status").textContent = "";
-  renderVideoPanel(null);
-  await loadRuns();
-  await loadActivity();
-  setStatus(`Deleted ${result.run_id}. Removed ${result.deleted_paths.length} log/note path(s).`);
 }
 
 function formatBulkDeletePreview(preview) {
@@ -1623,36 +1706,59 @@ async function deleteSelectedRuns() {
     setStatus("Select one or more runs first.");
     return;
   }
-  const preview = await api("/api/runs/delete-preview", {
-    method: "POST",
-    body: JSON.stringify({ run_ids: runIds, delete_logs: true }),
-  });
-  if (!preview.run_count) {
-    setStatus("No selected runs can be deleted.");
-    return;
+  state.isBulkDeleting = true;
+  runIds.forEach((runId) => state.pendingDeleteRunIds.add(runId));
+  updateBulkToolbar();
+  renderRuns();
+  try {
+    const preview = await api("/api/runs/delete-preview", {
+      method: "POST",
+      body: JSON.stringify({ run_ids: runIds, delete_logs: true }),
+    });
+    if (!preview.run_count) {
+      setStatus("No selected runs can be deleted.");
+      return;
+    }
+    if (!window.confirm(formatBulkDeletePreview(preview))) {
+      setStatus("Bulk delete cancelled.");
+      return;
+    }
+    const result = await api("/api/runs/delete", {
+      method: "POST",
+      body: JSON.stringify({ run_ids: runIds, delete_logs: true, confirm: true }),
+    });
+    state.selectedRunIds.clear();
+    const affectedRunIds = result.run_ids || [];
+    state.runs = state.runs.filter((run) => !affectedRunIds.includes(run.id));
+    if (state.selectedRun && affectedRunIds.includes(state.selectedRun.id)) {
+      state.selectedRun = null;
+      state.debugTarget = null;
+      state.lastDebug = null;
+      $("#notes-editor").value = "";
+      $("#debug-command").textContent = "";
+      $("#debug-log").textContent = "";
+      $("#debug-command-block").hidden = true;
+      $("#debug-log-block").hidden = true;
+      $("#debug-status").textContent = "";
+      renderVideoPanel(null);
+    }
+    renderRuns();
+    await loadRuns();
+    await loadActivity();
+    const skipped = (result.skipped_duplicate_ids || []).length;
+    const missing = (result.missing || []).length;
+    const extras = [
+      skipped ? `${skipped} duplicate skipped` : "",
+      missing ? `${missing} missing` : "",
+    ].filter(Boolean);
+    const suffix = extras.length ? ` (${extras.join(", ")})` : "";
+    setStatus(`Deleted ${result.deleted_count} run${result.deleted_count === 1 ? "" : "s"}. Removed ${result.deleted_paths.length} log/note path(s).${suffix}`);
+  } finally {
+    runIds.forEach((runId) => state.pendingDeleteRunIds.delete(runId));
+    state.isBulkDeleting = false;
+    updateBulkToolbar();
+    renderRuns();
   }
-  if (!window.confirm(formatBulkDeletePreview(preview))) {
-    setStatus("Bulk delete cancelled.");
-    return;
-  }
-  const result = await api("/api/runs/delete", {
-    method: "POST",
-    body: JSON.stringify({ run_ids: runIds, delete_logs: true, confirm: true }),
-  });
-  state.selectedRunIds.clear();
-  if (state.selectedRun && result.run_ids.includes(state.selectedRun.id)) {
-    state.selectedRun = null;
-    state.debugTarget = null;
-    state.lastDebug = null;
-    $("#notes-editor").value = "";
-    $("#debug-command").textContent = "";
-    $("#debug-log").textContent = "";
-    $("#debug-status").textContent = "";
-    renderVideoPanel(null);
-  }
-  await loadRuns();
-  await loadActivity();
-  setStatus(`Deleted ${result.deleted_count} run${result.deleted_count === 1 ? "" : "s"}. Removed ${result.deleted_paths.length} log/note path(s).`);
 }
 
 async function handleRunAction(action, runId, processId = "") {
@@ -1668,6 +1774,10 @@ async function handleRunAction(action, runId, processId = "") {
     }
     if (action === "stop-process") {
       await stopProcessById(processId || state.activeProcessMap[runId]);
+      return;
+    }
+    if (action === "cancel-queue") {
+      await cancelQueuedRun(runId);
       return;
     }
     if (!state.selectedRun || state.selectedRun.id !== runId) {
@@ -1686,6 +1796,13 @@ async function handleRunAction(action, runId, processId = "") {
   } catch (error) {
     handleActionError(error, pendingWindow);
   }
+}
+
+async function cancelQueuedRun(runId) {
+  const data = await api(`/api/runs/${encodeURIComponent(runId)}/cancel-queue`, { method: "POST" });
+  await loadRuns();
+  await loadActivity();
+  setStatus(data.cancelled ? `Cancelled queued run ${runId}.` : "That run is no longer queued.");
 }
 
 function applyPreset(kind) {
@@ -1741,7 +1858,7 @@ async function applyTweakPayload(payload) {
   setView("rewards");
   selectPresetForEdit(state.rewardDraftPreset.id);
   $("#train-status").textContent = payload.message || `Loaded tweak draft from ${state.rewardDraftPreset.source_label || "run"}.`;
-  setStatus("Tweak draft is active for the next training run. Adjust rewards, then start training.");
+  setStatus("Tweak draft is selected for the next training run. Adjust rewards, then start training.");
 }
 
 async function tweakFromLastRun() {
@@ -1902,10 +2019,10 @@ function toggleRewardCategoriesCollapsed() {
 }
 
 function renderPresets() {
-  const { activePresetId, selectedPresetId } = state;
+  const { selectedPresetId } = state;
   const presets = rewardPresetsForRender();
   $("#preset-list").innerHTML = presets.map((p) => `
-    <div class="preset-card ${p.id === selectedPresetId ? "selected" : ""} ${p.id === activePresetId ? "active-for-training" : ""} ${p.draft ? "draft-preset" : ""}"
+    <div class="preset-card ${p.id === selectedPresetId ? "selected" : ""} ${p.draft ? "draft-preset" : ""}"
          data-preset-id="${escapeHtml(p.id)}"
          title="${escapeHtml(p.description)}">
       <div class="preset-card-name">${escapeHtml(p.name)}${p.draft ? ` <span class="draft-badge">Draft</span>` : ""}</div>
@@ -1915,10 +2032,7 @@ function renderPresets() {
   document.querySelectorAll(".preset-card[data-preset-id]").forEach((card) => {
     card.addEventListener("click", () => selectPresetForEdit(card.dataset.presetId));
   });
-  // Update training form indicator
-  const activePreset = rewardPresetById(activePresetId) || { name: activePresetId };
-  const el = $("#train-active-preset-name");
-  if (el) el.textContent = activePreset.name || activePresetId;
+  updateTrainingPresetIndicators();
 }
 
 function selectPresetForEdit(presetId) {
@@ -1943,11 +2057,11 @@ function selectPresetForEdit(presetId) {
   builtInBadge.hidden = !preset.built_in && !preset.draft;
   builtInBadge.textContent = preset.draft ? "Unsaved Draft" : "Built-in";
 
-  const isActive = preset.id === state.activePresetId;
   const activateBtn = $("#preset-activate-btn");
-  activateBtn.disabled = false;
-  activateBtn.textContent = isActive ? "✓ Active for Training" : "Use for Training";
-  activateBtn.style.fontWeight = isActive ? "900" : "";
+  if (activateBtn) {
+    activateBtn.disabled = true;
+    activateBtn.hidden = true;
+  }
 
   $("#preset-collapse-all-btn").disabled = false;
   $("#preset-duplicate-btn").disabled = false;
@@ -1957,6 +2071,7 @@ function selectPresetForEdit(presetId) {
   $("#preset-save-btn").textContent = preset.draft ? "Save as Preset" : "Save Preset";
 
   renderRewardEditor(preset, state.rewardDefaults, !preset.built_in || Boolean(preset.draft));
+  updateTrainingPresetIndicators();
 }
 
 async function loadRewardsPage() {
@@ -1967,7 +2082,7 @@ async function loadRewardsPage() {
   state.presets = presetsData.presets || [];
   state.activePresetId = presetsData.active_preset_id || "baseline";
   state.rewardDefaults = tweakData.reward_defaults || {};
-  // Populate active preset overrides for training form
+  // Keep backend active preset as the initial/default selection.
   const active = rewardPresetById(state.activePresetId);
   state.activePresetOverrides = active ? (active.values || {}) : {};
 
@@ -1992,7 +2107,7 @@ async function loadRewardsPage() {
       </div>`).join("");
   }
 
-  // Auto-select the active preset for display
+  // Auto-select the backend active preset on first load; after that, selection drives training.
   if (state.selectedPresetId && rewardPresetById(state.selectedPresetId)) selectPresetForEdit(state.selectedPresetId);
   else if (state.activePresetId) selectPresetForEdit(state.activePresetId);
 }
@@ -2229,9 +2344,9 @@ function toggleTerrainCategoriesCollapsed() {
 }
 
 function renderTerrainPresets() {
-  const { terrainPresets, activeTerrainPresetId, selectedTerrainPresetId } = state;
+  const { terrainPresets, selectedTerrainPresetId } = state;
   $("#terrain-preset-list").innerHTML = terrainPresets.map((p) => `
-    <div class="preset-card ${p.id === selectedTerrainPresetId ? "selected" : ""} ${p.id === activeTerrainPresetId ? "active-for-training" : ""}"
+    <div class="preset-card ${p.id === selectedTerrainPresetId ? "selected" : ""}"
          data-terrain-preset-id="${escapeHtml(p.id)}"
          title="${escapeHtml(p.description)}">
       <div class="preset-card-name">${escapeHtml(p.name)}</div>
@@ -2241,9 +2356,7 @@ function renderTerrainPresets() {
   document.querySelectorAll(".preset-card[data-terrain-preset-id]").forEach((card) => {
     card.addEventListener("click", () => selectTerrainPresetForEdit(card.dataset.terrainPresetId));
   });
-  const activePreset = terrainPresets.find((p) => p.id === activeTerrainPresetId) || { name: activeTerrainPresetId };
-  const el = $("#train-active-terrain-preset-name");
-  if (el) el.textContent = activePreset.name || activeTerrainPresetId;
+  updateTrainingPresetIndicators();
 }
 
 function selectTerrainPresetForEdit(presetId) {
@@ -2264,11 +2377,11 @@ function selectTerrainPresetForEdit(presetId) {
     descInput.disabled = Boolean(preset.built_in);
   }
   $("#terrain-preset-builtin-badge").hidden = !preset.built_in;
-  const isActive = preset.id === state.activeTerrainPresetId;
   const activateBtn = $("#terrain-preset-activate-btn");
-  activateBtn.disabled = false;
-  activateBtn.textContent = isActive ? "✓ Active for Training" : "Use for Training";
-  activateBtn.style.fontWeight = isActive ? "900" : "";
+  if (activateBtn) {
+    activateBtn.disabled = true;
+    activateBtn.hidden = true;
+  }
   $("#terrain-preset-collapse-all-btn").disabled = false;
   $("#terrain-preset-duplicate-btn").disabled = false;
   $("#terrain-preset-delete-btn").disabled = preset.built_in;
@@ -2293,7 +2406,8 @@ async function loadTerrainPage() {
     $("#terrain-categories").innerHTML = "";
     $("#terrain-files").innerHTML = "";
     $("#terrain-values").innerHTML = "";
-    $("#terrain-preset-activate-btn").disabled = true;
+    const activateBtn = $("#terrain-preset-activate-btn");
+    if (activateBtn) activateBtn.disabled = true;
     $("#terrain-preset-collapse-all-btn").disabled = true;
     $("#terrain-preset-duplicate-btn").disabled = true;
     $("#terrain-preset-delete-btn").disabled = true;
@@ -2590,7 +2704,7 @@ function updateBulkToolbar() {
   if (count) count.textContent = `${selectedCount} selected`;
   if (move) move.disabled = selectedCount === 0;
   if (clear) clear.disabled = selectedCount === 0;
-  if (deleteButton) deleteButton.disabled = selectedCount === 0;
+  if (deleteButton) deleteButton.disabled = selectedCount === 0 || state.isBulkDeleting;
 }
 
 function toggleRunSelection(runId, checked) {
@@ -2654,8 +2768,8 @@ function renderFolderSidebar() {
   for (const folder of state.folders) {
     folderCounts[folder] = state.runs.filter((r) => r.folder === folder).length;
   }
-  const allActive = state.activeFolder === null ? "active" : "";
   const uncatActive = state.activeFolder === "" ? "active" : "";
+  const allActive = state.activeFolder === null ? "active" : "";
   const folderItems = state.folders
     .map((f) => {
       const active = state.activeFolder === f ? "active" : "";
@@ -2672,13 +2786,13 @@ function renderFolderSidebar() {
       <span class="folder-create-symbol">+</span>
       <span>New Folder</span>
     </button>
-    <div class="folder-item ${allActive}" data-folder="__all__">
-      <span class="folder-name">All Runs</span>
-      <span class="folder-count">${total}</span>
-    </div>
     <div class="folder-item ${uncatActive}" data-folder="__uncategorized__">
       <span class="folder-name">Uncategorized</span>
       <span class="folder-count">${uncategorized}</span>
+    </div>
+    <div class="folder-item ${allActive}" data-folder="__all__">
+      <span class="folder-name">All Runs</span>
+      <span class="folder-count">${total}</span>
     </div>
     ${folderItems}
   `;
@@ -3357,7 +3471,7 @@ $("#open-video-folder").addEventListener("click", () => openVideoFolder().catch(
 $("#copy-video-path").addEventListener("click", () => copyVideoPath().catch(handleActionError));
 $("#debug-refresh").addEventListener("click", refreshDebug);
 $("#copy-debug").addEventListener("click", () => copyDebugOutput().catch(handleActionError));
-$("#copy-attach").addEventListener("click", () => copyAttachCommand().catch(handleActionError));
+$("#copy-command").addEventListener("click", () => copyLaunchCommand().catch(handleActionError));
 $("#terminal-view").addEventListener("click", () => openTerminalView());
 $("#open-process-log-folder").addEventListener("click", () => openProcessLogFolder().catch(handleActionError));
 $("#stop-process").addEventListener("click", () => stopSelectedProcess().catch(handleActionError));
@@ -3376,9 +3490,12 @@ $("#play-run").addEventListener("click", () => {
 $("#tensorboard-run").addEventListener("click", () => state.selectedRun && handleRunAction("tensorboard", state.selectedRun.id));
 
 // Rewards page event listeners
-$("#preset-activate-btn").addEventListener("click", () => {
-  if (state.selectedPresetId) activatePreset(state.selectedPresetId).catch(handleActionError);
-});
+const presetActivateBtn = $("#preset-activate-btn");
+if (presetActivateBtn) {
+  presetActivateBtn.addEventListener("click", () => {
+    if (state.selectedPresetId) activatePreset(state.selectedPresetId).catch(handleActionError);
+  });
+}
 $("#preset-duplicate-btn").addEventListener("click", () => {
   if (state.selectedPresetId) duplicatePreset(state.selectedPresetId).catch(handleActionError);
 });
@@ -3391,9 +3508,12 @@ $("#preset-save-btn").addEventListener("click", () => {
 $("#preset-collapse-all-btn").addEventListener("click", toggleRewardCategoriesCollapsed);
 
 // Terrain page event listeners
-$("#terrain-preset-activate-btn").addEventListener("click", () => {
-  if (state.selectedTerrainPresetId) activateTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
-});
+const terrainPresetActivateBtn = $("#terrain-preset-activate-btn");
+if (terrainPresetActivateBtn) {
+  terrainPresetActivateBtn.addEventListener("click", () => {
+    if (state.selectedTerrainPresetId) activateTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
+  });
+}
 $("#terrain-preset-duplicate-btn").addEventListener("click", () => {
   if (state.selectedTerrainPresetId) duplicateTerrainPreset(state.selectedTerrainPresetId).catch(handleActionError);
 });

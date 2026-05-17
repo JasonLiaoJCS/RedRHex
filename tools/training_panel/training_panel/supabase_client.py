@@ -183,6 +183,13 @@ class SupabaseClient:
             {"id": f"eq.{job_id}"},
         )
 
+    def mark_job_running(self, job_id: str):
+        return self.update(
+            "jobs",
+            {"status": "running"},
+            {"id": f"eq.{job_id}"},
+        )
+
     def fail_job(self, job_id: str, message: str, result: dict | None = None):
         return self.update(
             "jobs",

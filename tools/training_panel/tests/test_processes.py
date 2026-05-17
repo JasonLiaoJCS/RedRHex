@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -8,7 +9,7 @@ from unittest.mock import Mock, patch
 from tools.training_panel.training_panel.commands import TrainingParams, VideoParams
 from tools.training_panel.training_panel.config import PanelPaths
 from tools.training_panel.training_panel.history import HistoryStore
-from tools.training_panel.training_panel.processes import EXTERNAL_TRAINING_ID_PREFIX, ProcessRegistry, SpawnedProcess
+from tools.training_panel.training_panel.processes import EXTERNAL_TRAINING_ID_PREFIX, ProcessInfo, ProcessRegistry, SpawnedProcess
 
 
 class ProcessRegistryTests(unittest.TestCase):
@@ -54,6 +55,7 @@ class ProcessRegistryTests(unittest.TestCase):
                     "tweak_source_label": "Run One",
                     "requester_id": "11111111-1111-4111-8111-111111111111",
                     "requester_label": "Jason",
+                    "display_name": "stair warmup",
                 }
             )
             with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
@@ -66,13 +68,124 @@ class ProcessRegistryTests(unittest.TestCase):
             self.assertEqual(record["created_by"], "11111111-1111-4111-8111-111111111111")
             self.assertEqual(record["requester_label"], "Jason")
             self.assertEqual(record["reward_preset_id"], "tweak-run-one")
+            self.assertEqual(record["display_name"], "stair warmup")
+            self.assertEqual(record["params"]["display_name"], "stair warmup")
+
+    def test_queue_training_starts_immediately_when_gpu_is_free(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                run = registry.queue_training(params)
+
+            record = history.get_run(run["id"])
+            self.assertEqual(record["status"], "running")
+            self.assertEqual([process["kind"] for process in registry.running_isaac_processes()], ["training"])
+
+    def test_queue_training_waits_behind_active_gpu_process(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                active = registry.start_training(params)
+                queued = registry.queue_training(params)
+
+            self.assertEqual(history.get_run(active["id"])["status"], "running")
+            self.assertEqual(history.get_run(queued["id"])["status"], "queued")
+            self.assertIsNone(history.get_run(queued["id"]).get("pid"))
+
+    def test_cancel_queued_training(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                registry.start_training(params)
+                queued = registry.queue_training(params)
+
+            self.assertTrue(registry.cancel_queued_training(queued["id"]))
+            self.assertEqual(history.get_run(queued["id"])["status"], "cancelled")
+
+    def test_start_next_queued_training_when_gpu_becomes_free(self):
+        class MutableProcess:
+            pid = 12345
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        class RunningProcess:
+            pid = 12346
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            active_proc = MutableProcess()
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=active_proc)), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                registry.start_training(params)
+                queued = registry.queue_training(params)
+            active_proc.returncode = 0
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=RunningProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                started = registry.start_next_queued_training()
+
+            self.assertEqual(started["id"], queued["id"])
+            self.assertEqual(history.get_run(queued["id"])["status"], "running")
+            self.assertEqual(history.get_run(queued["id"])["pid"], 12346)
 
     def test_play_process_debug_streams_log_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = self.make_paths(root)
-            registry = ProcessRegistry(paths, HistoryStore(paths))
-            result = registry.start_play("run_one", "/tmp/checkpoint.pt", device="cpu")
+            history = HistoryStore(paths)
+            log_dir = paths.rsl_rl_log_root / "run_one"
+            params_dir = log_dir / "params"
+            params_dir.mkdir(parents=True)
+            checkpoint = log_dir / "model_10.pt"
+            checkpoint.write_text("x", encoding="utf-8")
+            (params_dir / "env.yaml").write_text(
+                "terrain:\n  terrain_type: plane\nterrain_curriculum_enable: false\n",
+                encoding="utf-8",
+            )
+            history.add_run({"id": "run_one", "source": "training_panel", "status": "completed", "log_dir": str(log_dir)})
+            registry = ProcessRegistry(paths, history)
+            result = registry.start_play("run_one", str(checkpoint), device="cpu")
             try:
                 debug = registry.get_process_debug(result["id"])
                 self.assertIsNotNone(debug)
@@ -80,6 +193,12 @@ class ProcessRegistryTests(unittest.TestCase):
                 self.assertIsNone(debug["returncode"])
                 self.assertEqual(debug["source_run_id"], "run_one")
                 self.assertIn("scripts/rsl_rl/play.py", debug["command"])
+                self.assertIn("--terrain_override_file", debug["command"])
+                self.assertIn("--camera_follow_robot", debug["command"])
+                self.assertIn("--camera_eye -3.0 -2.4 1.6", debug["command"])
+                override_files = list(paths.process_override_dir.glob("*_terrain.json"))
+                self.assertEqual(len(override_files), 1)
+                self.assertIn("terrain.terrain_type", override_files[0].read_text(encoding="utf-8"))
                 self.assertIn("fake isaaclab", debug["log_tail"])
             finally:
                 proc = registry._processes.get(result["id"])
@@ -106,9 +225,14 @@ class ProcessRegistryTests(unittest.TestCase):
             paths = self.make_paths(root)
             history = HistoryStore(paths)
             log_dir = paths.rsl_rl_log_root / "run_one"
-            log_dir.mkdir(parents=True)
+            params_dir = log_dir / "params"
+            params_dir.mkdir(parents=True)
             checkpoint = log_dir / "model_10.pt"
             checkpoint.write_text("x", encoding="utf-8")
+            (params_dir / "env.yaml").write_text(
+                "terrain:\n  terrain_type: plane\nterrain_curriculum_enable: false\n",
+                encoding="utf-8",
+            )
             history.add_run(
                 {
                     "id": "run_one",
@@ -137,6 +261,12 @@ class ProcessRegistryTests(unittest.TestCase):
                 self.assertIn("--video_height 1080", debug["command"])
                 self.assertIn("--video_fps 30", debug["command"])
                 self.assertIn("--rendering_mode quality", debug["command"])
+                self.assertIn("--terrain_override_file", debug["command"])
+                self.assertIn("--camera_follow_robot", debug["command"])
+                self.assertIn("--camera_lookat 0.45 0.0 0.35", debug["command"])
+                override_files = list(paths.process_override_dir.glob("*_terrain.json"))
+                self.assertEqual(len(override_files), 1)
+                self.assertIn("terrain.terrain_type", override_files[0].read_text(encoding="utf-8"))
                 self.assertIn("attach_command", debug)
                 run = history.get_run("run_one")
                 self.assertEqual(run["video_status"], "recording")
@@ -148,6 +278,69 @@ class ProcessRegistryTests(unittest.TestCase):
                 if proc:
                     proc.wait(timeout=8)
                 time.sleep(0.1)
+
+    def test_process_terrain_override_falls_back_to_run_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            history.add_run(
+                {
+                    "id": "run_one",
+                    "source": "training_panel",
+                    "status": "completed",
+                    "created_at": "2026-05-15T11:00:00",
+                    "terrain_overrides": {"terrain.terrain_type": "plane"},
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+            path = registry._write_process_terrain_override("play_test", "run_one")
+            self.assertIsNotNone(path)
+            self.assertIn("run metadata", Path(path).read_text(encoding="utf-8"))
+            self.assertIn("terrain.terrain_type", Path(path).read_text(encoding="utf-8"))
+
+    def test_process_terrain_override_prefers_panel_metadata_over_env_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            log_dir = paths.rsl_rl_log_root / "run_one"
+            params_dir = log_dir / "params"
+            params_dir.mkdir(parents=True)
+            (params_dir / "env.yaml").write_text(
+                "terrain:\n  terrain_type: generator\n  max_init_terrain_level: 3\n",
+                encoding="utf-8",
+            )
+            history.add_run(
+                {
+                    "id": "run_one",
+                    "source": "training_panel",
+                    "status": "completed",
+                    "created_at": "2026-05-15T11:00:00",
+                    "log_dir": str(log_dir),
+                    "terrain_overrides": {
+                        "terrain.terrain_type": "plane",
+                        "terrain.max_init_terrain_level": 0,
+                    },
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+
+            path = registry._write_process_terrain_override("play_test", "run_one")
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["source"], "run metadata")
+            self.assertEqual(payload["overrides"]["terrain.terrain_type"], "plane")
+            self.assertEqual(payload["overrides"]["terrain.max_init_terrain_level"], 0)
+
+    def test_process_terrain_override_absent_for_old_runs_without_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            history.add_run({"id": "old_run", "source": "rsl_rl", "status": "completed"})
+            registry = ProcessRegistry(paths, history)
+            self.assertIsNone(registry._write_process_terrain_override("play_test", "old_run"))
 
     def test_onnx_export_process_uses_export_only_flags_and_updates_history(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,6 +455,111 @@ class ProcessRegistryTests(unittest.TestCase):
                 registry.stop(result["id"])
                 if proc:
                     proc.wait(timeout=8)
+
+    def test_running_for_log_dir_blocks_unlinked_active_training_log(self):
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            paths.ensure_dirs()
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            history.add_run({
+                "id": "panel_run",
+                "source": "training_panel",
+                "status": "running",
+                "created_at": "2026-05-17T01:35:27",
+                "process_log": str(paths.process_log_dir / "panel_run.log"),
+                "log_dir": None,
+            })
+            log_dir = paths.rsl_rl_log_root / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            os.utime(log_dir, (1778952937, 1778952937))
+            process_log = paths.process_log_dir / "panel_run.log"
+            process_log.write_text(f"Writing events to {log_dir}\n", encoding="utf-8")
+            registry._processes["panel_run"] = FakeProcess()
+            registry._infos["panel_run"] = ProcessInfo(
+                kind="training",
+                pid=12345,
+                run_id="panel_run",
+                log_file=str(process_log),
+                started_at="2026-05-17T01:35:27",
+                command="train.py --task Template-Redrhex-Direct-v0",
+            )
+
+            running = registry.running_for_log_dir(log_dir)
+
+            self.assertEqual([process["run_id"] for process in running], ["panel_run"])
+
+    def test_running_for_log_dir_uses_saved_start_time_for_external_training(self):
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            paths.ensure_dirs()
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            history.add_run({
+                "id": "panel_run",
+                "source": "training_panel",
+                "status": "running",
+                "created_at": "2026-05-17T01:35:27",
+                "process_log": str(paths.process_log_dir / "panel_run.log"),
+                "log_dir": None,
+            })
+            log_dir = paths.rsl_rl_log_root / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            os.utime(log_dir, (1778952937, 1778952937))
+            process_log = paths.process_log_dir / "panel_run.log"
+            process_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_01-35-34\n",
+                encoding="utf-8",
+            )
+            registry._processes["external_training_123"] = FakeProcess()
+            registry._infos["external_training_123"] = ProcessInfo(
+                kind="training",
+                pid=12345,
+                run_id="external_training_123",
+                source_run_id="panel_run",
+                log_file=str(process_log),
+                started_at="",
+                command="train.py --task Template-Redrhex-Direct-v0",
+            )
+
+            running = registry.running_for_log_dir(log_dir)
+
+            self.assertEqual([process["run_id"] for process in running], ["external_training_123"])
+
+    def test_log_dir_from_process_log_recovers_deleted_event_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            paths.ensure_dirs()
+            process_log = paths.process_log_dir / "panel_run.log"
+            deleted_log_dir = paths.rsl_rl_log_root / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            process_log.write_text(
+                "FileNotFoundError: [Errno 2] No such file or directory: "
+                f"b'{deleted_log_dir}/events.out.tfevents.1778952937.host.2617302.0'\n",
+                encoding="utf-8",
+            )
+            history = HistoryStore(paths)
+            history.add_run({
+                "id": "panel_run",
+                "source": "training_panel",
+                "status": "running",
+                "created_at": "2026-05-17T01:35:27",
+                "process_log": str(process_log),
+                "log_dir": None,
+            })
+            registry = ProcessRegistry(paths, history)
+
+            self.assertEqual(registry._log_dir_from_process_log("panel_run"), str(deleted_log_dir))
 
     def test_training_command_match_rejects_conflicting_args(self):
         recorded = (
@@ -446,6 +744,139 @@ class ProcessRegistryTests(unittest.TestCase):
             self.assertEqual(panel["log_dir"], str(log_dir))
             self.assertEqual(panel["latest_checkpoint"], str(log_dir / "model_9999.pt"))
             self.assertFalse(any(run["id"] == log_dir.name for run in runs))
+
+    def test_reconcile_persists_running_panel_log_dir_before_exit(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            process_log = paths.process_log_dir / "panel_running.log"
+            process_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_01-35-34\n",
+                encoding="utf-8",
+            )
+            log_dir = paths.rsl_rl_log_root / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_1.pt").write_text("x", encoding="utf-8")
+            history.add_run(
+                {
+                    "id": "panel_running",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T01:35:27",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+            registry._processes["panel_running"] = FakeProcess()
+            registry._infos["panel_running"] = ProcessInfo(
+                kind="training",
+                pid=12345,
+                run_id="panel_running",
+                log_file=str(process_log),
+                started_at="2026-05-17T01:35:27",
+                command="train.py --task Template-Redrhex-Direct-v0",
+            )
+
+            with patch("tools.training_panel.training_panel.processes.subprocess.check_output", return_value=""):
+                registry.reconcile_stale_history()
+
+            raw = next(record for record in history._load_data()["runs"] if record["id"] == "panel_running")
+            panel = history.get_run("panel_running")
+            self.assertEqual(raw["status"], "running")
+            self.assertEqual(raw["log_dir"], str(log_dir))
+            self.assertEqual(panel["latest_checkpoint"], str(log_dir / "model_1.pt"))
+
+    def test_reconcile_persists_fresh_discovered_log_before_exact_name(self):
+        class FakeProcess:
+            pid = 12346
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            process_log = paths.process_log_dir / "panel_running.log"
+            process_log.write_text("Isaac startup has not printed the experiment name yet.\n", encoding="utf-8")
+            log_dir = paths.rsl_rl_log_root / "2026-05-17_10-21-24_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_0.pt").write_text("x", encoding="utf-8")
+            history.add_run(
+                {
+                    "id": "panel_20260517_102117_740732",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T10:21:17",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+            registry._processes["panel_20260517_102117_740732"] = FakeProcess()
+            registry._infos["panel_20260517_102117_740732"] = ProcessInfo(
+                kind="training",
+                pid=12346,
+                run_id="panel_20260517_102117_740732",
+                log_file=str(process_log),
+                started_at="2026-05-17T10:21:17",
+                command="train.py --task Template-Redrhex-Direct-v0",
+            )
+
+            with patch("tools.training_panel.training_panel.processes.subprocess.check_output", return_value=""):
+                registry.reconcile_stale_history()
+
+            raw = next(record for record in history._load_data()["runs"] if record["id"] == "panel_20260517_102117_740732")
+            runs = history.list_runs()
+            self.assertEqual([run["id"] for run in runs], ["panel_20260517_102117_740732"])
+            self.assertEqual(raw["status"], "running")
+            self.assertEqual(raw["log_dir"], str(log_dir))
+
+    def test_reconcile_failed_run_does_not_time_fallback_to_neighbor_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            process_log = paths.process_log_dir / "panel_failed.log"
+            process_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_10-31-01\n"
+                "CUDA error: out of memory\n",
+                encoding="utf-8",
+            )
+            exit_file = paths.process_log_dir / "panel_failed.exit"
+            exit_file.write_text("1", encoding="utf-8")
+            neighbor_log = paths.rsl_rl_log_root / "2026-05-17_10-30-57_wheg_locomotion_reform_v1"
+            neighbor_log.mkdir(parents=True)
+            (neighbor_log / "model_19.pt").write_text("x", encoding="utf-8")
+            history.add_run(
+                {
+                    "id": "panel_failed",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T10:30:55",
+                    "process_log": str(process_log),
+                    "exit_file": str(exit_file),
+                    "log_dir": None,
+                }
+            )
+            registry = ProcessRegistry(paths, history)
+
+            with patch("tools.training_panel.training_panel.processes.subprocess.check_output", return_value=""):
+                registry.reconcile_stale_history()
+
+            run = history.get_run("panel_failed")
+            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["returncode"], 1)
+            self.assertIsNone(run["log_dir"])
+            self.assertIsNone(run["latest_checkpoint"])
 
     def test_reconcile_stale_history_marks_missing_panel_process_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp:

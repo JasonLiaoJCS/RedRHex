@@ -21,11 +21,20 @@ REMOTE_JOB_TYPES = {
     "tensorboard",
     "compact_run",
     "delete_run",
+    "send_missed_notifications",
 }
 
 ROLE_PERMISSIONS = {
     "viewer": set(),
-    "operator": {"start_training", "stop_process", "record_video", "export_onnx", "tensorboard", "compact_run"},
+    "operator": {
+        "start_training",
+        "stop_process",
+        "record_video",
+        "export_onnx",
+        "tensorboard",
+        "compact_run",
+        "send_missed_notifications",
+    },
     "admin": set(REMOTE_JOB_TYPES),
 }
 

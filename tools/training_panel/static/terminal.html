@@ -18,17 +18,23 @@
           <button type="button" id="terminal-theme" class="ghost-button">Dark Mode</button>
           <button type="button" id="terminal-refresh" class="ghost-button">Refresh</button>
           <button type="button" id="terminal-copy" class="ghost-button">Copy Output</button>
-          <button type="button" id="terminal-attach" class="ghost-button">Copy Attach</button>
-          <button type="button" id="terminal-stop" class="ghost-button">Stop Process</button>
+          <button type="button" id="terminal-command-copy" class="ghost-button">Copy Command</button>
+          <button type="button" id="terminal-stop" class="danger-button">Stop Process</button>
         </div>
       </header>
       <section class="terminal-grid">
-        <article>
-          <h2>Command</h2>
+        <article id="terminal-command-block">
+          <div class="console-label">
+            <span>Launch Command</span>
+            <small>Command the panel used to start this process.</small>
+          </div>
           <pre id="terminal-command"></pre>
         </article>
         <article>
-          <h2>Output</h2>
+          <div class="console-label">
+            <span>Process Output</span>
+            <small>Captured stdout/stderr from the selected process.</small>
+          </div>
           <pre id="terminal-output"></pre>
         </article>
       </section>

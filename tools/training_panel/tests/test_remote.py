@@ -41,8 +41,10 @@ class FakeClient:
         self.deletes = []
         self.uploads = []
         self.inserts = []
+        self.updates = []
         self.function_calls = []
         self.claim_gpu_locked = []
+        self.select_by_table = {}
         self.raise_on_artifacts_upsert = False
         self.raise_on_activity_insert = False
 
@@ -71,7 +73,18 @@ class FakeClient:
             raise RuntimeError("activity schema missing")
         self.inserts.append((table, payload, kwargs))
 
+    def update(self, table, payload, query=None, **kwargs):
+        self.updates.append((table, payload, query, kwargs))
+        return [payload]
+
+    def mark_job_running(self, job_id):
+        self.updates.append(("jobs", {"status": "running"}, {"id": f"eq.{job_id}"}, {}))
+        return [{"id": job_id, "status": "running"}]
+
     def select(self, table, query=None):
+        if table in self.select_by_table:
+            value = self.select_by_table[table]
+            return value(query) if callable(value) else value
         return self.select_rows
 
     def delete(self, table, query=None):
@@ -175,6 +188,7 @@ class RemoteTests(unittest.TestCase):
         self.assertTrue(role_allows("operator", "export_onnx"))
         self.assertTrue(role_allows("operator", "tensorboard"))
         self.assertTrue(role_allows("operator", "compact_run"))
+        self.assertTrue(role_allows("operator", "send_missed_notifications"))
         self.assertFalse(role_allows("operator", "delete_run"))
         self.assertTrue(role_allows("admin", "delete_run"))
 
@@ -201,6 +215,7 @@ class RemoteTests(unittest.TestCase):
             result = worker.poll_once()
             self.assertEqual(result["status"], "completed")
             self.assertEqual(client.completed[0][0], "job_one")
+            self.assertIn(("jobs", {"status": "running"}, {"id": "eq.job_one"}, {}), client.updates)
 
     def test_worker_records_team_activity_without_blocking_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,6 +355,29 @@ class RemoteTests(unittest.TestCase):
             params = executor.processes.start_training.call_args.args[0]
             self.assertEqual(params.requester_id, actor_id)
 
+    def test_executor_uses_payload_requester_when_actor_id_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._make_executor(Path(tmp))
+            executor.processes.start_training = MagicMock(return_value={"id": "run_new", "status": "running"})
+            requester_id = "22222222-2222-4222-8222-222222222222"
+
+            executor.execute({
+                "type": "start_training",
+                "actor_role": "operator",
+                "payload": {
+                    "task": "Template-Redrhex-Direct-v0",
+                    "num_envs": 64,
+                    "max_iterations": 100,
+                    "device": "cuda:0",
+                    "requester_id": requester_id,
+                    "requester_label": "phone user",
+                },
+            })
+
+            params = executor.processes.start_training.call_args.args[0]
+            self.assertEqual(params.requester_id, requester_id)
+            self.assertEqual(params.requester_label, "phone user")
+
     def test_executor_compact_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             executor = self._make_executor(Path(tmp))
@@ -411,6 +449,49 @@ class RemoteTests(unittest.TestCase):
                 self.assertTrue(run["created_at"])
                 self.assertTrue(run["updated_at"])
 
+    def test_worker_immediately_syncs_launched_training_run_with_requester(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            requester_id = "11111111-1111-4111-8111-111111111111"
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True, sync_interval_seconds=999)
+            client = FakeClient(job={
+                "id": "job_one",
+                "type": "start_training",
+                "actor_role": "operator",
+                "actor_id": requester_id,
+                "payload": {
+                    "task": "Template-Redrhex-Direct-v0",
+                    "num_envs": 4,
+                    "max_iterations": 8,
+                    "requester_id": requester_id,
+                    "requester_label": "phone user",
+                },
+            })
+            executor = FakeExecutor(result=RemoteJobResult(
+                local_run_id="panel_run",
+                process_id="panel_run",
+                payload={
+                    "id": "panel_run",
+                    "status": "running",
+                    "created_at": "2026-05-17T00:00:00",
+                    "params": {"task": "Template-Redrhex-Direct-v0"},
+                },
+            ))
+            executor.sync_runs_payload = MagicMock(return_value=[])
+            worker = RemoteWorker(config, paths, client, executor=executor)
+
+            result = worker.poll_once()
+
+            self.assertEqual(result["status"], "completed")
+            run_upserts = [item for item in client.upserts if item[0] == "runs"]
+            self.assertTrue(run_upserts)
+            launched = run_upserts[0][1]
+            self.assertEqual(launched["id"], "panel_run")
+            self.assertEqual(launched["status"], "running")
+            self.assertEqual(launched["created_by"], requester_id)
+            self.assertEqual(launched["params"]["requester_id"], requester_id)
+
     def test_worker_sync_runs_preserves_created_by_and_dispatches_notifications(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -440,6 +521,103 @@ class RemoteTests(unittest.TestCase):
             self.assertIn("training_completed", event_types)
             self.assertIn("video_ready", event_types)
             self.assertTrue(all(call[1]["requester_id"] == actor_id for call in client.function_calls))
+
+    def test_worker_missed_notifications_backfills_requester_and_skips_sent_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            requester_id = "11111111-1111-4111-8111-111111111111"
+            client = FakeClient(job={
+                "id": "job_missed",
+                "type": "send_missed_notifications",
+                "actor_role": "operator",
+                "actor_id": requester_id,
+                "payload": {"scope": "latest", "requester_id": requester_id, "requester_label": "phone user"},
+            })
+            client.select_by_table["jobs"] = [{
+                "id": "job_start",
+                "type": "start_training",
+                "machine_id": "lab-pc",
+                "actor_id": requester_id,
+                "payload": {"requester_id": requester_id},
+                "result": {"local_run_id": "run_one"},
+            }]
+            client.select_by_table["notification_settings"] = [{
+                "user_id": requester_id,
+                "machine_id": "lab-pc",
+                "discord_enabled": True,
+                "notify_training_completed": True,
+            }]
+            client.select_by_table["run_events"] = [{
+                "event_key": "run_one:training_completed:0",
+                "notification_status": "sent",
+            }]
+            executor = FakeExecutor()
+            executor.sync_runs_payload = MagicMock(return_value=[
+                {
+                    "id": "run_one",
+                    "status": "completed",
+                    "created_at": "2026-05-17T00:00:00",
+                    "updated_at": "2026-05-17T00:01:00",
+                    "params": {"task": "Template-Redrhex-Direct-v0"},
+                    "artifacts": [],
+                }
+            ])
+            worker = RemoteWorker(RemoteConfig(machine_id="lab-pc", accept_jobs=True), paths, client, executor=executor)
+
+            result = worker.poll_once()
+
+            payload = result["result"]["payload"]
+            self.assertEqual(payload["skipped_sent"], 1)
+            self.assertEqual(payload["sent"], 0)
+            self.assertFalse(client.function_calls)
+            self.assertEqual(worker.history.get_run("run_one")["created_by"], requester_id)
+
+    def test_worker_missed_notifications_sends_unsent_latest_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            requester_id = "11111111-1111-4111-8111-111111111111"
+            client = FakeClient(job={
+                "id": "job_missed",
+                "type": "send_missed_notifications",
+                "actor_role": "operator",
+                "actor_id": requester_id,
+                "payload": {"scope": "latest", "requester_id": requester_id},
+            })
+            client.select_by_table["jobs"] = [{
+                "id": "job_start",
+                "type": "start_training",
+                "machine_id": "lab-pc",
+                "actor_id": requester_id,
+                "result": {"payload": {"id": "run_two"}},
+            }]
+            client.select_by_table["notification_settings"] = [{
+                "user_id": requester_id,
+                "machine_id": "lab-pc",
+                "discord_enabled": True,
+                "notify_training_completed": True,
+            }]
+            client.select_by_table["run_events"] = []
+            executor = FakeExecutor()
+            executor.sync_runs_payload = MagicMock(return_value=[
+                {
+                    "id": "run_two",
+                    "status": "completed",
+                    "created_by": requester_id,
+                    "created_at": "2026-05-17T00:00:00",
+                    "updated_at": "2026-05-17T00:01:00",
+                    "params": {"requester_id": requester_id},
+                    "artifacts": [],
+                }
+            ])
+            worker = RemoteWorker(RemoteConfig(machine_id="lab-pc", accept_jobs=True), paths, client, executor=executor)
+
+            result = worker.poll_once()
+
+            self.assertEqual(result["result"]["payload"]["sent"], 1)
+            self.assertEqual(client.function_calls[0][1]["event_type"], "training_completed")
+            self.assertEqual(client.function_calls[0][1]["requester_id"], requester_id)
 
     def test_worker_passes_gpu_lock_to_job_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +732,31 @@ class RemoteTests(unittest.TestCase):
             self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.panel_deleted"}), client.deletes)
             self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.2026_deleted_run"}), client.deletes)
             self.assertIn(("runs", {"machine_id": "eq.lab-pc", "log_dir": f"eq.{log_dir}"}), client.deletes)
+
+    def test_worker_sync_deleted_runs_can_limit_to_current_tombstone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            paths.ensure_dirs()
+            history = RemoteJobExecutor(paths).history
+            old_log = paths.rsl_rl_log_root / "old_log"
+            new_log = paths.rsl_rl_log_root / "new_log"
+            old_log.mkdir(parents=True)
+            new_log.mkdir(parents=True)
+            history.patch_run_metadata("old_panel", log_dir=str(old_log), source="training_panel")
+            history.patch_run_metadata("new_panel", log_dir=str(new_log), source="training_panel")
+            history.delete_run("old_panel", confirm=True, delete_logs=False)
+            history.delete_run("new_panel", confirm=True, delete_logs=False)
+            config = RemoteConfig(machine_id="lab-pc", accept_jobs=True)
+            client = FakeClient()
+            worker = RemoteWorker(config, paths, client, executor=FakeExecutor())
+
+            count = worker.sync_deleted_runs(tombstones=history.deleted_run_tombstones(run_ids=["new_panel"]))
+
+            self.assertEqual(count, 3)
+            self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.new_panel"}), client.deletes)
+            self.assertIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.new_log"}), client.deletes)
+            self.assertNotIn(("runs", {"machine_id": "eq.lab-pc", "id": "eq.old_panel"}), client.deletes)
 
     def test_worker_uploads_latest_video_and_records_storage_path(self):
         with tempfile.TemporaryDirectory() as tmp:

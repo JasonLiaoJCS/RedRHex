@@ -18,6 +18,8 @@ def _swap_left_right(values: torch.Tensor) -> torch.Tensor:
 
 
 def _transform_policy_obs_left_right(obs: torch.Tensor) -> torch.Tensor:
+    if obs.shape[-1] != 56:
+        return obs.clone()
     obs = obs.clone()
     device = obs.device
 
@@ -44,6 +46,8 @@ def _transform_history_obs_left_right(history_obs: torch.Tensor, policy_obs_dim:
 
 
 def _transform_critic_obs_left_right(critic_obs: torch.Tensor) -> torch.Tensor:
+    if critic_obs.shape[-1] != 47:
+        return critic_obs.clone()
     critic_obs = critic_obs.clone()
     critic_obs[:, 0:6] = -_swap_left_right(critic_obs[:, 0:6])
     critic_obs[:, 6:12] = -_swap_left_right(critic_obs[:, 6:12])
@@ -70,6 +74,8 @@ def _transform_teacher_obs_left_right(
 
 
 def _transform_actions_left_right(actions: torch.Tensor) -> torch.Tensor:
+    if actions.shape[-1] != 12:
+        return actions.clone()
     actions = actions.clone()
     actions[:, 0:6] = -_swap_left_right(actions[:, 0:6])
     actions[:, 6:12] = -_swap_left_right(actions[:, 6:12])

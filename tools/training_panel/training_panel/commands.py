@@ -9,6 +9,8 @@ from .config import PanelPaths
 
 DEFAULT_TASK = "Template-Redrhex-Direct-v0"
 DEFAULT_VIDEO_PRESET = "high"
+DEFAULT_FOLLOW_CAMERA_EYE = (-3.0, -2.4, 1.6)
+DEFAULT_FOLLOW_CAMERA_LOOKAT = (0.45, 0.0, 0.35)
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class TrainingParams:
     tweak_source_label: str | None = None
     requester_id: str | None = None
     requester_label: str | None = None
+    display_name: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainingParams":
@@ -100,6 +103,7 @@ class TrainingParams:
             tweak_source_label=str(data["tweak_source_label"]) if data.get("tweak_source_label") else None,
             requester_id=str(data["requester_id"]) if data.get("requester_id") else None,
             requester_label=str(data["requester_label"]) if data.get("requester_label") else None,
+            display_name=str(data["display_name"]).strip() if data.get("display_name") else None,
         )
         params.validate()
         return params
@@ -115,6 +119,8 @@ class TrainingParams:
             raise ValueError("device must be cpu or cuda[:index]")
         if self.resume and not self.checkpoint:
             raise ValueError("checkpoint is required when resume is enabled")
+        if self.display_name and len(self.display_name) > 120:
+            raise ValueError("display_name must be 120 characters or fewer")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -155,6 +161,10 @@ def play_argv(
     video_height: int | None = None,
     video_fps: int | None = None,
     rendering_mode: str | None = None,
+    terrain_override_file: str | None = None,
+    camera_follow_robot: bool = False,
+    camera_eye: tuple[float, float, float] | None = None,
+    camera_lookat: tuple[float, float, float] | None = None,
     export_policy_only: bool = False,
 ) -> list[str]:
     argv = [
@@ -180,6 +190,14 @@ def play_argv(
             argv.extend(["--video_fps", str(video_fps)])
         if rendering_mode:
             argv.extend(["--rendering_mode", rendering_mode])
+    if terrain_override_file:
+        argv.extend(["--terrain_override_file", terrain_override_file])
+    if camera_follow_robot:
+        eye = camera_eye or DEFAULT_FOLLOW_CAMERA_EYE
+        lookat = camera_lookat or DEFAULT_FOLLOW_CAMERA_LOOKAT
+        argv.append("--camera_follow_robot")
+        argv.extend(["--camera_eye", *(str(value) for value in eye)])
+        argv.extend(["--camera_lookat", *(str(value) for value in lookat)])
     if export_policy_only:
         argv.append("--export_policy_only")
     argv.extend(["--checkpoint", checkpoint])

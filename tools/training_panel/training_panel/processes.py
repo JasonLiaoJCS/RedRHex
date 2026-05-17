@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -15,6 +16,8 @@ from pathlib import Path
 
 from .commands import (
     DEFAULT_VIDEO_PRESET,
+    DEFAULT_FOLLOW_CAMERA_EYE,
+    DEFAULT_FOLLOW_CAMERA_LOOKAT,
     TrainingParams,
     VideoParams,
     display_isaaclab_command,
@@ -27,6 +30,7 @@ from .commands import (
 )
 from .config import PanelPaths, timestamp_id
 from .history import HistoryStore, latest_checkpoint, latest_onnx, latest_video, tail_file
+from .terrain import read_terrain_values_from_yaml
 
 EXTERNAL_PLAY_ID_PREFIX = "external_play_"
 EXTERNAL_ONNX_ID_PREFIX = "external_onnx_"
@@ -38,6 +42,7 @@ EXTERNAL_ID_PREFIXES = (
     EXTERNAL_TRAINING_ID_PREFIX,
     EXTERNAL_TENSORBOARD_ID_PREFIX,
 )
+GPU_PROCESS_KINDS = {"training", "play", "video", "onnx"}
 
 @dataclass
 class ProcessInfo:
@@ -72,6 +77,7 @@ class ProcessRegistry:
         self.paths = paths
         self.history = history
         self._lock = threading.Lock()
+        self._queue_lock = threading.Lock()
         self._processes: dict[str, subprocess.Popen] = {}
         self._infos: dict[str, ProcessInfo] = {}
         self._tensorboards_by_logdir: dict[str, str] = {}
@@ -86,23 +92,28 @@ class ProcessRegistry:
         external = [process for process in self._external_processes() if process.get("process_group") not in known_groups]
         return infos + external
 
+    def queue_training(self, params: TrainingParams) -> dict:
+        with self._queue_lock:
+            if self._queued_training_runs() or self.running_isaac_processes():
+                return self._create_queued_training_run(params)
+            return self._start_training_run(params)
+
     def start_training(self, params: TrainingParams) -> dict:
+        return self._start_training_run(params)
+
+    def _create_queued_training_run(self, params: TrainingParams) -> dict:
         self.paths.ensure_dirs()
         run_id = f"panel_{timestamp_id()}"
-        started_at_epoch = time.time()
-        started_at = datetime.now().isoformat(timespec="seconds")
+        queued_at = datetime.now().isoformat(timespec="seconds")
         script_argv = training_argv(params)
-        shell = shell_for_isaaclab(self.paths, script_argv)
         log_file = self.paths.process_log_dir / f"{run_id}.log"
-        # Write panel overrides before spawning so train.py reads them on startup.
-        self._write_reward_override(params.reward_overrides)
-        self._write_terrain_override(params.terrain_overrides)
         record = {
             "id": run_id,
             "source": "training_panel",
-            "status": "running",
-            "created_at": started_at,
-            "updated_at": started_at,
+            "status": "queued",
+            "created_at": queued_at,
+            "updated_at": queued_at,
+            "queued_at": queued_at,
             "params": params.to_dict(),
             "command": display_isaaclab_command(self.paths, script_argv),
             "process_log": str(log_file),
@@ -113,8 +124,52 @@ class ProcessRegistry:
             "terrain_overrides": params.terrain_overrides,
             "created_by": params.requester_id,
             "requester_label": params.requester_label,
+            "display_name": params.display_name,
         }
         self.history.add_run(record)
+        return record
+
+    def _start_training_run(
+        self,
+        params: TrainingParams,
+        *,
+        run_id: str | None = None,
+        existing_record: dict | None = None,
+    ) -> dict:
+        self.paths.ensure_dirs()
+        run_id = run_id or f"panel_{timestamp_id()}"
+        started_at_epoch = time.time()
+        started_at = datetime.now().isoformat(timespec="seconds")
+        script_argv = training_argv(params)
+        shell = shell_for_isaaclab(self.paths, script_argv)
+        log_file = self.paths.process_log_dir / f"{run_id}.log"
+        # Write panel overrides immediately before spawning so train.py reads the right queued run settings.
+        self._write_reward_override(params.reward_overrides)
+        self._write_terrain_override(params.terrain_overrides)
+        record = {
+            "id": run_id,
+            "source": "training_panel",
+            "status": "running",
+            "created_at": (existing_record or {}).get("created_at", started_at),
+            "updated_at": started_at,
+            "started_at": started_at,
+            "queued_at": (existing_record or {}).get("queued_at"),
+            "params": params.to_dict(),
+            "command": display_isaaclab_command(self.paths, script_argv),
+            "process_log": str(log_file),
+            "log_dir": None,
+            "reward_preset_id": params.reward_preset_id,
+            "reward_overrides": params.reward_overrides,
+            "terrain_preset_id": params.terrain_preset_id,
+            "terrain_overrides": params.terrain_overrides,
+            "created_by": params.requester_id,
+            "requester_label": params.requester_label,
+            "display_name": params.display_name,
+        }
+        if existing_record:
+            self.history.update_run(run_id, **record)
+        else:
+            self.history.add_run(record)
         spawned = self._spawn_shell(run_id, shell, log_file)
         proc = spawned.proc
         self.history.update_run(run_id, pid=proc.pid)
@@ -138,6 +193,41 @@ class ProcessRegistry:
             "attach_command": spawned.attach_command,
         }
 
+    def _queued_training_runs(self) -> list[dict]:
+        queued = [
+            run
+            for run in self.history.list_runs()
+            if run.get("source") == "training_panel" and str(run.get("status") or "").lower() == "queued"
+        ]
+        return sorted(queued, key=lambda run: str(run.get("queued_at") or run.get("created_at") or ""))
+
+    def start_next_queued_training(self) -> dict | None:
+        with self._queue_lock:
+            if self.running_isaac_processes():
+                return None
+            queued = self._queued_training_runs()
+            if not queued:
+                return None
+            run = queued[0]
+            try:
+                params = TrainingParams.from_dict(run.get("params") or {})
+                return self._start_training_run(params, run_id=str(run["id"]), existing_record=run)
+            except Exception as exc:
+                self.history.update_run(
+                    str(run.get("id") or ""),
+                    status="failed",
+                    returncode=1,
+                    queue_error=str(exc),
+                )
+                return None
+
+    def cancel_queued_training(self, run_id: str) -> bool:
+        run = self.history.get_run(run_id)
+        if not run or str(run.get("status") or "").lower() != "queued":
+            return False
+        self.history.update_run(run_id, status="cancelled", cancelled_at=datetime.now().isoformat(timespec="seconds"))
+        return True
+
     def _write_reward_override(self, overrides: dict) -> None:
         import json as _json
         override_file = self.paths.reward_override_file
@@ -156,7 +246,39 @@ class ProcessRegistry:
         elif override_file.exists():
             override_file.unlink()
 
+    def _terrain_overrides_for_run(self, run_id: str, checkpoint: str | Path | None = None) -> tuple[dict, str]:
+        run = self.history.get_run(run_id) or {}
+        metadata_overrides = run.get("terrain_overrides") or (run.get("params") or {}).get("terrain_overrides") or {}
+        if metadata_overrides:
+            return dict(metadata_overrides), "run metadata"
+
+        log_dir = Path(str(run["log_dir"])) if run.get("log_dir") else None
+        if log_dir is None and checkpoint:
+            checkpoint_path = Path(str(checkpoint))
+            if checkpoint_path.name.startswith("model_"):
+                log_dir = checkpoint_path.parent
+
+        if log_dir:
+            env_yaml = log_dir / "params" / "env.yaml"
+            if env_yaml.exists():
+                values = read_terrain_values_from_yaml(env_yaml)
+                if values:
+                    return values, str(env_yaml)
+
+        return {}, "none"
+
+    def _write_process_terrain_override(self, process_id: str, run_id: str, checkpoint: str | Path | None = None) -> str | None:
+        overrides, source = self._terrain_overrides_for_run(run_id, checkpoint)
+        if not overrides:
+            return None
+        self.paths.process_override_dir.mkdir(parents=True, exist_ok=True)
+        path = self.paths.process_override_dir / f"{process_id}_terrain.json"
+        path.write_text(json.dumps({"source": source, "overrides": overrides}, indent=2), encoding="utf-8")
+        return str(path)
+
     def stop(self, run_id: str) -> bool:
+        if self.cancel_queued_training(run_id):
+            return True
         with self._lock:
             proc = self._processes.get(run_id)
             info = self._infos.get(run_id)
@@ -236,8 +358,17 @@ class ProcessRegistry:
         )
 
     def start_play(self, run_id: str, checkpoint: str, device: str = "cuda:0") -> dict:
+        self.paths.ensure_dirs()
         play_id = f"play_{timestamp_id()}"
-        argv = play_argv(checkpoint=checkpoint, device=device)
+        terrain_override_file = self._write_process_terrain_override(play_id, run_id, checkpoint)
+        argv = play_argv(
+            checkpoint=checkpoint,
+            device=device,
+            terrain_override_file=terrain_override_file,
+            camera_follow_robot=True,
+            camera_eye=DEFAULT_FOLLOW_CAMERA_EYE,
+            camera_lookat=DEFAULT_FOLLOW_CAMERA_LOOKAT,
+        )
         shell = shell_for_isaaclab(self.paths, argv)
         log_file = self.paths.process_log_dir / f"{play_id}.log"
         spawned = self._spawn_shell(play_id, shell, log_file)
@@ -270,9 +401,11 @@ class ProcessRegistry:
         device: str = "cuda:0",
         video_params: VideoParams | None = None,
     ) -> dict:
+        self.paths.ensure_dirs()
         params = video_params or VideoParams.from_preset(DEFAULT_VIDEO_PRESET)
         params.validate()
         video_id = f"video_{timestamp_id()}"
+        terrain_override_file = self._write_process_terrain_override(video_id, run_id, checkpoint)
         argv = play_argv(
             checkpoint=checkpoint,
             device=device,
@@ -284,6 +417,10 @@ class ProcessRegistry:
             video_height=params.height,
             video_fps=params.fps,
             rendering_mode=params.rendering_mode,
+            terrain_override_file=terrain_override_file,
+            camera_follow_robot=True,
+            camera_eye=DEFAULT_FOLLOW_CAMERA_EYE,
+            camera_lookat=DEFAULT_FOLLOW_CAMERA_LOOKAT,
         )
         shell = shell_for_isaaclab(self.paths, argv)
         log_file = self.paths.process_log_dir / f"{video_id}.log"
@@ -413,6 +550,54 @@ class ProcessRegistry:
             and (kind is None or process.get("kind") == kind)
         ]
 
+    def running_for_log_dir(self, log_dir: str | Path) -> list[dict]:
+        target = Path(log_dir).resolve()
+        try:
+            target_mtime = target.stat().st_mtime
+        except OSError:
+            target_mtime = 0.0
+        running = []
+        for process in self.list_processes():
+            if process.get("returncode") is not None:
+                continue
+            source_run_id = process.get("source_run_id") or process.get("run_id")
+            run = self.history.get_run(str(source_run_id)) if source_run_id else None
+            run_log_dir = Path(str(run.get("log_dir"))).resolve() if run and run.get("log_dir") else None
+            if run_log_dir == target:
+                running.append(process)
+                continue
+            if process.get("kind") == "training" and self._training_process_may_own_log_dir(process, target, target_mtime):
+                running.append(process)
+        return running
+
+    def _training_process_may_own_log_dir(self, process: dict, log_dir: Path, log_dir_mtime: float) -> bool:
+        if not log_dir_mtime:
+            return False
+        run_id = str(process.get("source_run_id") or process.get("run_id") or "")
+        run = self.history.get_run(run_id) if run_id else None
+        started_at = self._process_started_at_epoch(process, run)
+        if not started_at or log_dir_mtime < started_at:
+            return False
+        process_log = Path(str(process.get("log_file") or ""))
+        if process_log.exists():
+            text = self._head_file(process_log, max_chars=80000) + "\n" + tail_file(process_log, max_chars=200000)
+            if str(log_dir) in text or log_dir.name in text:
+                return True
+            exact_names = re.findall(r"Exact experiment name requested from command line:\s*(\S+)", text)
+            if any(log_dir.name == name or log_dir.name.startswith(f"{name}_") for name in exact_names):
+                return True
+        return bool(run and run.get("source") == "training_panel" and not run.get("log_dir"))
+
+    def _process_started_at_epoch(self, process: dict, run: dict | None = None) -> float:
+        for value in (process.get("started_at"), (run or {}).get("created_at")):
+            if not value:
+                continue
+            try:
+                return datetime.fromisoformat(str(value)).timestamp()
+            except ValueError:
+                continue
+        return 0.0
+
     def running_media_processes(self) -> list[dict]:
         return self.running_isaac_processes()
 
@@ -420,7 +605,7 @@ class ProcessRegistry:
         return [
             process
             for process in self.list_processes()
-            if process.get("returncode") is None and process.get("kind") in ("play", "video", "onnx")
+            if process.get("returncode") is None and process.get("kind") in GPU_PROCESS_KINDS
         ]
 
     def stop_all_for_run(self, source_run_id: str) -> list[str]:
@@ -445,15 +630,26 @@ class ProcessRegistry:
                 continue
             if run.get("status") not in ("running", "stopping"):
                 continue
+            if run.get("log_dir"):
+                self.history.update_run(run["id"], log_dir=run["log_dir"])
+            else:
+                log_dir = self._log_dir_from_process_log(run["id"])
+                if log_dir:
+                    self.history.update_run(run["id"], log_dir=log_dir)
+                    run = {**run, "log_dir": log_dir}
             exit_code = self._exit_code_from_history(run)
             if exit_code is not None:
-                log_dir = run.get("log_dir") or self._completed_log_for_run(run)
+                log_dir = run.get("log_dir") or self._completed_log_for_run(
+                    run,
+                    allow_time_fallback=exit_code == 0,
+                )
                 if log_dir:
                     status = "completed" if exit_code == 0 else "failed"
                     self.history.link_run_to_log(run["id"], log_dir, status=status, returncode=exit_code)
                     continue
             if run.get("id") not in known_process_runs:
                 self.history.update_run(run["id"], status="interrupted")
+        self.start_next_queued_training()
 
     def _exit_code_from_history(self, run: dict) -> int | None:
         exit_file = run.get("exit_file")
@@ -467,7 +663,7 @@ class ProcessRegistry:
         except ValueError:
             return None
 
-    def _completed_log_for_run(self, run: dict) -> str | None:
+    def _completed_log_for_run(self, run: dict, *, allow_time_fallback: bool = True) -> str | None:
         process_log = Path(str(run.get("process_log") or ""))
         if process_log.exists():
             text = self._head_file(process_log, max_chars=120000) + "\n" + tail_file(process_log, max_chars=120000)
@@ -477,6 +673,9 @@ class ProcessRegistry:
                 candidates = [path for path in candidates if path.is_dir()]
                 if candidates:
                     return str(max(candidates, key=lambda path: path.stat().st_mtime))
+                return None
+        if not allow_time_fallback:
+            return None
         created_at = run.get("created_at")
         if created_at:
             try:
@@ -736,6 +935,32 @@ class ProcessRegistry:
                 if process_log:
                     return Path(process_log)
         return None
+
+    def _log_dir_from_process_log(self, run_id: str) -> str | None:
+        run = self.history.get_run(run_id) or {}
+        process_log = Path(str(run.get("process_log") or ""))
+        if not process_log.exists():
+            return None
+        text = self._head_file(process_log, max_chars=120000) + "\n" + tail_file(process_log, max_chars=300000)
+        exact_names = re.findall(r"Exact experiment name requested from command line:\s*(\S+)", text)
+        for name in reversed(exact_names):
+            candidates = [path for path in self.paths.rsl_rl_log_root.glob(f"{name}*") if path.is_dir()]
+            if candidates:
+                return str(max(candidates, key=lambda path: path.stat().st_mtime))
+        root = re.escape(str(self.paths.rsl_rl_log_root))
+        matches = re.findall(rf"({root}/[^\s'\"<>]+)", text)
+        log_dirs = []
+        for match in matches:
+            path = Path(match)
+            if path.name.startswith("events.out.tfevents") or path.name.startswith("model_"):
+                path = path.parent
+            while path.parent != self.paths.rsl_rl_log_root and path != self.paths.rsl_rl_log_root:
+                path = path.parent
+            if path.parent == self.paths.rsl_rl_log_root:
+                log_dirs.append(path)
+        if not log_dirs:
+            return None
+        return str(log_dirs[-1])
 
     def _is_repo_training_process(self, command: str, pid_text: str) -> bool:
         if self._is_tmux_server_command(command):
@@ -998,14 +1223,26 @@ class ProcessRegistry:
         convergence_detected = False
         convergence_notified_at: float | None = None
         log_dir: str | None = None
-        poll_interval = 60  # seconds between TensorBoard reads
+        log_poll_interval = 2.0
+        convergence_poll_interval = 60.0
+        next_convergence_check = 0.0
 
         # Poll while training is running, checking for convergence each cycle.
         while proc.poll() is None:
-            time.sleep(poll_interval)
             if not log_dir:
-                log_dir = self.history.find_latest_log_after(started_at_epoch)
-            if log_dir and not convergence_detected:
+                log_dir = self._log_dir_from_process_log(run_id)
+                if log_dir:
+                    self.history.update_run(run_id, log_dir=log_dir)
+            now = time.time()
+            should_check_convergence = False
+            if now >= next_convergence_check:
+                should_check_convergence = True
+                next_convergence_check = now + convergence_poll_interval
+                if not log_dir:
+                    log_dir = self._log_dir_from_process_log(run_id) or self.history.find_latest_log_after(started_at_epoch)
+                    if log_dir:
+                        self.history.update_run(run_id, log_dir=log_dir)
+            if log_dir and not convergence_detected and should_check_convergence:
                 try:
                     cfg = load_convergence_config(self.paths.convergence_config_file)
                     if cfg.enabled:
@@ -1028,21 +1265,26 @@ class ProcessRegistry:
                                     self.history.update_run(run_id, queue_video_on_completion=True)
                 except Exception:
                     pass  # never let convergence logic crash the monitor thread
+            time.sleep(log_poll_interval)
 
         returncode = proc.wait()
         status = "completed" if returncode == 0 else "failed"
         if not log_dir:
-            log_dir = self.history.find_latest_log_after(started_at_epoch)
+            log_dir = self._log_dir_from_process_log(run_id)
+            if not log_dir and returncode == 0:
+                log_dir = self.history.find_latest_log_after(started_at_epoch)
         self.history.update_run(run_id, status=status, returncode=returncode, log_dir=log_dir)
 
         # Record video when: training succeeded normally, OR convergence was detected and
         # auto_record_video was requested (even if training was stopped early).
         run = self.history.get_run(run_id) or {}
         force_video = bool(run.get("queue_video_on_completion")) and convergence_detected
+        video_started = False
         if (returncode == 0 or force_video) and log_dir:
             checkpoint = latest_checkpoint(Path(log_dir))
             if not checkpoint:
                 self.history.update_run(run_id, video_status="missing_checkpoint")
+                self.start_next_queued_training()
                 return
             try:
                 params = run.get("params") or {}
@@ -1052,10 +1294,13 @@ class ProcessRegistry:
                     device=str(params.get("device") or "cuda:0"),
                     video_params=VideoParams.from_preset(DEFAULT_VIDEO_PRESET),
                 )
+                video_started = True
             except Exception as exc:
                 self.history.update_run(run_id, video_status="failed", video_error=str(exc))
         elif not log_dir:
             pass  # no log dir found — nothing to record
+        if not video_started:
+            self.start_next_queued_training()
 
     def _monitor_video(self, source_run_id: str, video_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()
@@ -1073,6 +1318,7 @@ class ProcessRegistry:
             has_video=bool(video),
             video_error=None if returncode == 0 and video else "Video process finished but no MP4 was produced.",
         )
+        self.start_next_queued_training()
 
     @staticmethod
     def _checkpoint_iteration(checkpoint: str | Path) -> int | None:
@@ -1111,6 +1357,7 @@ class ProcessRegistry:
             has_onnx=bool(onnx_path),
             onnx_error=None if returncode == 0 and onnx_path else "ONNX export finished but policy.onnx was not produced.",
         )
+        self.start_next_queued_training()
 
     @staticmethod
     def _force_stop_after_grace(proc: subprocess.Popen, process_group: int, tmux_session: str | None = None) -> None:

@@ -1,5 +1,5 @@
 {
-  "active_preset_id": "baseline",
+  "active_preset_id": "flat-debug",
   "presets": [
     {
       "id": "baseline",
@@ -133,7 +133,7 @@
           0.14
         ],
         "terrain.terrain_generator.sub_terrains.stairs.step_width": 0.25,
-        "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.4,
+        "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.45,
         "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [
           0.02,
           0.14

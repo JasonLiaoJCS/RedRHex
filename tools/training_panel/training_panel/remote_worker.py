@@ -24,6 +24,13 @@ from .supabase_client import SupabaseClient
 
 VIDEO_BUCKET = "redrhex-videos"
 GPU_JOB_TYPES = {"start_training", "record_video", "export_onnx"}
+FINISHED_RUN_STATUSES = {"completed", "failed", "interrupted"}
+NOTIFICATION_SETTING_KEYS = {
+    "training_converged": "notify_training_converged",
+    "training_completed": "notify_training_completed",
+    "training_failed": "notify_training_failed",
+    "video_ready": "notify_video_ready",
+}
 
 
 def _storage_safe(value: str) -> str:
@@ -108,6 +115,48 @@ def _uuid_or_none(value: str | None) -> str | None:
         return None
 
 
+def _job_payload(job: dict) -> dict:
+    payload = job.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _job_result(job: dict) -> dict:
+    result = job.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def _requester_id_for_job(job: dict) -> str | None:
+    payload = _job_payload(job)
+    return _uuid_or_none(str(job.get("actor_id") or "")) or _uuid_or_none(str(payload.get("requester_id") or ""))
+
+
+def _requester_label_for_job(job: dict, requester_id: str | None = None) -> str | None:
+    payload = _job_payload(job)
+    label = (
+        payload.get("requester_label")
+        or job.get("actor_name")
+        or job.get("actor_email")
+        or job.get("actor_role")
+        or requester_id
+    )
+    return str(label) if label else None
+
+
+def _run_id_for_job(job: dict) -> str:
+    payload = _job_payload(job)
+    result = _job_result(job)
+    result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    return str(
+        payload.get("run_id")
+        or result.get("local_run_id")
+        or result.get("process_id")
+        or result_payload.get("id")
+        or result_payload.get("run_id")
+        or result_payload.get("source_run_id")
+        or ""
+    )
+
+
 @dataclass
 class RemoteJobResult:
     local_run_id: str | None = None
@@ -142,10 +191,10 @@ class RemoteJobExecutor:
 
         if job_type == "start_training":
             params = TrainingParams.from_dict(payload)
-            actor_id = _uuid_or_none(str(job.get("actor_id") or ""))
-            if actor_id:
-                params.requester_id = actor_id
-                params.requester_label = str(job.get("actor_name") or job.get("actor_role") or "Remote member")
+            requester_id = _requester_id_for_job(job)
+            if requester_id:
+                params.requester_id = requester_id
+                params.requester_label = _requester_label_for_job(job, requester_id) or "Remote member"
             result = self.processes.start_training(params)
             return RemoteJobResult(local_run_id=result.get("id"), process_id=result.get("id"), payload=result)
 
@@ -392,9 +441,9 @@ class RemoteWorker:
                     errors.append(f"notify {event.get('event_type')} {run_id}: {exc}")
         return errors
 
-    def sync_deleted_runs(self) -> int:
+    def sync_deleted_runs(self, tombstones: list[dict] | None = None) -> int:
         deleted_count = 0
-        for tombstone in self.history.deleted_run_tombstones():
+        for tombstone in self.history.deleted_run_tombstones() if tombstones is None else tombstones:
             for query in self._deleted_run_queries(tombstone):
                 self.client.delete("runs", query=query)
                 deleted_count += 1
@@ -434,6 +483,250 @@ class RemoteWorker:
         except Exception as exc:
             self.last_sync_error = str(exc)
         return self.last_sync_error
+
+    def _run_record_for_upsert(self, run: dict, requester_id: str | None = None, requester_label: str | None = None) -> dict:
+        now = _now_iso()
+        params = run.get("params") if isinstance(run.get("params"), dict) else {}
+        params = dict(params)
+        if requester_id:
+            params["requester_id"] = requester_id
+        if requester_label:
+            params["requester_label"] = requester_label
+        created_by = requester_id or run.get("created_by") or params.get("requester_id")
+        return {
+            "id": run.get("id"),
+            "machine_id": self.config.machine_id,
+            "status": run.get("status") or "running",
+            "display_name": run.get("display_name"),
+            "folder": run.get("folder"),
+            "notes": run.get("notes"),
+            "created_at": run.get("created_at") or now,
+            "updated_at": run.get("updated_at") or now,
+            "log_dir": run.get("log_dir"),
+            "params": params,
+            "latest_checkpoint": run.get("latest_checkpoint"),
+            "latest_video": run.get("latest_video"),
+            "onnx_path": run.get("onnx_path"),
+            "created_by": created_by,
+        }
+
+    def _sync_launched_training_run(self, job: dict, result: dict) -> str:
+        if str(job.get("type") or job.get("job_type") or "") != "start_training":
+            return ""
+        result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        run_id = str(result.get("local_run_id") or result.get("process_id") or result_payload.get("id") or "")
+        if not run_id:
+            return ""
+        requester_id = _requester_id_for_job(job) or _uuid_or_none(str(result_payload.get("created_by") or ""))
+        requester_label = _requester_label_for_job(job, requester_id) or result_payload.get("requester_label")
+        run_record = {
+            **result_payload,
+            "id": run_id,
+            "status": result_payload.get("status") or "running",
+        }
+        try:
+            self.client.upsert("runs", self._run_record_for_upsert(run_record, requester_id, requester_label))
+        except Exception as exc:
+            return str(exc)
+        return ""
+
+    def _mark_job_running(self, job_id: str) -> None:
+        try:
+            if hasattr(self.client, "mark_job_running"):
+                self.client.mark_job_running(job_id)
+            else:
+                self.client.update("jobs", {"status": "running"}, {"id": f"eq.{job_id}"})
+        except Exception:
+            # Queue visibility is helpful, but a status PATCH must not block launch.
+            return
+
+    def _execute_job(self, job: dict) -> RemoteJobResult:
+        job_type = str(job.get("type") or job.get("job_type") or "")
+        actor_role = str(job.get("actor_role") or job.get("role") or "viewer")
+        if not role_allows(actor_role, job_type):
+            raise PermissionError(f"Role '{actor_role}' cannot run remote job '{job_type}'")
+        if job_type == "send_missed_notifications":
+            return RemoteJobResult(payload=self._send_missed_notifications(job))
+        return self.executor.execute(job)
+
+    def _notification_settings_for_requester(self, requester_id: str) -> dict:
+        try:
+            rows = self.client.select(
+                "notification_settings",
+                query={
+                    "user_id": f"eq.{requester_id}",
+                    "machine_id": f"eq.{self.config.machine_id}",
+                    "select": "*",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return {}
+        return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+
+    def _notification_enabled(self, event: dict, settings: dict) -> bool:
+        if settings and settings.get("discord_enabled") is not True:
+            return False
+        setting_key = NOTIFICATION_SETTING_KEYS.get(str(event.get("event_type") or ""))
+        return not setting_key or settings.get(setting_key, True) is not False
+
+    def _sent_event_exists(self, event_key: str) -> bool:
+        if not event_key:
+            return False
+        try:
+            rows = self.client.select(
+                "run_events",
+                query={
+                    "event_key": f"eq.{event_key}",
+                    "notification_status": "eq.sent",
+                    "select": "event_key,notification_status",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return False
+        return isinstance(rows, list) and bool(rows)
+
+    def _remote_start_jobs(self) -> list[dict]:
+        try:
+            rows = self.client.select(
+                "jobs",
+                query={
+                    "type": "eq.start_training",
+                    "select": "id,machine_id,type,status,payload,result,actor_id,actor_role,created_at,updated_at",
+                    "order": "created_at.desc",
+                    "limit": "200",
+                },
+            )
+        except Exception:
+            return []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def _remote_runs(self) -> list[dict]:
+        try:
+            rows = self.client.select(
+                "runs",
+                query={
+                    "machine_id": f"eq.{self.config.machine_id}",
+                    "select": "*",
+                    "order": "created_at.desc",
+                    "limit": "200",
+                },
+            )
+        except Exception:
+            return []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def _missed_run_candidates(self, requester_id: str, requester_label: str | None = None) -> list[tuple[dict, list[dict]]]:
+        jobs_by_run: dict[str, dict] = {}
+        for job in self._remote_start_jobs():
+            if job.get("machine_id") not in (None, "", self.config.machine_id):
+                continue
+            if _requester_id_for_job(job) != requester_id:
+                continue
+            run_id = _run_id_for_job(job)
+            if run_id:
+                jobs_by_run[run_id] = job
+
+        combined: dict[str, dict] = {}
+        artifacts_by_run: dict[str, list[dict]] = {}
+        for run in self._remote_runs():
+            run_id = str(run.get("id") or "")
+            if run_id:
+                combined[run_id] = dict(run)
+        for local in self.executor.sync_runs_payload():
+            run_id = str(local.get("id") or "")
+            if not run_id:
+                continue
+            artifacts_by_run[run_id] = list(local.get("artifacts") or [])
+            existing = combined.get(run_id, {})
+            existing_params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
+            local_params = local.get("params") if isinstance(local.get("params"), dict) else {}
+            merged = {**existing, **local}
+            merged["params"] = {**existing_params, **local_params}
+            if not merged.get("created_by"):
+                merged["created_by"] = existing.get("created_by") or local.get("created_by") or merged["params"].get("requester_id")
+            combined[run_id] = merged
+
+        candidates: list[tuple[dict, list[dict]]] = []
+        for run_id, run in combined.items():
+            status = str(run.get("status") or "").lower()
+            if status not in FINISHED_RUN_STATUSES:
+                continue
+            params = run.get("params") if isinstance(run.get("params"), dict) else {}
+            owned = str(run.get("created_by") or params.get("requester_id") or "") == requester_id
+            if not owned and run_id not in jobs_by_run:
+                continue
+            if not owned:
+                params = {**params, "requester_id": requester_id}
+                if requester_label:
+                    params["requester_label"] = requester_label
+                run = {**run, "created_by": requester_id, "params": params}
+                try:
+                    self.history.patch_run_metadata(
+                        run_id,
+                        created_by=requester_id,
+                        requester_label=requester_label,
+                        params=params,
+                    )
+                    self.client.upsert("runs", self._run_record_for_upsert(run, requester_id, requester_label))
+                except Exception:
+                    pass
+            candidates.append((run, artifacts_by_run.get(run_id, [])))
+
+        return sorted(
+            candidates,
+            key=lambda item: str(item[0].get("updated_at") or item[0].get("created_at") or ""),
+            reverse=True,
+        )
+
+    def _send_missed_notifications(self, job: dict) -> dict:
+        payload = _job_payload(job)
+        requester_id = _requester_id_for_job(job)
+        if not requester_id:
+            raise ValueError("requester_id is required to send missed notifications")
+        requester_label = _requester_label_for_job(job, requester_id)
+        scope = str(payload.get("scope") or payload.get("mode") or "latest").lower()
+        if scope in {"future", "future_only", "none"}:
+            return {"scope": scope, "checked": 0, "sent": 0, "skipped": 0, "message": "Future notifications only."}
+        if scope not in {"latest", "all"}:
+            raise ValueError("scope must be latest or all")
+
+        settings = self._notification_settings_for_requester(requester_id)
+        candidates = self._missed_run_candidates(requester_id, requester_label)
+        selected = candidates[:1] if scope == "latest" else candidates
+        summary = {
+            "scope": scope,
+            "requester_id": requester_id,
+            "checked": len(candidates),
+            "matched": len(selected),
+            "sent": 0,
+            "skipped_sent": 0,
+            "skipped_disabled": 0,
+            "errors": [],
+        }
+        for run, artifacts in selected:
+            events = notification_events_for_run(
+                run,
+                machine_id=self.config.machine_id,
+                artifacts=artifacts,
+                remote_url=self.config.cloudflare_tunnel_host,
+                require_video_storage=True,
+            )
+            for event in events:
+                if not self._notification_enabled(event, settings):
+                    summary["skipped_disabled"] += 1
+                    continue
+                event_key = str(event.get("event_key") or "")
+                if self._sent_event_exists(event_key):
+                    summary["skipped_sent"] += 1
+                    continue
+                try:
+                    self.client.function_request("notify", event)
+                    summary["sent"] += 1
+                except Exception as exc:
+                    summary["errors"].append(f"{event.get('event_type')} {run.get('id')}: {exc}")
+        return summary
 
     def _remote_artifact_record(self, artifact: dict) -> dict | None:
         run_id = str(artifact.get("run_id") or "")
@@ -583,14 +876,19 @@ class RemoteWorker:
 
         job_id = str(job.get("id"))
         self.active_job_id = job_id
+        self._mark_job_running(job_id)
+        job["status"] = "running"
         self._record_job_activity(job, "queued")
         self._record_job_activity(job, "claimed")
         self._record_job_activity(job, "running")
         try:
-            result = self.executor.execute(job).to_dict()
-            sync_error = self.sync_if_due(force=True)
-            if sync_error:
-                result.setdefault("payload", {})["sync_error"] = sync_error
+            result = self._execute_job(job).to_dict()
+            launch_sync_error = self._sync_launched_training_run(job, result)
+            job_type = str(job.get("type") or job.get("job_type") or "")
+            sync_error = "" if job_type == "send_missed_notifications" else self.sync_if_due(force=True)
+            sync_errors = [error for error in (launch_sync_error, sync_error) if error]
+            if sync_errors:
+                result.setdefault("payload", {})["sync_error"] = "; ".join(sync_errors)
             self.client.complete_job(job_id, result)
             self._record_job_activity(job, "completed", result=result)
             return {"status": "completed", "job_id": job_id, "result": result}

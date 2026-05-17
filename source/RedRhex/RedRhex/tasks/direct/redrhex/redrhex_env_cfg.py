@@ -151,8 +151,8 @@ REDRHEX_CFG = ArticulationCfg(
             # 左側腿：初始角度 -45°（方向相反）
             # =====================================================
             "Revolute_15": 45.0 * math.pi / 180,   # 右前腿 - 45°
-            "Revolute_12": 45.0 * math.pi / 180,   # 右後腿 - 45°
             "Revolute_7": 45.0 * math.pi / 180,    # 右中腿 - 45°
+            "Revolute_12": 45.0 * math.pi / 180,   # 右後腿 - 45°
             "Revolute_18": -45.0 * math.pi / 180,  # 左前腿 - -45°
             "Revolute_23": -45.0 * math.pi / 180,  # 左中腿 - -45°
             "Revolute_24": -45.0 * math.pi / 180,  # 左後腿 - -45°
@@ -173,8 +173,8 @@ REDRHEX_CFG = ArticulationCfg(
             # 這些關節會被鎖定，保持固定角度
             # =====================================================
             "Revolute_5": 45.0 * math.pi / 180,    # 45°
-            "Revolute_13": -45.0 * math.pi / 180,  # -45°
             "Revolute_8": 45.0 * math.pi / 180,    # 45°
+            "Revolute_13": -45.0 * math.pi / 180,  # -45°
             "Revolute_25": 45.0 * math.pi / 180,   # 45°
             "Revolute_26": 45.0 * math.pi / 180,   # 45°
             "Revolute_27": 45.0 * math.pi / 180,   # 45°
@@ -208,8 +208,8 @@ REDRHEX_CFG = ArticulationCfg(
         "main_drive": DCMotorCfg(
             # 這 6 個關節是主驅動關節
             joint_names_expr=[
-                "Revolute_15", "Revolute_12", "Revolute_18",
-                "Revolute_23", "Revolute_24", "Revolute_7"
+                "Revolute_15", "Revolute_7", "Revolute_12",
+                "Revolute_18", "Revolute_23", "Revolute_24",
             ],
             effort_limit=100.0,      # 最大力矩限制（牛頓米）- 馬達能出的最大力
             effort_limit_sim=100.0,
@@ -227,8 +227,8 @@ REDRHEX_CFG = ArticulationCfg(
         # 用途：調整機器人轉彎、側移、保持平衡
         "abad": DCMotorCfg(
             joint_names_expr=[
-                "Revolute_14", "Revolute_11", "Revolute_17",
-                "Revolute_22", "Revolute_21", "Revolute_6"
+                "Revolute_14", "Revolute_6", "Revolute_11",
+                "Revolute_17", "Revolute_22", "Revolute_21",
             ],
             effort_limit=8.0,        # 力矩限制（較小，因為只需微調）
             effort_limit_sim=8.0,
@@ -251,8 +251,8 @@ REDRHEX_CFG = ArticulationCfg(
         # - 高阻尼防止任何振動
         "damper": ImplicitActuatorCfg(
             joint_names_expr=[
-                "Revolute_5", "Revolute_13", "Revolute_25",
-                "Revolute_26", "Revolute_27", "Revolute_8"
+                "Revolute_5", "Revolute_8", "Revolute_13",
+                "Revolute_25", "Revolute_26", "Revolute_27",
             ],
             effort_limit_sim=50.0,   # 高力矩：能抵抗外力維持位置
             velocity_limit_sim=1.0,  # 極低速度限制：防止快速移動

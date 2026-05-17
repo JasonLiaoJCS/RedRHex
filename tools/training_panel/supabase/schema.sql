@@ -1,4 +1,4 @@
--- RedRHex Training Panel V3.0.0 Supabase schema
+-- RedRHex Training Panel V3.0.1 Supabase schema
 -- Apply in the Supabase SQL editor, then configure Row Level Security policies
 -- for your team's auth provider.
 

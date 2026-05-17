@@ -48,6 +48,19 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--rendering_mode") + 1], "quality")
         self.assertEqual(argv[argv.index("--checkpoint") + 1], "/tmp/model_10.pt")
 
+    def test_play_argv_supports_terrain_replay_and_follow_camera(self):
+        argv = play_argv(
+            "/tmp/model_10.pt",
+            terrain_override_file="/tmp/terrain.json",
+            camera_follow_robot=True,
+            camera_eye=(-3.0, -2.4, 1.6),
+            camera_lookat=(0.45, 0.0, 0.35),
+        )
+        self.assertEqual(argv[argv.index("--terrain_override_file") + 1], "/tmp/terrain.json")
+        self.assertIn("--camera_follow_robot", argv)
+        self.assertEqual(argv[argv.index("--camera_eye") + 1 : argv.index("--camera_eye") + 4], ["-3.0", "-2.4", "1.6"])
+        self.assertEqual(argv[argv.index("--camera_lookat") + 1 : argv.index("--camera_lookat") + 4], ["0.45", "0.0", "0.35"])
+
     def test_video_default_is_high_quality(self):
         high = VideoParams.from_preset(None)
         self.assertEqual(high.preset, "high")
@@ -113,6 +126,32 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(params.requester_id, "11111111-1111-4111-8111-111111111111")
         self.assertEqual(params.requester_label, "Jason")
         self.assertNotIn("requester_id", " ".join(training_argv(params)))
+
+    def test_training_params_accept_display_name_without_changing_argv(self):
+        params = TrainingParams.from_dict(
+            {
+                "task": "Template-Redrhex-Direct-v0",
+                "num_envs": 4,
+                "max_iterations": 8,
+                "device": "cuda:0",
+                "display_name": "  stair warmup  ",
+            }
+        )
+        self.assertEqual(params.display_name, "stair warmup")
+        self.assertEqual(params.to_dict()["display_name"], "stair warmup")
+        self.assertNotIn("stair warmup", " ".join(training_argv(params)))
+
+    def test_training_params_reject_display_name_over_limit(self):
+        with self.assertRaises(ValueError):
+            TrainingParams.from_dict(
+                {
+                    "task": "Template-Redrhex-Direct-v0",
+                    "num_envs": 4,
+                    "max_iterations": 8,
+                    "device": "cuda:0",
+                    "display_name": "x" * 121,
+                }
+            )
 
 
 if __name__ == "__main__":

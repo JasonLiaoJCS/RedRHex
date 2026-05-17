@@ -138,6 +138,258 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(listed["2026_run"]["folder"], "Good Runs")
             self.assertTrue(listed["2026_run"]["latest_checkpoint"].endswith("model_0.pt"))
 
+    def test_link_run_to_log_preserves_requester_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            requester_id = "11111111-1111-4111-8111-111111111111"
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "real_log"
+            log_dir.mkdir(parents=True)
+            store = HistoryStore(self.make_paths(root))
+            store.add_run({
+                "id": "panel_run",
+                "source": "training_panel",
+                "created_by": requester_id,
+                "requester_label": "phone user",
+                "params": {"requester_id": requester_id, "task": "Template-Redrhex-Direct-v0"},
+            })
+
+            linked = store.link_run_to_log("panel_run", str(log_dir), status="completed", returncode=0)
+            listed = {item["id"]: item for item in store.list_runs()}
+
+            self.assertEqual(linked["created_by"], requester_id)
+            self.assertEqual(linked["params"]["requester_id"], requester_id)
+            self.assertEqual(linked["requester_label"], "phone user")
+            self.assertEqual(listed["panel_run"]["created_by"], requester_id)
+
+    def test_list_runs_collapses_panel_and_log_name_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_01-18-16_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_13.pt").write_text("x", encoding="utf-8")
+            store = HistoryStore(self.make_paths(root))
+            store.add_run(
+                {
+                    "id": "panel_20260517_011805",
+                    "source": "training_panel",
+                    "status": "completed",
+                    "created_at": "2026-05-17T01:18:05",
+                    "log_dir": str(log_dir),
+                    "terrain_preset_id": "flat-debug",
+                }
+            )
+            store.add_run(
+                {
+                    "id": log_dir.name,
+                    "source": "training_panel",
+                    "created_at": "2026-05-17T01:18:46",
+                    "log_dir": None,
+                    "display_name": "duplicate shell",
+                }
+            )
+
+            runs = store.list_runs()
+            ids = [run["id"] for run in runs]
+            panel = next(run for run in runs if run["id"] == "panel_20260517_011805")
+
+            self.assertEqual(ids.count("panel_20260517_011805"), 1)
+            self.assertNotIn(log_dir.name, ids)
+            self.assertEqual(panel["log_dir"], str(log_dir))
+            self.assertEqual(panel["terrain_preset_id"], "flat-debug")
+            self.assertTrue(panel["latest_checkpoint"].endswith("model_13.pt"))
+
+    def test_running_panel_run_claims_discovered_log_by_exact_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            process_log = store.paths.process_log_dir / "panel_run.log"
+            process_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_01-35-34\n",
+                encoding="utf-8",
+            )
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_4.pt").write_text("x", encoding="utf-8")
+            store.add_run(
+                {
+                    "id": "panel_run",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T01:35:27",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+
+            runs = store.list_runs()
+            ids = [run["id"] for run in runs]
+            panel = next(run for run in runs if run["id"] == "panel_run")
+
+            self.assertEqual(ids, ["panel_run"])
+            self.assertEqual(panel["status"], "running")
+            self.assertEqual(panel["log_dir"], str(log_dir))
+            self.assertTrue(panel["latest_checkpoint"].endswith("model_4.pt"))
+
+    def test_running_panel_run_claims_discovered_log_by_explicit_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            process_log = store.paths.process_log_dir / "panel_run.log"
+            process_log.write_text(f"Writing TensorBoard data under {log_dir}/events.out.tfevents.test\n", encoding="utf-8")
+            store.add_run(
+                {
+                    "id": "panel_run",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T01:35:27",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+
+            runs = store.list_runs()
+
+            self.assertEqual([run["id"] for run in runs], ["panel_run"])
+            self.assertEqual(runs[0]["log_dir"], str(log_dir))
+
+    def test_running_panel_run_claims_fresh_discovered_log_before_log_mentions_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            process_log = store.paths.process_log_dir / "panel_run.log"
+            process_log.write_text("Isaac startup is still loading...\n", encoding="utf-8")
+            log_dir = (
+                root
+                / "logs"
+                / "rsl_rl"
+                / "redrhex_wheg"
+                / "2026-05-17_10-21-24_wheg_locomotion_reform_v1"
+            )
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_0.pt").write_text("x", encoding="utf-8")
+            store.add_run(
+                {
+                    "id": "panel_20260517_102117_740732",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T10:21:17",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+
+            runs = store.list_runs()
+            ids = [run["id"] for run in runs]
+            panel = runs[0]
+
+            self.assertEqual(ids, ["panel_20260517_102117_740732"])
+            self.assertEqual(panel["status"], "running")
+            self.assertEqual(panel["log_dir"], str(log_dir))
+            self.assertTrue(panel["latest_checkpoint"].endswith("model_0.pt"))
+
+    def test_failed_panel_run_does_not_display_mismatched_completed_log_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_10-30-57_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "model_19.pt").write_text("x", encoding="utf-8")
+            completed_log = store.paths.process_log_dir / "panel_completed.log"
+            completed_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_10-30-57\n",
+                encoding="utf-8",
+            )
+            failed_log = store.paths.process_log_dir / "panel_failed.log"
+            failed_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_10-31-01\n"
+                "CUDA error: out of memory\n",
+                encoding="utf-8",
+            )
+            store.add_run(
+                {
+                    "id": "panel_completed",
+                    "source": "training_panel",
+                    "status": "completed",
+                    "returncode": 0,
+                    "created_at": "2026-05-17T10:30:50",
+                    "process_log": str(completed_log),
+                    "log_dir": str(log_dir),
+                }
+            )
+            store.add_run(
+                {
+                    "id": "panel_failed",
+                    "source": "training_panel",
+                    "status": "failed",
+                    "returncode": 1,
+                    "created_at": "2026-05-17T10:30:55",
+                    "process_log": str(failed_log),
+                    "log_dir": str(log_dir),
+                }
+            )
+
+            runs = {run["id"]: run for run in store.list_runs()}
+
+            self.assertEqual(runs["panel_completed"]["log_dir"], str(log_dir))
+            self.assertTrue(runs["panel_completed"]["latest_checkpoint"].endswith("model_19.pt"))
+            self.assertIsNone(runs["panel_failed"]["log_dir"])
+            self.assertIsNone(runs["panel_failed"]["latest_checkpoint"])
+
+    def test_patch_discovered_id_updates_canonical_panel_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            process_log = store.paths.process_log_dir / "panel_run.log"
+            process_log.write_text(
+                "Exact experiment name requested from command line: 2026-05-17_01-35-34\n",
+                encoding="utf-8",
+            )
+            store.add_run(
+                {
+                    "id": "panel_run",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T01:35:27",
+                    "process_log": str(process_log),
+                    "log_dir": None,
+                }
+            )
+
+            updated = store.patch_run_metadata(log_dir.name, folder="Good Runs", display_name="canonical name")
+            records = store._load_data()["runs"]
+            listed = {run["id"]: run for run in store.list_runs()}
+
+            self.assertEqual(updated["id"], "panel_run")
+            self.assertEqual(listed["panel_run"]["folder"], "Good Runs")
+            self.assertEqual(listed["panel_run"]["display_name"], "canonical name")
+            self.assertFalse(any(record.get("id") == log_dir.name for record in records))
+
+    def test_set_note_discovered_id_updates_canonical_panel_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "2026-05-17_01-35-34_wheg_locomotion_reform_v1"
+            log_dir.mkdir(parents=True)
+            store.add_run(
+                {
+                    "id": "panel_run",
+                    "source": "training_panel",
+                    "status": "running",
+                    "created_at": "2026-05-17T01:35:27",
+                    "log_dir": str(log_dir),
+                }
+            )
+
+            store.set_note(log_dir.name, "team note")
+
+            self.assertEqual(store.get_note("panel_run"), "team note")
+            self.assertEqual(store.get_note(log_dir.name), "team note")
+            self.assertFalse((store.paths.notes_dir / f"{log_dir.name}.md").exists())
+
     def test_bulk_assign_and_clear_folders_through_handler(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -232,6 +484,25 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(store.get_note("failed_panel_run"), "")
             self.assertFalse(any(record.get("id") == "failed_panel_run" for record in store._load_data()["runs"]))
 
+    def test_deleted_run_tombstones_can_filter_to_current_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            old_log = root / "logs" / "rsl_rl" / "redrhex_wheg" / "old_run"
+            new_log = root / "logs" / "rsl_rl" / "redrhex_wheg" / "new_run"
+            old_log.mkdir(parents=True)
+            new_log.mkdir(parents=True)
+            store.patch_run_metadata("old_panel", log_dir=str(old_log), source="training_panel")
+            store.patch_run_metadata("new_panel", log_dir=str(new_log), source="training_panel")
+            store.delete_run("old_panel", confirm=True, delete_logs=False)
+            store.delete_run("new_panel", confirm=True, delete_logs=False)
+
+            current = store.deleted_run_tombstones(run_ids=["new_panel"])
+
+            self.assertEqual([item["id"] for item in current], ["new_panel"])
+            self.assertEqual(current[0]["log_dir_name"], "new_run")
+            self.assertEqual(len(store.deleted_run_tombstones()), 2)
+
     def test_delete_run_removes_panel_sidecar_logs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -286,6 +557,66 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(store.get_run("run_a"), None)
             self.assertEqual(store.get_run("run_b"), None)
 
+    def test_bulk_delete_tolerates_stale_discovered_alias_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "shared_log"
+            log_dir.mkdir(parents=True)
+            (log_dir / "events.out.tfevents.test").write_text("x", encoding="utf-8")
+            store.add_run({
+                "id": "panel_run",
+                "source": "training_panel",
+                "created_at": "2026-05-17T10:00:00",
+                "log_dir": str(log_dir),
+            })
+
+            result = store.bulk_delete_runs(["panel_run", "shared_log"], confirm=True)
+
+            self.assertEqual(result["deleted_count"], 1)
+            self.assertEqual(result["missing"], ["shared_log"])
+            self.assertEqual(result["run_ids"], ["panel_run"])
+            self.assertFalse(log_dir.exists())
+            self.assertIsNone(store.get_run("panel_run"))
+            tombstones = store.deleted_run_tombstones(run_ids=["shared_log"])
+            self.assertTrue(any(item.get("log_dir_name") == "shared_log" for item in tombstones))
+
+    def test_bulk_delete_deletes_shared_paths_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            process_log = root / "logs" / "training_panel" / "process_logs" / "shared.log"
+            process_log.parent.mkdir(parents=True, exist_ok=True)
+            process_log.write_text("x", encoding="utf-8")
+            for run_id in ("run_a", "run_b"):
+                store.add_run({
+                    "id": run_id,
+                    "source": "training_panel",
+                    "created_at": "2026-05-17T10:00:00",
+                    "process_log": str(process_log),
+                })
+
+            result = store.bulk_delete_runs(["run_a", "run_b"], confirm=True)
+
+            self.assertEqual(result["deleted_count"], 2)
+            self.assertEqual(result["deleted_paths"], [str(process_log)])
+            self.assertFalse(process_log.exists())
+            self.assertIsNone(store.get_run("run_a"))
+            self.assertIsNone(store.get_run("run_b"))
+
+    def test_bulk_delete_tombstones_each_requested_id_for_same_log_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = HistoryStore(self.make_paths(root))
+            data = {"runs": [], "folders": [], "deleted_runs": []}
+            log_dir = root / "logs" / "rsl_rl" / "redrhex_wheg" / "shared_log"
+
+            store._remember_deleted_run(data, "panel_a", run={"source": "training_panel"}, log_dir=str(log_dir))
+            store._remember_deleted_run(data, "panel_b", run={"source": "training_panel"}, log_dir=str(log_dir))
+
+            self.assertEqual([item["id"] for item in data["deleted_runs"]], ["panel_a", "panel_b"])
+            self.assertTrue(all(item["log_dir_name"] == "shared_log" for item in data["deleted_runs"]))
+
     def test_bulk_delete_running_guard_groups_active_processes(self):
         class FakeProcesses:
             def running_for_run(self, run_id):
@@ -299,6 +630,58 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(
             handler._running_by_run(["run_a", "run_b"]),
             {"run_b": [{"id": "proc_b", "source_run_id": "run_b", "kind": "training"}]},
+        )
+
+    def test_delete_running_guard_checks_log_dir_matches(self):
+        class FakeProcesses:
+            def running_for_run(self, run_id):
+                return []
+
+            def running_for_log_dir(self, log_dir):
+                if str(log_dir).endswith("active_log"):
+                    return [{"run_id": "panel_run", "kind": "training"}]
+                return []
+
+        class FakeHistory:
+            def delete_preview(self, run_id):
+                return {
+                    "paths": [
+                        {"kind": "rsl_rl_log_dir", "path": "/tmp/active_log", "is_dir": True},
+                    ]
+                }
+
+        handler = object.__new__(PanelHandler)
+        handler.state = type("FakeState", (), {"processes": FakeProcesses(), "history": FakeHistory()})()
+
+        self.assertEqual(
+            handler._running_for_run_or_log_dir("active_log"),
+            [{"run_id": "panel_run", "kind": "training"}],
+        )
+
+    def test_bulk_delete_running_guard_checks_log_dir_matches(self):
+        class FakeProcesses:
+            def running_for_run(self, run_id):
+                return []
+
+            def running_for_log_dir(self, log_dir):
+                if Path(str(log_dir)).name == "active_log_dir":
+                    return [{"run_id": "panel_run", "kind": "training"}]
+                return []
+
+        class FakeHistory:
+            def delete_preview(self, run_id):
+                return {
+                    "paths": [
+                        {"kind": "rsl_rl_log_dir", "path": f"/tmp/{run_id}_dir", "is_dir": True},
+                    ]
+                }
+
+        handler = object.__new__(PanelHandler)
+        handler.state = type("FakeState", (), {"processes": FakeProcesses(), "history": FakeHistory()})()
+
+        self.assertEqual(
+            handler._running_by_run_or_log_dir(["inactive_log", "active_log"]),
+            {"active_log": [{"run_id": "panel_run", "kind": "training"}]},
         )
 
     def test_compact_preview_keeps_highest_iteration_checkpoint(self):

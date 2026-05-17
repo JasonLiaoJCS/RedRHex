@@ -96,6 +96,8 @@ TUPLE_FIELDS = {
     "terrain.terrain_generator.sub_terrains.stairs.step_height_range",
     "terrain.terrain_generator.sub_terrains.boxes.grid_height_range",
 }
+BOX_GRID_WIDTH_KEY = "terrain.terrain_generator.sub_terrains.boxes.grid_width"
+BOX_GRID_BORDER_EPSILON = 1e-6
 
 
 BUILT_IN_TERRAIN_PRESETS: list[dict[str, Any]] = [
@@ -175,7 +177,7 @@ BUILT_IN_TERRAIN_PRESETS: list[dict[str, Any]] = [
             "terrain.terrain_generator.sub_terrains.boxes.proportion": 0.35,
             "terrain.terrain_generator.sub_terrains.stairs.step_height_range": [0.02, 0.14],
             "terrain.terrain_generator.sub_terrains.stairs.step_width": 0.25,
-            "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.40,
+            "terrain.terrain_generator.sub_terrains.boxes.grid_width": 0.45,
             "terrain.terrain_generator.sub_terrains.boxes.grid_height_range": [0.02, 0.14],
         },
     },
@@ -301,6 +303,58 @@ def _normalize_values(values: dict[str, Any]) -> dict[str, Any]:
         if key in FIELD_MAP:
             normalized[key] = _coerce_field_value(key, value)
     return normalized
+
+
+def _path_value(root: Any, key: str) -> Any:
+    target = root
+    for part in key.split("."):
+        if isinstance(target, dict):
+            target = target.get(part)
+        else:
+            target = getattr(target, part, None)
+        if target is None:
+            return None
+    return target
+
+
+def _box_grid_border_width(size: Any, grid_width: float) -> float | None:
+    if grid_width <= 0:
+        return None
+    if isinstance(size, tuple):
+        size = list(size)
+    if not isinstance(size, list) or len(size) < 2:
+        return None
+    try:
+        size_x = float(size[0])
+        size_y = float(size[1])
+    except (TypeError, ValueError):
+        return None
+    num_boxes_x = int(size_x / grid_width)
+    num_boxes_y = int(size_y / grid_width)
+    if num_boxes_x <= 0 or num_boxes_y <= 0:
+        return None
+    return size_x - min(num_boxes_x, num_boxes_y) * grid_width
+
+
+def _safe_box_grid_width(env_cfg: Any, requested: Any, overrides: dict[str, Any]) -> tuple[Any, bool]:
+    try:
+        grid_width = float(requested)
+    except (TypeError, ValueError):
+        return requested, False
+    size = overrides.get("terrain.terrain_generator.size")
+    if size is None:
+        size = _path_value(env_cfg, "terrain.terrain_generator.size")
+    border_width = _box_grid_border_width(size, grid_width)
+    if border_width is None or border_width > BOX_GRID_BORDER_EPSILON:
+        return grid_width, False
+
+    adjusted = grid_width * 0.99
+    for _ in range(12):
+        border_width = _box_grid_border_width(size, adjusted)
+        if border_width is not None and border_width > BOX_GRID_BORDER_EPSILON:
+            return round(adjusted, 6), True
+        adjusted *= 0.99
+    return grid_width, False
 
 
 def terrain_defaults(repo_root: Path) -> dict[str, Any]:
@@ -460,7 +514,8 @@ def terrain_diff(yaml_values: dict[str, Any], defaults: dict[str, Any]) -> dict[
 def apply_terrain_overrides(env_cfg: Any, overrides: dict[str, Any]) -> list[str]:
     """Apply flattened terrain override keys to an Isaac env config object."""
     applied: list[str] = []
-    for key, raw_value in _normalize_values(overrides).items():
+    normalized = _normalize_values(overrides)
+    for key, raw_value in normalized.items():
         target = env_cfg
         parts = key.split(".")
         for part in parts[:-1]:
@@ -473,6 +528,9 @@ def apply_terrain_overrides(env_cfg: Any, overrides: dict[str, Any]) -> list[str
         if target is None:
             continue
         value = raw_value
+        adjusted = False
+        if key == BOX_GRID_WIDTH_KEY:
+            value, adjusted = _safe_box_grid_width(env_cfg, raw_value, normalized)
         if key in TUPLE_FIELDS and isinstance(value, list):
             value = tuple(value)
         if isinstance(target, dict):
@@ -481,7 +539,10 @@ def apply_terrain_overrides(env_cfg: Any, overrides: dict[str, Any]) -> list[str
             setattr(target, parts[-1], value)
         else:
             continue
-        applied.append(f"{key}={raw_value}")
+        if adjusted:
+            applied.append(f"{key}={value} (adjusted from {raw_value})")
+        else:
+            applied.append(f"{key}={raw_value}")
     return applied
 
 
