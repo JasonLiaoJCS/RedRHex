@@ -147,6 +147,8 @@ class ProcessRegistry:
             "created_by": params.requester_id,
             "requester_label": params.requester_label,
             "display_name": params.display_name,
+            "folder": params.folder,
+            "client_request_id": params.client_request_id,
         }
         self.history.add_run(record)
         return record
@@ -187,6 +189,8 @@ class ProcessRegistry:
             "created_by": params.requester_id,
             "requester_label": params.requester_label,
             "display_name": params.display_name,
+            "folder": params.folder,
+            "client_request_id": params.client_request_id,
         }
         if existing_record:
             self.history.update_run(run_id, **record)
@@ -1319,6 +1323,7 @@ class ProcessRegistry:
             if not log_dir and returncode == 0:
                 log_dir = self.history.find_latest_log_after(started_at_epoch)
         self.history.update_run(run_id, status=status, returncode=returncode, log_dir=log_dir)
+        self._refresh_tensorboard_summary(run_id, log_dir)
 
         # Record video when: training succeeded normally, OR convergence was detected and
         # auto_record_video was requested (even if training was stopped early).
@@ -1346,6 +1351,29 @@ class ProcessRegistry:
             pass  # no log dir found — nothing to record
         if not video_started:
             self.start_next_queued_training()
+
+    def _refresh_tensorboard_summary(self, run_id: str, log_dir: str | None) -> None:
+        if not log_dir:
+            return
+        try:
+            from .tensorboard_summary import ensure_tensorboard_summary
+
+            run = self.history.get_run(run_id) or {}
+            title = str(run.get("display_name") or run.get("id") or Path(log_dir).name)
+            summary = ensure_tensorboard_summary(Path(log_dir), title=title)
+            if summary:
+                self.history.update_run(
+                    run_id,
+                    tensorboard_summary_path=str(summary),
+                    tensorboard_summary_status="completed",
+                    tensorboard_summary_error=None,
+                )
+        except Exception as exc:
+            self.history.update_run(
+                run_id,
+                tensorboard_summary_status="failed",
+                tensorboard_summary_error=str(exc),
+            )
 
     def _monitor_video(self, source_run_id: str, video_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()

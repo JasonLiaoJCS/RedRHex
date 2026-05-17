@@ -62,7 +62,7 @@ class RemoteConfig:
     cloudflare_tunnel_host: str = ""
     discord_webhook_url: str = ""
     poll_interval_seconds: float = 2.0
-    sync_interval_seconds: float = 5.0
+    sync_interval_seconds: float = 30.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RemoteConfig":
@@ -77,7 +77,7 @@ class RemoteConfig:
             cloudflare_tunnel_host=source.get("REDRHEX_CLOUDFLARE_TUNNEL_HOST", "").rstrip("/"),
             discord_webhook_url=source.get("REDRHEX_DISCORD_WEBHOOK_URL", ""),
             poll_interval_seconds=float(source.get("REDRHEX_REMOTE_POLL_SECONDS", "2")),
-            sync_interval_seconds=float(source.get("REDRHEX_REMOTE_SYNC_SECONDS", "5")),
+            sync_interval_seconds=float(source.get("REDRHEX_REMOTE_SYNC_SECONDS", "30")),
         )
 
     @property

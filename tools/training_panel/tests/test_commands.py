@@ -141,6 +141,23 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(params.to_dict()["display_name"], "stair warmup")
         self.assertNotIn("stair warmup", " ".join(training_argv(params)))
 
+    def test_training_params_preserve_folder_and_client_request_id_without_changing_argv(self):
+        params = TrainingParams.from_dict(
+            {
+                "task": "Template-Redrhex-Direct-v0",
+                "num_envs": 4,
+                "max_iterations": 8,
+                "device": "cuda:0",
+                "folder": "  tests  ",
+                "client_request_id": "child-123",
+            }
+        )
+        self.assertEqual(params.folder, "tests")
+        self.assertEqual(params.client_request_id, "child-123")
+        argv = " ".join(training_argv(params))
+        self.assertNotIn("tests", argv)
+        self.assertNotIn("child-123", argv)
+
     def test_training_params_reject_display_name_over_limit(self):
         with self.assertRaises(ValueError):
             TrainingParams.from_dict(

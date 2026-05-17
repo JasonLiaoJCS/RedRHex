@@ -1,4 +1,13 @@
-import { HEARTBEAT_STALE_MS } from "./config.js";
+import { HEARTBEAT_STALE_MS } from "./config.js?v=3.4-first-release";
+import {
+  convergenceLabel as catalogConvergenceLabel,
+  jobDisplayStatus as catalogJobDisplayStatus,
+  resolvedVideoStatus as catalogResolvedVideoStatus,
+  statusDescriptor as catalogStatusDescriptor,
+  statusDescription as catalogStatusDescription,
+  statusLabel as catalogStatusLabel,
+  statusTone as catalogStatusTone,
+} from "./status_catalog.js?v=3.4-first-release";
 
 export const BUILT_IN_REWARD_PRESETS = [
   {
@@ -304,6 +313,10 @@ export const TERRAIN_FIELDS = [
 
 export const ACTIVE_JOB_STATUSES = new Set(["queued", "claimed", "running"]);
 export const GPU_JOB_TYPES = new Set(["start_training", "record_video", "export_onnx"]);
+export const PENDING_CONFIRMATION_REFRESH_MS = 1_500;
+export const PENDING_CONFIRMATION_MAX_AGE_MS = 30 * 60 * 1000;
+export const VIDEO_REFRESH_MS = 1_500;
+export const VIDEO_REFRESH_RECENT_MS = 2 * 60 * 1000;
 export const ACTIVE_REFRESH_MS = 3_000;
 export const IDLE_REFRESH_MS = 5_000;
 
@@ -351,10 +364,29 @@ export function machineState(machine, now = Date.now()) {
 
 export function statusTone(status) {
   const normalized = String(status || "").toLowerCase();
-  if (["completed", "ready", "online", "accepting", "success"].includes(normalized)) return "good";
-  if (["running", "claimed", "queued", "busy"].includes(normalized)) return "info";
-  if (["failed", "cancelled", "offline", "missing"].includes(normalized)) return "bad";
-  return "muted";
+  if (["ready", "busy", "paused", "offline", "missing"].includes(normalized)) {
+    return catalogStatusTone("machine", normalized);
+  }
+  if (["recordable", "uploading"].includes(normalized)) {
+    return catalogStatusTone("artifact", normalized);
+  }
+  if (["claimed", "launched"].includes(normalized)) {
+    return catalogStatusTone("job", normalized);
+  }
+  if (["online", "accepting", "success"].includes(normalized)) return "good";
+  return catalogStatusTone("run", normalized);
+}
+
+export function statusDescriptor(kind, status, context = {}) {
+  return catalogStatusDescriptor(kind, status, context);
+}
+
+export function statusLabel(kind, status, context = {}) {
+  return catalogStatusLabel(kind, status, context);
+}
+
+export function jobDisplayStatus(job = {}) {
+  return catalogJobDisplayStatus(job);
 }
 
 export function hasActiveRemoteWork(snapshot = {}) {
@@ -363,7 +395,45 @@ export function hasActiveRemoteWork(snapshot = {}) {
   return Boolean(machine?.gpu_locked) || jobs.some((job) => ACTIVE_JOB_STATUSES.has(String(job.status || "").toLowerCase()));
 }
 
+export function hasPendingTrainingConfirmation(snapshot = {}, nowMs = Date.now()) {
+  const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+  const runs = Array.isArray(snapshot.runs) ? snapshot.runs : [];
+  const realRunIds = new Set(runs.map((run) => String(run?.id || "").trim()).filter(Boolean));
+  return jobs.some((job) => {
+    if (String(job?.type || "") !== "start_training") return false;
+    if (!ACTIVE_JOB_STATUSES.has(String(job?.status || "").toLowerCase())) return false;
+    const timestamp = Date.parse(job?.updated_at || job?.created_at || "");
+    if (!Number.isFinite(timestamp) || timestamp < nowMs - PENDING_CONFIRMATION_MAX_AGE_MS) return false;
+    const linkedRunId = jobRunId(job).trim();
+    return !linkedRunId || !realRunIds.has(linkedRunId);
+  });
+}
+
+export function hasVideoRefreshPulse(snapshot = {}, nowMs = Date.now()) {
+  const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+  const runs = Array.isArray(snapshot.runs) ? snapshot.runs : [];
+  const artifacts = Array.isArray(snapshot.artifacts) ? snapshot.artifacts : [];
+  if (jobs.some((job) => {
+    if (String(job?.type || "") !== "record_video") return false;
+    const status = String(job?.status || "").toLowerCase();
+    if (ACTIVE_JOB_STATUSES.has(status)) return true;
+    if (status !== "completed" && status !== "failed") return false;
+    const timestamp = Date.parse(job?.updated_at || job?.created_at || "");
+    return Number.isFinite(timestamp) && timestamp >= nowMs - VIDEO_REFRESH_RECENT_MS;
+  })) {
+    return true;
+  }
+  return runs.some((run) => {
+    const videoStatus = String(run?.video_status || "").toLowerCase();
+    if (videoStatus === "recording") return true;
+    if (videoStateForRun(run, artifacts).state === "uploading") return true;
+    return false;
+  });
+}
+
 export function refreshDelayForSnapshot(snapshot = {}) {
+  if (hasPendingTrainingConfirmation(snapshot)) return PENDING_CONFIRMATION_REFRESH_MS;
+  if (hasVideoRefreshPulse(snapshot)) return VIDEO_REFRESH_MS;
   return hasActiveRemoteWork(snapshot) ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS;
 }
 
@@ -380,8 +450,24 @@ export function jobQueueLabel(job = {}, machine = null) {
   if (status === "claimed") return "claimed by worker";
   if (status === "running") return "running";
   if (status === "failed") return job.error || "failed";
-  if (status === "completed") return "completed";
+  if (status === "completed" && type === "start_training") return statusLabel("job", "launched");
+  if (status === "completed") return statusLabel("job", "completed");
   return status || "unknown";
+}
+
+export function jobRunId(job = {}) {
+  const payload = job.payload && typeof job.payload === "object" ? job.payload : {};
+  const result = job.result && typeof job.result === "object" ? job.result : {};
+  const resultPayload = result.payload && typeof result.payload === "object" ? result.payload : {};
+  return String(
+    payload.run_id
+    || result.local_run_id
+    || result.process_id
+    || resultPayload.id
+    || resultPayload.run_id
+    || resultPayload.source_run_id
+    || "",
+  );
 }
 
 export function latestVideoArtifact(runId, artifacts = []) {
@@ -391,12 +477,73 @@ export function latestVideoArtifact(runId, artifacts = []) {
   return matches[0] || null;
 }
 
+function storageSafe(value = "") {
+  return String(value || "").trim().replace(/[^A-Za-z0-9_.-]+/g, "_") || "run";
+}
+
+function isInsidePath(base = "", candidate = "") {
+  const normalizedBase = String(base || "").replaceAll("\\", "/").replace(/\/+$/, "");
+  const normalizedCandidate = String(candidate || "").replaceAll("\\", "/");
+  return Boolean(normalizedBase && (
+    normalizedCandidate === normalizedBase
+    || normalizedCandidate.startsWith(`${normalizedBase}/`)
+  ));
+}
+
+function runLocalPathBelongsToRun(run = {}, path = "") {
+  const value = String(path || "").trim();
+  if (!value) return false;
+  const logDir = String(run.log_dir || "").trim();
+  return !logDir || isInsidePath(logDir, value);
+}
+
+export function artifactBelongsToRun(run = {}, artifact = {}) {
+  const runId = String(run?.id || "").trim();
+  if (!runId || String(artifact?.run_id || "").trim() !== runId) return false;
+  const localPath = String(artifact.local_path || artifact.path || "").trim();
+  const logDir = String(run.log_dir || "").trim();
+  if (localPath && logDir && !isInsidePath(logDir, localPath)) return false;
+  const storagePath = String(artifact.storage_path || "").trim();
+  if (storagePath && !storagePath.startsWith(`runs/${storageSafe(runId)}/`)) return false;
+  return true;
+}
+
+export function artifactsForRun(run = {}, artifacts = [], kind = "") {
+  return artifacts.filter((artifact) => {
+    if (kind && artifact.kind !== kind) return false;
+    return artifactBelongsToRun(run, artifact);
+  });
+}
+
+export function latestVideoArtifactForRun(run = {}, artifacts = []) {
+  const matches = artifactsForRun(run, artifacts, "video")
+    .filter((artifact) => artifact.storage_path)
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  return matches[0] || null;
+}
+
+export function latestTensorboardSummaryArtifactForRun(run = {}, artifacts = []) {
+  const matches = artifactsForRun(run, artifacts, "tensorboard_summary")
+    .filter((artifact) => artifact.public_url || artifact.storage_path)
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  return matches[0] || null;
+}
+
+export function tensorboardSummaryStateForRun(run = {}, artifacts = []) {
+  const artifact = latestTensorboardSummaryArtifactForRun(run, artifacts);
+  if (artifact?.storage_path) return { state: "ready", artifact, url: "" };
+  if (artifact?.public_url) return { state: "ready", artifact, url: artifact.public_url };
+  if (run.tensorboard_summary_status === "failed") return { state: "failed", artifact: null, url: "" };
+  if (run.has_tensorboard || run.tensorboard_summary_path) return { state: "generating", artifact: null, url: "" };
+  return { state: "missing", artifact: null, url: "" };
+}
+
 export function hasAnyVideoRecord(run = {}, artifacts = []) {
-  return Boolean(run.latest_video) || artifacts.some((artifact) => artifact.run_id === run.id && artifact.kind === "video");
+  return runLocalPathBelongsToRun(run, run.latest_video) || artifactsForRun(run, artifacts, "video").length > 0;
 }
 
 export function videoStateForRun(run = {}, artifacts = []) {
-  const artifact = latestVideoArtifact(run.id, artifacts);
+  const artifact = latestVideoArtifactForRun(run, artifacts);
   if (artifact) return { state: "ready", artifact };
   if (hasAnyVideoRecord(run, artifacts)) return { state: "uploading", artifact: null };
   if (run.latest_checkpoint) return { state: "recordable", artifact: null };
@@ -404,7 +551,7 @@ export function videoStateForRun(run = {}, artifacts = []) {
 }
 
 export function checkpointIteration(path = "") {
-  const match = String(path || "").match(/model_(\d+)\.pt(?:$|[?#])/);
+  const match = String(path || "").match(/model_(\d+)(?:\.pt|[^0-9]|$)/);
   return match ? Number(match[1]) : null;
 }
 
@@ -420,7 +567,7 @@ export function checkpointArtifactsForRun(run = {}, artifacts = []) {
     });
   }
   artifacts
-    .filter((artifact) => artifact.run_id === run.id && artifact.kind === "checkpoint")
+    .filter((artifact) => artifactBelongsToRun(run, artifact) && artifact.kind === "checkpoint")
     .forEach((artifact) => {
       const path = String(artifact.local_path || artifact.path || "");
       if (!path) return;
@@ -445,15 +592,14 @@ export function checkpointOptionsForRun(run = {}, artifacts = []) {
 
 export function videoArtifactForCheckpoint(run = {}, artifacts = [], checkpoint = "") {
   const iteration = checkpointIteration(checkpoint);
-  const videos = artifacts
-    .filter((artifact) => artifact.run_id === run.id && artifact.kind === "video" && artifact.storage_path)
+  const videos = artifactsForRun(run, artifacts, "video")
+    .filter((artifact) => artifact.storage_path)
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   if (Number.isFinite(iteration)) {
-    const pattern = new RegExp(`model_${iteration}(?:\\D|$)`);
-    const exact = videos.find((artifact) => pattern.test(`${artifact.storage_path || ""} ${artifact.local_path || ""}`));
+    const exact = videos.find((artifact) => checkpointIteration(`${artifact.local_path || ""} ${artifact.storage_path || ""}`) === iteration);
     if (exact) return exact;
   }
-  if (checkpoint && run.latest_checkpoint && String(checkpoint) === String(run.latest_checkpoint)) {
+  if (!checkpoint && !Number.isFinite(iteration)) {
     return videos[0] || null;
   }
   return null;
@@ -462,12 +608,10 @@ export function videoArtifactForCheckpoint(run = {}, artifacts = [], checkpoint 
 export function hasVideoRecordForCheckpoint(run = {}, artifacts = [], checkpoint = "") {
   if (videoArtifactForCheckpoint(run, artifacts, checkpoint)) return true;
   const iteration = checkpointIteration(checkpoint);
-  if (!Number.isFinite(iteration)) return hasAnyVideoRecord(run, artifacts);
-  const pattern = new RegExp(`model_${iteration}(?:\\D|$)`);
-  return Boolean(run.latest_video && pattern.test(String(run.latest_video))) || artifacts.some((artifact) => (
-    artifact.run_id === run.id
-    && artifact.kind === "video"
-    && pattern.test(`${artifact.local_path || ""} ${artifact.storage_path || ""}`)
+  if (!Number.isFinite(iteration)) return !checkpoint && hasAnyVideoRecord(run, artifacts);
+  return Boolean(runLocalPathBelongsToRun(run, run.latest_video) && checkpointIteration(String(run.latest_video)) === iteration) || artifactsForRun(run, artifacts).some((artifact) => (
+    artifact.kind === "video"
+    && checkpointIteration(`${artifact.local_path || ""} ${artifact.storage_path || ""}`) === iteration
   ));
 }
 
@@ -529,9 +673,10 @@ export function formatRelativeTime(iso, now = Date.now()) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-export function buildTrainingJob({ machineId, params, preset, terrainPreset, role, userId }) {
+export function buildTrainingJob({ machineId, params, preset, terrainPreset, role, userId, requesterLabel = "", clientRequestId = "" }) {
   const rewardValues = preset?.values && typeof preset.values === "object" ? preset.values : {};
   const terrainValues = terrainPreset?.values && typeof terrainPreset.values === "object" ? terrainPreset.values : {};
+  const requestId = String(clientRequestId || params?.client_request_id || "").trim();
   return {
     machine_id: machineId || null,
     type: "start_training",
@@ -544,6 +689,9 @@ export function buildTrainingJob({ machineId, params, preset, terrainPreset, rol
       reward_overrides: rewardValues,
       terrain_preset_id: terrainPreset?.id || "baseline",
       terrain_overrides: terrainValues,
+      requester_id: userId || null,
+      requester_label: requesterLabel || "",
+      client_request_id: requestId || null,
     },
   };
 }
@@ -670,3 +818,8 @@ export function normalizePreset(raw) {
 export function normalizeTerrainPreset(raw) {
   return normalizePreset(raw);
 }
+
+// Re-exports from status_catalog — keeps remote_app.js importing only from core.js.
+export const convergenceLabel    = catalogConvergenceLabel;
+export const resolvedVideoStatus = catalogResolvedVideoStatus;
+export const statusDescription   = catalogStatusDescription;

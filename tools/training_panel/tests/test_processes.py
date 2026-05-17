@@ -130,6 +130,39 @@ class ProcessRegistryTests(unittest.TestCase):
             self.assertIsNone(history.get_run(run["id"]).get("pid"))
             schedule.assert_called_once()
 
+    def test_training_records_preserve_launch_folder_and_client_request_id(self):
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history)
+            params = TrainingParams.from_dict(
+                {
+                    "task": "Template-Redrhex-Direct-v0",
+                    "num_envs": 4,
+                    "max_iterations": 8,
+                    "folder": "tests",
+                    "client_request_id": "child-123",
+                    "display_name": "Launch A",
+                }
+            )
+            with patch.object(registry, "_spawn_shell", return_value=SpawnedProcess(proc=FakeProcess())), patch("threading.Thread") as thread_cls:
+                thread_cls.return_value.start = Mock()
+                run = registry.start_training(params)
+
+            record = history.get_run(run["id"])
+            self.assertEqual(record["display_name"], "Launch A")
+            self.assertEqual(record["folder"], "tests")
+            self.assertEqual(record["client_request_id"], "child-123")
+            self.assertEqual(record["params"]["folder"], "tests")
+            self.assertEqual(record["params"]["client_request_id"], "child-123")
+
     def test_start_next_queued_training_respects_isaac_settle_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

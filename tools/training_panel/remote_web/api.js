@@ -1,8 +1,9 @@
-import { SUPABASE_ANON_KEY, SUPABASE_URL, VIDEO_BUCKET } from "./config.js";
-import { BUILT_IN_REWARD_PRESETS, BUILT_IN_TERRAIN_PRESETS } from "./core.js";
+import { SUPABASE_ANON_KEY, SUPABASE_URL, VIDEO_BUCKET } from "./config.js?v=3.4-first-release";
+import { BUILT_IN_REWARD_PRESETS, BUILT_IN_TERRAIN_PRESETS } from "./core.js?v=3.4-first-release";
 
 const TOKEN_KEY = "redrhex_child_access_token";
 const REFRESH_KEY = "redrhex_child_refresh_token";
+const DEFAULT_FETCH_TIMEOUT_MS = 15000;
 
 export const sessionStore = {
   get accessToken() {
@@ -48,11 +49,28 @@ async function parseResponse(response) {
 }
 
 export async function supabaseFetch(path, options = {}) {
-  const response = await fetch(`${SUPABASE_URL}${path}`, {
-    ...options,
-    headers: authHeaders(options.headers || {}),
-  });
-  return parseResponse(response);
+  const { timeoutMs = DEFAULT_FETCH_TIMEOUT_MS, ...requestOptions } = options;
+  const controller = typeof AbortController !== "undefined" && !requestOptions.signal
+    ? new AbortController()
+    : null;
+  const timeoutId = controller && timeoutMs > 0
+    ? globalThis.setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  try {
+    const response = await fetch(`${SUPABASE_URL}${path}`, {
+      ...requestOptions,
+      signal: requestOptions.signal || controller?.signal,
+      headers: authHeaders(requestOptions.headers || {}),
+    });
+    return await parseResponse(response);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Supabase request timed out. Check the connection and try refreshing.");
+    }
+    throw error;
+  } finally {
+    if (timeoutId) globalThis.clearTimeout(timeoutId);
+  }
 }
 
 export async function signIn(email, password) {
@@ -159,11 +177,12 @@ export async function loadRemoteSnapshot(machineId, userId = "") {
   const notificationQuery = userId
     ? `user_id=eq.${encodedUser}&machine_id=eq.${encodedMachine}&select=*&limit=1`
     : "select=*&limit=0";
-  const [machines, jobs, runs, artifactsResult, presetsResult, terrainPresetsResult, profilesResult, notificationResult] = await Promise.all([
+  const [machines, jobs, runs, deletionsResult, artifactsResult, presetsResult, terrainPresetsResult, profilesResult, notificationResult] = await Promise.all([
     select("machines", `select=*&order=heartbeat_at.desc`),
     select("jobs", `select=*&order=created_at.desc&limit=60`),
     select("runs", `select=*&order=created_at.desc&limit=120`),
-    optionalSelect("artifacts", `select=*&order=created_at.desc&limit=200`),
+    optionalSelect("run_deletions", `select=*&order=deleted_at.desc&limit=500`),
+    optionalSelect("artifacts", `select=*&order=created_at.desc&limit=500`),
     optionalSelect("reward_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
     optionalSelect("terrain_presets", `select=*&order=built_in.desc,updated_at.desc,name.asc`),
     optionalSelect("profiles", `select=id,email,display_name,role`),
@@ -178,6 +197,7 @@ export async function loadRemoteSnapshot(machineId, userId = "") {
     targetMachine: machines.find((machine) => machine.machine_id === machineId) || null,
     jobs: jobs.filter((job) => !job.machine_id || job.machine_id === machineId || job.claimed_by === machineId),
     runs: runs.filter((run) => !run.machine_id || run.machine_id === machineId || machineId === ""),
+    runDeletions: deletionsResult.rows.filter((item) => !item.machine_id || item.machine_id === machineId || machineId === ""),
     artifacts: artifacts.filter((artifact) => !artifact.machine_id || artifact.machine_id === machineId || machineId === ""),
     profiles: profilesResult.rows,
     notificationSettings: notificationResult.rows[0] || null,
@@ -186,9 +206,11 @@ export async function loadRemoteSnapshot(machineId, userId = "") {
     encodedMachine,
     schema: {
       artifacts: artifactsResult.ok,
+      runDeletions: deletionsResult.ok,
       rewardPresets: presetsResult.ok,
       terrainPresets: terrainPresetsResult.ok,
       warnings: [
+        deletionsResult.ok ? "" : `Run deletion tombstones unavailable: ${deletionsResult.error}`,
         artifactsResult.ok ? "" : `Artifacts table unavailable: ${artifactsResult.error}`,
         presetsResult.ok ? "" : `Reward presets table unavailable: ${presetsResult.error}`,
         terrainPresetsResult.ok ? "" : `Terrain presets table unavailable: ${terrainPresetsResult.error}`,

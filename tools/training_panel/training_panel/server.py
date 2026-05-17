@@ -180,6 +180,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/video"):
             run_id = route_id(parsed.path)
             return self._send_run_video(run_id)
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/tensorboard-summary.png"):
+            run_id = route_id(parsed.path)
+            return self._send_run_tensorboard_summary(run_id)
         if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/delete-preview"):
             run_id = route_id(parsed.path)
             preview = self.state.history.delete_preview(run_id)
@@ -769,6 +772,37 @@ class PanelHandler(BaseHTTPRequestHandler):
         if resolved_video != resolved_root and resolved_root not in resolved_video.parents:
             return self._json({"error": "Video path is outside the RSL-RL log root"}, status=403)
         self._send_file_response(resolved_video, "video/mp4")
+
+    def _send_run_tensorboard_summary(self, run_id: str) -> None:
+        run = self.state.history.get_run(run_id)
+        if not run:
+            return self._json({"error": "Run not found"}, status=404)
+        log_dir = Path(str(run.get("log_dir") or ""))
+        if not log_dir.is_dir():
+            return self._json({"error": "No log directory found for run"}, status=404)
+
+        try:
+            from .tensorboard_summary import ensure_tensorboard_summary, tensorboard_summary_path
+
+            title = str(run.get("display_name") or run.get("id") or log_dir.name)
+            summary = ensure_tensorboard_summary(log_dir, title=title)
+            summary_path = Path(str(summary or run.get("tensorboard_summary_path") or tensorboard_summary_path(log_dir)))
+            if summary:
+                self.state.history.update_run(
+                    run_id,
+                    tensorboard_summary_path=str(summary),
+                    tensorboard_summary_status="completed",
+                    tensorboard_summary_error=None,
+                )
+        except Exception as exc:
+            return self._json({"error": f"TensorBoard summary generation failed: {exc}"}, status=500)
+
+        if not summary_path.exists() or not summary_path.is_file():
+            return self._json({"error": "No TensorBoard summary image found for run"}, status=404)
+        resolved_summary = summary_path.resolve()
+        if not _is_within(resolved_summary, log_dir) or not _is_within(resolved_summary, self.state.paths.rsl_rl_log_root):
+            return self._json({"error": "TensorBoard summary path is outside the selected run log directory"}, status=403)
+        self._send_file_response(resolved_summary, "image/png")
 
     def _send_file_response(self, path: Path, content_type: str) -> None:
         file_size = path.stat().st_size

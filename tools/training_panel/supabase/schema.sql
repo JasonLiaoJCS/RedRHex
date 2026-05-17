@@ -1,4 +1,4 @@
--- RedRHex Training Panel V3.2.0 Supabase schema
+-- RedRHex Training Panel V3.4 Supabase schema
 -- Apply in the Supabase SQL editor, then configure Row Level Security policies
 -- for your team's auth provider.
 
@@ -35,8 +35,17 @@ create table if not exists public.machines (
   gpu_locked boolean not null default false,
   tunnel_host text,
   heartbeat_at timestamptz,
+  last_sync_at timestamptz,
+  last_sync_duration_ms integer,
+  last_sync_error text not null default '',
+  last_sync_summary jsonb not null default '{}',
   updated_at timestamptz not null default now()
 );
+
+alter table public.machines add column if not exists last_sync_at timestamptz;
+alter table public.machines add column if not exists last_sync_duration_ms integer;
+alter table public.machines add column if not exists last_sync_error text not null default '';
+alter table public.machines add column if not exists last_sync_summary jsonb not null default '{}';
 
 create table if not exists public.runs (
   id text primary key,
@@ -58,6 +67,29 @@ create table if not exists public.runs (
 alter table public.runs add column if not exists notes text;
 alter table public.runs add column if not exists folder text;
 alter table public.runs add column if not exists created_by uuid references auth.users(id);
+alter table public.runs add column if not exists convergence_detected boolean;
+alter table public.runs add column if not exists convergence_iteration integer;
+alter table public.runs add column if not exists convergence_improvement_pct numeric;
+alter table public.runs add column if not exists video_status text;
+alter table public.runs add column if not exists returncode integer;
+
+create table if not exists public.run_deletions (
+  machine_id text not null references public.machines(machine_id) on delete cascade,
+  id text not null,
+  log_dir text,
+  log_dir_name text,
+  deleted_by uuid references auth.users(id),
+  deleted_at timestamptz not null default now(),
+  metadata jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (machine_id, id)
+);
+
+alter table public.run_deletions add column if not exists log_dir text;
+alter table public.run_deletions add column if not exists log_dir_name text;
+alter table public.run_deletions add column if not exists deleted_by uuid references auth.users(id);
+alter table public.run_deletions add column if not exists metadata jsonb not null default '{}';
 
 create table if not exists public.reward_presets (
   id text primary key,
@@ -254,6 +286,11 @@ create trigger set_machines_updated_at
   before update on public.machines
   for each row execute function public.set_redrhex_updated_at();
 
+drop trigger if exists set_run_deletions_updated_at on public.run_deletions;
+create trigger set_run_deletions_updated_at
+  before update on public.run_deletions
+  for each row execute function public.set_redrhex_updated_at();
+
 drop trigger if exists set_notification_settings_updated_at on public.notification_settings;
 create trigger set_notification_settings_updated_at
   before update on public.notification_settings
@@ -292,6 +329,7 @@ $$;
 alter table public.profiles enable row level security;
 alter table public.machines enable row level security;
 alter table public.runs enable row level security;
+alter table public.run_deletions enable row level security;
 alter table public.jobs enable row level security;
 alter table public.run_events enable row level security;
 alter table public.team_activity_events enable row level security;
@@ -302,7 +340,7 @@ alter table public.reward_presets enable row level security;
 alter table public.terrain_presets enable row level security;
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('redrhex-videos', 'redrhex-videos', false, 1073741824, array['video/mp4'])
+values ('redrhex-videos', 'redrhex-videos', false, 1073741824, array['video/mp4', 'image/png'])
 on conflict (id) do update
 set public = false,
     file_size_limit = excluded.file_size_limit,
@@ -310,6 +348,7 @@ set public = false,
 
 drop policy if exists "profiles readable by authenticated users" on public.profiles;
 drop policy if exists "runs readable by authenticated users" on public.runs;
+drop policy if exists "run deletions readable by authenticated users" on public.run_deletions;
 drop policy if exists "operators can update remote run metadata" on public.runs;
 drop policy if exists "artifacts readable by authenticated users" on public.artifacts;
 drop policy if exists "machines readable by authenticated users" on public.machines;
@@ -334,6 +373,7 @@ drop policy if exists "users can update own notification settings" on public.not
 drop policy if exists "users can delete own notification settings" on public.notification_settings;
 drop policy if exists "machine can upsert own row" on public.machines;
 drop policy if exists "machine can upsert own runs" on public.runs;
+drop policy if exists "machine can upsert own run deletions" on public.run_deletions;
 drop policy if exists "machine can upsert own artifacts" on public.artifacts;
 drop policy if exists "authenticated users can read redrhex videos" on storage.objects;
 
@@ -341,6 +381,9 @@ create policy "profiles readable by authenticated users" on public.profiles
   for select to authenticated using (true);
 
 create policy "runs readable by authenticated users" on public.runs
+  for select to authenticated using (true);
+
+create policy "run deletions readable by authenticated users" on public.run_deletions
   for select to authenticated using (true);
 
 create policy "operators can update remote run metadata" on public.runs
@@ -508,6 +551,10 @@ create policy "machine can upsert own runs" on public.runs
   for all using (machine_id = (auth.jwt() ->> 'sub'))
   with check (machine_id = (auth.jwt() ->> 'sub'));
 
+create policy "machine can upsert own run deletions" on public.run_deletions
+  for all using (machine_id = (auth.jwt() ->> 'sub'))
+  with check (machine_id = (auth.jwt() ->> 'sub'));
+
 create policy "machine can upsert own artifacts" on public.artifacts
   for all using (machine_id = (auth.jwt() ->> 'sub'))
   with check (machine_id = (auth.jwt() ->> 'sub'));
@@ -518,6 +565,8 @@ create policy "authenticated users can read redrhex videos" on storage.objects
 
 -- Indexes on FK columns (Postgres does not auto-create these).
 create index if not exists idx_runs_machine_id      on public.runs(machine_id);
+create index if not exists idx_run_deletions_deleted_at on public.run_deletions(machine_id, deleted_at desc);
+create index if not exists idx_run_deletions_log_dir_name on public.run_deletions(machine_id, log_dir_name);
 create index if not exists idx_jobs_machine_id      on public.jobs(machine_id);
 create index if not exists idx_jobs_status          on public.jobs(status);
 create index if not exists idx_artifacts_run_id     on public.artifacts(run_id);
@@ -531,6 +580,36 @@ create index if not exists idx_team_activity_actor_id   on public.team_activity_
 create index if not exists idx_team_activity_machine_id on public.team_activity_events(machine_id);
 create index if not exists idx_team_activity_run_id     on public.team_activity_events(run_id);
 create index if not exists idx_team_activity_job_id     on public.team_activity_events(job_id);
+
+do $$
+begin
+  alter publication supabase_realtime add table public.runs;
+exception when duplicate_object or undefined_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.jobs;
+exception when duplicate_object or undefined_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.artifacts;
+exception when duplicate_object or undefined_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.machines;
+exception when duplicate_object or undefined_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.run_deletions;
+exception when duplicate_object or undefined_object then null;
+end $$;
 
 create or replace view public.team_activity_member_7d as
 select

@@ -1,10 +1,18 @@
 # RedRHex Training Panel
 
-Local admin panel and V3.2 remote-control system for launching RSL-RL training runs, tuning rewards/terrain, viewing run history, keeping notes, coordinating team access, and sending requester-scoped notifications.
+Local admin panel and V3.4 remote-control system for launching RSL-RL training runs, tuning rewards/terrain, viewing run history, keeping notes, coordinating team access, and sending requester-scoped notifications.
 
-**Version:** 3.2.1 Terrain Stack
+**Version:** 3.4 First Release
 **Published by:** BioRoLa ABAD RHex Team
 **Credits:** Jason Liao and Jacob Yang
+
+## Documentation
+
+- [Manual EN](docs/MANUAL_EN.md)
+- [Manual 中文](docs/MANUAL_ZH.md)
+- [RedRHex To Go 中文手冊](docs/REDRHEX_TO_GO_MANUAL_ZH.md)
+- [Changelog EN](docs/CHANGELOG_EN.md)
+- [更新紀錄 中文](docs/CHANGELOG_ZH.md)
 
 ## Run
 
@@ -47,7 +55,7 @@ V3.0 highlights:
 
 - `RedRHex To Go`, the phone-friendly child GitHub Pages UI for dashboard, training launch, reward tuning, history, notes/folders, safe remote actions, and signed team video playback.
 - Local Control Center worker management: start, stop, restart, tmux/child mode, auto-start, accept/pause jobs, status tail, and setup checks.
-- Faster, safer worker sync with heartbeat polling, metadata convergence between mother and child, non-fatal artifact sync, and private video upload records.
+- Faster, safer worker sync with heartbeat polling, deletion tombstones, metadata convergence between mother and child, non-fatal artifact sync, and private video upload records.
 - Child auto-update without full-page rebuilds, so video playback, scrolling, and in-progress edits stay stable.
 - Per-user notification settings from the child Connection page, using each requester's Discord webhook.
 
@@ -205,7 +213,7 @@ Apply the Supabase schema from:
 tools/training_panel/supabase/schema.sql
 ```
 
-Re-apply the schema after pulling V3.2.0 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, updated-at triggers, queue filtering helpers, requester-scoped notification settings, run event delivery status, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
+Re-apply the schema after pulling V3.4 updates. It adds `reward_presets`, `terrain_presets`, run `notes`/`folder` metadata, deletion tombstones, worker sync diagnostics, updated-at triggers, queue filtering helpers, requester-scoped notification settings, run event delivery status, team activity events, and the private `redrhex-videos` Storage bucket used for signed team-only MP4 playback.
 
 Use the local panel's `Control Center` tab to inspect remote configuration, copy worker/tunnel commands, and enable or disable remote job acceptance.
 

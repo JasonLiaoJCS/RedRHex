@@ -1,4 +1,4 @@
-import { DEFAULT_MACHINE_ID, SUPABASE_URL } from "./config.js";
+import { DEFAULT_MACHINE_ID, SUPABASE_URL } from "./config.js?v=3.4-first-release";
 import {
   createSignedVideoUrl,
   currentUser,
@@ -11,7 +11,15 @@ import {
   signOut,
   update,
   upsert,
-} from "./api.js";
+} from "./api.js?v=3.4-first-release";
+import { createRemoteRealtime } from "./realtime.js?v=3.4-first-release";
+import {
+  compareHistoryRuns,
+  historyRunsForSnapshot,
+  jobClientRequestId,
+  normalizeHistorySort,
+  realRunConfirmsJob,
+} from "./history_sync.js?v=3.4-first-release";
 import {
   REWARD_FIELDS,
   TERRAIN_DEFAULT_VALUES,
@@ -28,6 +36,8 @@ import {
   friendlyErrorMessage,
   formatRelativeTime,
   hasActiveRemoteWork,
+  jobDisplayStatus,
+  jobRunId,
   latestFinishedTweakRun,
   jobQueueLabel,
   machineState,
@@ -37,12 +47,17 @@ import {
   checkpointOptionsForRun,
   refreshDelayForSnapshot,
   shouldReplaceVideoPanel,
+  convergenceLabel,
+  resolvedVideoStatus,
   slugify,
+  statusDescription,
+  statusLabel,
   statusTone,
+  tensorboardSummaryStateForRun,
   videoArtifactForCheckpoint,
   videoStateForCheckpoint,
   videoStateForRun,
-} from "./core.js?v=3.0.0-discord-webhook-diagnostics";
+} from "./core.js?v=3.4-first-release";
 
 const PHONE_MEDIA = window.matchMedia
   ? window.matchMedia("(max-width: 720px)")
@@ -50,6 +65,8 @@ const PHONE_MEDIA = window.matchMedia
 
 const TEXT_AUTOSAVE_DELAY_MS = 350;
 const THEME_KEY = "redrhex_to_go_theme";
+const CHILD_RELEASE_VERSION = "3.4";
+const CHILD_RELEASE_NAME = "First Release";
 const VIEW_IDS = ["train", "rewards", "terrain", "history", "connection", "dashboard"];
 const NOTIFICATION_EVENTS = [
   ["notify_training_converged", "Converged", "Reward improvement has flattened."],
@@ -62,6 +79,10 @@ function initialView() {
   const stored = localStorage.getItem("redrhex_child_view");
   if (stored === "dashboard") return "train";
   return VIEW_IDS.includes(stored) ? stored : "train";
+}
+
+function initialHistorySort() {
+  return normalizeHistorySort(localStorage.getItem("redrhex_child_history_sort"));
 }
 
 function preferredTheme() {
@@ -80,11 +101,12 @@ const state = {
     machine: null,
     jobs: [],
     runs: [],
+    runDeletions: [],
     artifacts: [],
     presets: [],
     terrainPresets: [],
     notificationSettings: null,
-    schema: { artifacts: true, rewardPresets: true, terrainPresets: true, warnings: [] },
+    schema: { artifacts: true, runDeletions: true, rewardPresets: true, terrainPresets: true, warnings: [] },
   },
   selectedPresetId: localStorage.getItem("redrhex_child_preset") || "baseline",
   draftPreset: null,
@@ -99,10 +121,13 @@ const state = {
     max_iterations: 8,
     device: "cuda:0",
     seed: "",
+    display_name: "",
+    folder: "",
   },
   selectedRunId: "",
   runSearch: "",
   folderFilter: "all",
+  historySort: initialHistorySort(),
   signedVideos: {},
   videoCheckpointByRun: {},
   runDrafts: {},
@@ -117,8 +142,20 @@ const state = {
   terrainPresetMetadataSaveInFlight: false,
   terrainPresetMetadataQueued: false,
   notificationSettings: null,
+  notificationSettingsDraft: null,
   notificationSaveStatus: "saved",
   notificationTestResult: null,
+  notificationMissedResult: null,
+  missedNotificationMode: "future_only",
+  lastQueuedJobId: "",
+  localPendingTrainingJobs: [],
+  trainQueueNotice: null,
+  realtime: null,
+  realtimeMachineId: "",
+  realtimeDiagnostics: { enabled: false, status: "off", error: "", lastEventAt: "", lastTable: "" },
+  realtimeRefreshTimer: null,
+  lastRefreshReason: "boot",
+  lastRefreshDurationMs: 0,
   message: "",
   loading: false,
   loadError: "",
@@ -193,14 +230,22 @@ function selectedTerrainPresetForTraining() {
   return preset;
 }
 
+function historyRunsForView(sortBy = "newest") {
+  return historyRunsForSnapshot(state.snapshot, { sortBy, localPendingTrainingJobs: state.localPendingTrainingJobs });
+}
+
+function historyRunsForBrowser() {
+  return historyRunsForView(state.historySort);
+}
+
 function selectedRun({ fallback = true } = {}) {
-  const selected = state.snapshot.runs.find((run) => run.id === state.selectedRunId);
+  const selected = historyRunsForView().find((run) => run.id === state.selectedRunId);
   if (selected) return selected;
-  return fallback ? state.snapshot.runs[0] || null : null;
+  return fallback ? historyRunsForView()[0] || null : null;
 }
 
 function runById(runId) {
-  return state.snapshot.runs.find((run) => run.id === runId) || null;
+  return historyRunsForView().find((run) => run.id === runId) || null;
 }
 
 function selectedHistoryRun() {
@@ -210,11 +255,38 @@ function selectedHistoryRun() {
 
 function setMessage(message, options = {}) {
   state.message = message;
-  if (options.forceRender || !app.querySelector("#message-notice")) {
+  const target = app || document.querySelector("#app");
+  if (options.forceRender || !target || !target.querySelector("#message-notice")) {
     render();
   } else {
     patchShellStatus();
   }
+}
+
+function noticeToneClass(tone = "info") {
+  if (tone === "danger" || tone === "warning" || tone === "queue-success") return tone;
+  return "";
+}
+
+function trainQueueNoticeHtml() {
+  const notice = state.trainQueueNotice;
+  const message = notice?.message || "";
+  return `<div id="train-queue-notice" class="notice ${noticeToneClass(notice?.tone)}" ${message ? "" : "hidden"}>${escapeHtml(message)}</div>`;
+}
+
+function patchTrainQueueNotice() {
+  const slot = document.querySelector("#train-queue-notice");
+  if (!slot) return;
+  const notice = state.trainQueueNotice;
+  const message = notice?.message || "";
+  slot.textContent = message;
+  slot.hidden = !message;
+  slot.className = `notice ${noticeToneClass(notice?.tone)}`.trim();
+}
+
+function setTrainQueueNotice(message, tone = "info") {
+  state.trainQueueNotice = message ? { message, tone } : null;
+  patchTrainQueueNotice();
 }
 
 function setTheme(theme) {
@@ -239,10 +311,17 @@ function setView(view) {
   render();
 }
 
+function snapshotWithLocalPendingJobs() {
+  return {
+    ...state.snapshot,
+    jobs: [...state.localPendingTrainingJobs, ...(state.snapshot.jobs || [])],
+  };
+}
+
 function scheduleRefresh() {
   if (state.refreshTimer) clearTimeout(state.refreshTimer);
   if (!state.user || document.hidden) return;
-  const delay = refreshDelayForSnapshot(state.snapshot);
+  const delay = refreshDelayForSnapshot(snapshotWithLocalPendingJobs());
   state.refreshTimer = setTimeout(() => {
     refresh({ silent: true }).catch((error) => {
       state.loadError = friendlyErrorMessage(error);
@@ -250,6 +329,57 @@ function scheduleRefresh() {
       scheduleRefresh();
     });
   }, delay);
+}
+
+function refreshModeText() {
+  const delaySeconds = Math.round(refreshDelayForSnapshot(snapshotWithLocalPendingJobs()) / 1000);
+  const realtime = state.realtimeDiagnostics || {};
+  if (realtime.enabled) return `Realtime + ${delaySeconds}s fallback`;
+  if (realtime.status && !["off", "fallback"].includes(realtime.status)) {
+    return `Realtime ${realtime.status} + ${delaySeconds}s poll`;
+  }
+  return `Polling ${delaySeconds}s`;
+}
+
+function queueRealtimeRefresh(reason = "realtime") {
+  if (state.realtimeRefreshTimer) clearTimeout(state.realtimeRefreshTimer);
+  state.realtimeRefreshTimer = setTimeout(() => {
+    refresh({ silent: true, reason }).catch((error) => {
+      state.loadError = friendlyErrorMessage(error);
+      patchCurrentView();
+      scheduleRefresh();
+    });
+  }, 250);
+}
+
+async function stopRealtime() {
+  if (state.realtimeRefreshTimer) clearTimeout(state.realtimeRefreshTimer);
+  state.realtimeRefreshTimer = null;
+  if (state.realtime) {
+    await state.realtime.stop();
+  }
+  state.realtime = null;
+  state.realtimeMachineId = "";
+}
+
+async function ensureRealtime() {
+  if (!state.user) return;
+  if (state.realtime && state.realtimeMachineId === state.machineId) return;
+  await stopRealtime();
+  state.realtimeMachineId = state.machineId;
+  state.realtime = createRemoteRealtime({
+    machineId: state.machineId,
+    onChange: (event) => {
+      state.lastRefreshReason = `realtime:${event.table}`;
+      queueRealtimeRefresh(state.lastRefreshReason);
+    },
+    onStatus: (diagnostics) => {
+      state.realtimeDiagnostics = diagnostics;
+      patchShellStatus();
+      if (state.view === "connection") patchConnection();
+    },
+  });
+  await state.realtime.start();
 }
 
 function currentRunDraft(run) {
@@ -335,10 +465,30 @@ async function ensureSelectedVideoSigned() {
   }
 }
 
+async function ensureSelectedTensorboardSummarySigned() {
+  const run = selectedRun();
+  if (!run) return;
+  const summary = tensorboardSummaryStateForRun(run, state.snapshot.artifacts);
+  const storagePath = summary.artifact?.storage_path;
+  if (!storagePath) return;
+  const existing = signedVideoEntry(storagePath);
+  if (existing?.url && existing.expiresAt && existing.expiresAt - Date.now() > 5 * 60_000) return;
+  try {
+    state.signedVideos[storagePath] = {
+      url: await createSignedVideoUrl(storagePath),
+      expiresAt: Date.now() + 55 * 60_000,
+    };
+  } catch (error) {
+    state.message = friendlyErrorMessage(error);
+  }
+}
+
 async function refresh(options = {}) {
   if (!state.user) return;
   if (state.refreshing) return;
   state.refreshing = true;
+  const refreshStarted = performance.now();
+  state.lastRefreshReason = options.reason || (options.silent ? "poll" : "manual");
   const silent = Boolean(options.silent);
   if (!silent) state.loading = true;
   state.loadError = "";
@@ -347,9 +497,20 @@ async function refresh(options = {}) {
     state.snapshot = await loadRemoteSnapshot(state.machineId, state.user?.id || "");
     state.snapshot.presets = state.snapshot.presets.map(normalizePreset);
     state.snapshot.terrainPresets = (state.snapshot.terrainPresets || []).map(normalizeTerrainPreset);
-    state.notificationSettings = normalizeNotificationSettings(state.snapshot.notificationSettings);
-    if (!state.selectedRunId && state.snapshot.runs[0] && !(state.view === "history" && state.isPhone)) {
-      state.selectedRunId = state.snapshot.runs[0].id;
+    pruneLocalPendingTrainingJobs();
+    const freshNotificationSettings = normalizeNotificationSettings(state.snapshot.notificationSettings);
+    state.notificationSettings = freshNotificationSettings;
+    if (!state.notificationSettingsDraft || !["dirty", "saving"].includes(state.notificationSaveStatus)) {
+      state.notificationSettingsDraft = freshNotificationSettings;
+    }
+    const viewRuns = historyRunsForView();
+    const selectedStillVisible = state.selectedRunId && viewRuns.some((run) => run.id === state.selectedRunId);
+    if (state.selectedRunId && !selectedStillVisible) {
+      state.selectedRunId = "";
+      state.runMetadataSaveStatus = "saved";
+    }
+    if (!state.selectedRunId && viewRuns[0] && !(state.view === "history" && state.isPhone)) {
+      state.selectedRunId = viewRuns[0].id;
     }
     if (!rewardPresetsForView().find((preset) => preset.id === state.selectedPresetId) && state.snapshot.presets[0]) {
       state.selectedPresetId = state.snapshot.presets[0].id;
@@ -359,11 +520,13 @@ async function refresh(options = {}) {
     }
     state.lastUpdated = new Date().toISOString();
     await ensureSelectedVideoSigned();
+    await ensureSelectedTensorboardSummarySigned();
   } catch (error) {
     state.loadError = friendlyErrorMessage(error);
   } finally {
     state.loading = false;
     state.refreshing = false;
+    state.lastRefreshDurationMs = Math.round(performance.now() - refreshStarted);
     if (silent && app.querySelector(".nav-tabs")) {
       patchCurrentView();
     } else {
@@ -380,12 +543,27 @@ async function loadProfile() {
 }
 
 async function boot() {
-  state.user = await currentUser();
-  if (state.user) {
-    await loadProfile();
-    await refresh();
+  try {
+    render();
+    state.user = await currentUser();
+    if (state.user) {
+      try {
+        await loadProfile();
+      } catch (error) {
+        state.profile = { id: state.user.id, email: state.user.email, role: "viewer" };
+        state.loadError = friendlyErrorMessage(error);
+      }
+      await refresh();
+      await ensureRealtime();
+    }
+  } catch (error) {
+    state.loadError = friendlyErrorMessage(error);
+  } finally {
+    state.loading = false;
+    state.refreshing = false;
+    render();
+    document.dispatchEvent(new CustomEvent("redrhex:booted"));
   }
-  render();
 }
 
 function healthChecks() {
@@ -398,6 +576,8 @@ function healthChecks() {
     ["machine", "Machine heartbeat", machineStatus !== "missing" && machineStatus !== "offline", machine?.heartbeat_at ? `${machine.machine_id} - ${formatRelativeTime(machine.heartbeat_at)}` : "No heartbeat"],
     ["accept", "Worker accepting jobs", Boolean(machine?.accept_jobs), machine?.accept_jobs ? "Ready to queue" : "Paused by mother panel"],
     ["gpu", "GPU lock", !machine?.gpu_locked, machine?.gpu_locked ? "Busy" : "Free"],
+    ["sync", "History deletion sync", Boolean(state.snapshot.schema?.runDeletions), state.snapshot.schema?.runDeletions ? "Tombstones available" : "Apply schema.sql in Supabase"],
+    ["realtime", "Realtime refresh", Boolean(state.realtimeDiagnostics?.enabled), state.realtimeDiagnostics?.enabled ? `Subscribed${state.realtimeDiagnostics.lastTable ? ` - latest ${state.realtimeDiagnostics.lastTable}` : ""}` : state.realtimeDiagnostics?.error || refreshModeText()],
     ["rewards", "Reward preset schema", Boolean(state.snapshot.schema?.rewardPresets), state.snapshot.schema?.rewardPresets ? "Shared presets ready" : "Apply schema.sql in Supabase"],
     ["terrain", "Terrain preset schema", Boolean(state.snapshot.schema?.terrainPresets), state.snapshot.schema?.terrainPresets ? "Shared terrain presets ready" : "Apply schema.sql in Supabase"],
     ["video", "Video storage", Boolean(state.snapshot.schema?.artifacts), state.snapshot.schema?.artifacts ? "Private signed playback ready" : "Apply schema.sql in Supabase"],
@@ -423,17 +603,18 @@ function shell() {
         <p class="subcopy">Team training, reward tuning, history, and shared results from anywhere.</p>
       </div>
       <div class="top-status">
+        <span id="child-release-badge" class="badge release-badge">To Go V${escapeHtml(CHILD_RELEASE_VERSION)} · ${escapeHtml(CHILD_RELEASE_NAME)}</span>
         <span id="machine-state-badge" class="badge ${tone}">${escapeHtml(machineState(machine))}</span>
         <span id="role-badge" class="badge">${escapeHtml(role())}</span>
         <span id="last-updated-badge" class="badge">${state.lastUpdated ? `Updated ${escapeHtml(formatRelativeTime(state.lastUpdated))}` : "Not updated yet"}</span>
-        <span id="refresh-mode-badge" class="badge ${hasActiveRemoteWork(state.snapshot) ? "info" : ""}">${hasActiveRemoteWork(state.snapshot) ? "Auto-refresh 3s" : "Auto-refresh 15s"}</span>
+        <span id="refresh-mode-badge" class="badge ${hasActiveRemoteWork(state.snapshot) || state.realtimeDiagnostics?.enabled ? "info" : ""}">${escapeHtml(refreshModeText())}</span>
         <button class="theme-toggle" data-action="toggle-theme">${state.theme === "dark" ? "Light Mode" : "Dark Mode"}</button>
       </div>
     </header>
     <nav class="nav-tabs">
       ${views.map(([id, label]) => `<button class="${state.view === id ? "active" : ""}" data-action="view" data-view="${id}">${label}</button>`).join("")}
     </nav>
-    <div id="message-notice" class="notice" ${state.message ? "" : "hidden"}>${escapeHtml(state.message)}</div>
+    <div id="message-notice" class="notice ${state.lastQueuedJobId && /^Queued/.test(state.message) ? "queue-success" : ""}" ${state.message ? "" : "hidden"}>${escapeHtml(state.message)}</div>
     <div id="schema-warnings">${(state.snapshot.schema?.warnings || []).map((warning) => `<div class="notice warning">${escapeHtml(warning)}</div>`).join("")}</div>
     <div id="load-error-notice" class="notice danger" ${state.loadError ? "" : "hidden"}>${escapeHtml(state.loadError)}</div>
     ${state.user ? welcomeBanner() : ""}
@@ -481,8 +662,8 @@ function welcomeBanner() {
         <p class="subcopy">${escapeHtml(readyText)}</p>
       </div>
       <div class="welcome-actions">
-        <button class="primary" data-action="view" data-view="train">Start Training</button>
-        <button data-action="view" data-view="history">View History</button>
+        ${state.view === "train" ? "" : `<button class="primary" data-action="view" data-view="train">Go To Training Page</button>`}
+        ${state.view === "history" ? "" : `<button data-action="view" data-view="history">View History</button>`}
       </div>
     </section>
   `;
@@ -493,7 +674,7 @@ function loginPage() {
     <section class="login-grid">
       <article class="panel intro-panel">
         <h2>Team Sign In</h2>
-        <p>This child panel connects to the RedRHex Supabase control plane. It uses the public project URL and publishable key; the private machine token stays only on the training PC.</p>
+        <p>Sign in with your RedRHex team account. Contact the lab admin if you don't have credentials yet.</p>
         <div class="health-row">
           <span>Project</span>
           <strong>${escapeHtml(new URL(SUPABASE_URL).host)}</strong>
@@ -501,8 +682,9 @@ function loginPage() {
       </article>
       <article class="panel">
         <h2>Login</h2>
-        <label>Email <input id="login-email" type="email" autocomplete="email"></label>
-        <label>Password <input id="login-password" type="password" autocomplete="current-password"></label>
+        <p id="login-error" class="notice danger" hidden></p>
+        <label>Email <input id="login-email" type="email" autocomplete="email" placeholder="you@example.com"></label>
+        <label>Password <input id="login-password" type="password" autocomplete="current-password" placeholder="your password"></label>
         <button class="primary wide" data-action="login">Sign In</button>
       </article>
     </section>
@@ -566,7 +748,7 @@ function dashboardStatusCards() {
   const queued = jobs.filter((job) => String(job.status || "").toLowerCase() === "queued").length;
   const running = jobs.filter((job) => ["claimed", "running"].includes(String(job.status || "").toLowerCase())).length;
   const failed = jobs.filter((job) => String(job.status || "").toLowerCase() === "failed").slice(0, 5).length;
-  const latestRun = state.snapshot.runs[0];
+  const latestRun = historyRunsForView()[0];
   const stateCopy = {
     ready: ["Ready", "Mother is online and accepting jobs."],
     busy: ["Busy", "An Isaac/GPU action is running."],
@@ -607,14 +789,14 @@ function dashboardQueueSummary() {
   return `<div class="mini-list">${visibleJobs.map((job) => `
     <div>
       <strong>${escapeHtml(job.type)}</strong>
-      <span class="badge ${statusTone(job.status)}">${escapeHtml(job.status)}</span>
+      <span class="badge ${statusTone(jobDisplayStatus(job))}">${escapeHtml(jobDisplayStatus(job))}</span>
       <small>${escapeHtml(jobQueueLabel(job, machine))}</small>
       <small>${escapeHtml(formatRelativeTime(job.created_at))}</small>
     </div>`).join("")}</div>`;
 }
 
 function dashboardLatestRuns() {
-  const latestRuns = state.snapshot.runs.slice(0, state.isPhone ? 3 : 5);
+  const latestRuns = historyRunsForView().slice(0, state.isPhone ? 3 : 5);
   return latestRuns.map(runCard).join("") || empty("No runs synced yet.");
 }
 
@@ -637,7 +819,7 @@ function jobSummary(jobs) {
   return `<div class="mini-list">${jobs.map((job) => `
     <div>
       <strong>${escapeHtml(job.type)}</strong>
-      <span class="badge ${statusTone(job.status)}">${escapeHtml(job.status)}</span>
+      <span class="badge ${statusTone(jobDisplayStatus(job))}">${escapeHtml(jobDisplayStatus(job))}</span>
       <small>${escapeHtml(jobQueueLabel(job, machine))}</small>
       <small>${escapeHtml(formatRelativeTime(job.created_at))}</small>
     </div>`).join("")}</div>`;
@@ -655,6 +837,13 @@ function trainView() {
         <p class="muted">Queues a job for mother. The worker will run one Isaac/GPU action at a time.</p>
         <label>Machine ID <input id="machine-id" value="${escapeHtml(state.machineId)}"></label>
         <label>Task <input id="task" value="${escapeHtml(form.task)}"></label>
+        <div class="input-row">
+          <label>Run Name <input id="run-display-name" maxlength="120" placeholder="optional" value="${escapeHtml(form.display_name || "")}"></label>
+          <label>Folder <input id="run-folder-before-launch" maxlength="120" list="run-folder-suggestions" placeholder="Uncategorized" value="${escapeHtml(form.folder || "")}"></label>
+        </div>
+        <datalist id="run-folder-suggestions">
+          ${folders().map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("")}
+        </datalist>
         <div class="input-row">
           <label>Envs <input id="num-envs" type="number" min="1" max="8192" value="${escapeHtml(form.num_envs)}"></label>
           <label>Iterations <input id="max-iterations" type="number" min="1" max="100000" value="${escapeHtml(form.max_iterations)}"></label>
@@ -675,6 +864,7 @@ function trainView() {
           <button class="primary" data-action="queue-training" ${disabled ? "disabled" : ""}>Queue Training</button>
           <button data-action="tweak-last-run" ${disabled ? "disabled" : ""}>Tweak From Last Run</button>
         </div>
+        ${trainQueueNoticeHtml()}
         ${disabled ? `<p class="muted">Viewer accounts can inspect but cannot launch training.</p>` : ""}
       </article>
       <article class="panel">
@@ -900,7 +1090,7 @@ function terrainInput(field, value, editable) {
 
 function filteredRuns() {
   const q = state.runSearch.trim().toLowerCase();
-  return state.snapshot.runs.filter((run) => {
+  return historyRunsForBrowser().filter((run) => {
     const folder = run.folder || "";
     if (state.folderFilter === "uncategorized" && folder) return false;
     if (state.folderFilter !== "all" && state.folderFilter !== "uncategorized" && folder !== state.folderFilter) return false;
@@ -916,7 +1106,7 @@ function runMatchesSearch(run) {
 }
 
 function folders() {
-  const set = new Set(state.snapshot.runs.map((run) => run.folder).filter(Boolean));
+  const set = new Set(historyRunsForBrowser().map((run) => run.folder).filter(Boolean));
   return [...set].sort((a, b) => a.localeCompare(b));
 }
 
@@ -925,7 +1115,7 @@ function folderLabel(folderKey) {
 }
 
 function folderRuns(folderKey) {
-  return state.snapshot.runs.filter((run) => {
+  return historyRunsForBrowser().filter((run) => {
     if (folderKey === "uncategorized") return !run.folder;
     return run.folder === folderKey;
   });
@@ -945,16 +1135,24 @@ function folderSummaries() {
   return summaries
     .map((folder) => ({
       ...folder,
-      latest: folder.runs.slice().sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")))[0],
+      newest: folder.runs.slice().sort((a, b) => compareHistoryRuns(a, b, "newest"))[0],
+      oldest: folder.runs.slice().sort((a, b) => compareHistoryRuns(a, b, "oldest"))[0],
+      sortRun: folder.runs.slice().sort((a, b) => compareHistoryRuns(a, b, state.historySort))[0],
       matches: !q || folder.label.toLowerCase().includes(q) || folder.runs.some(runMatchesSearch),
     }))
     .filter((folder) => folder.matches)
-    .sort((a, b) => a.label.localeCompare(b.label));
+    .sort((a, b) => {
+      if (state.historySort === "name") return a.label.localeCompare(b.label);
+      return compareHistoryRuns(a.sortRun, b.sortRun, state.historySort) || a.label.localeCompare(b.label);
+    });
 }
 
 function folderCard(folder) {
   const completed = folder.runs.filter((run) => run.status === "completed").length;
   const running = folder.runs.filter((run) => ["running", "stopping"].includes(String(run.status || "").toLowerCase())).length;
+  const referenceRun = state.historySort === "oldest" ? folder.oldest : folder.newest;
+  const referenceLabel = state.historySort === "oldest" ? "Oldest" : "Newest";
+  const referenceTime = referenceRun?.created_at || referenceRun?.started_at || referenceRun?.updated_at || "";
   return `
     <button class="folder-card" data-action="open-folder" data-folder="${escapeHtml(folder.key)}">
       <span class="folder-card-top">
@@ -962,7 +1160,7 @@ function folderCard(folder) {
         <span class="badge">${folder.runs.length} run${folder.runs.length === 1 ? "" : "s"}</span>
       </span>
       <small>${running ? `${running} running - ` : ""}${completed} completed</small>
-      <small>Latest ${escapeHtml(formatRelativeTime(folder.latest?.updated_at || folder.latest?.created_at))}</small>
+      <small>${referenceLabel} ${escapeHtml(formatRelativeTime(referenceTime))}</small>
     </button>
   `;
 }
@@ -1001,7 +1199,16 @@ function historyLayout() {
           <button data-action="refresh">Refresh</button>
         </div>
         ${historyFolderNav({ root, currentLabel, folderCount })}
-        <input id="run-search" placeholder="${root ? "Search folders and runs" : "Search this folder"}" value="${escapeHtml(state.runSearch)}">
+        <div class="history-tools">
+          <input id="run-search" placeholder="${root ? "Search folders and runs" : "Search this folder"}" value="${escapeHtml(state.runSearch)}">
+          <label>Sort
+            <select id="history-sort">
+              <option value="newest" ${state.historySort === "newest" ? "selected" : ""}>Newest first</option>
+              <option value="oldest" ${state.historySort === "oldest" ? "selected" : ""}>Oldest first</option>
+              <option value="name" ${state.historySort === "name" ? "selected" : ""}>Name</option>
+            </select>
+          </label>
+        </div>
         <div id="history-browser">${historyBrowserContent()}</div>
       </aside>
       ${state.isPhone ? "" : `<article class="panel run-details">${selected ? runDetails(selected, { context: "desktop" }) : empty(root ? "Open a folder to see runs." : "Select a run.")}</article>`}
@@ -1028,7 +1235,7 @@ function historyDesktopBackBar(currentLabel) {
 
 function historyFolderNav({ root, currentLabel, folderCount }) {
   if (root) {
-    const runCount = state.snapshot.runs.length;
+    const runCount = historyRunsForView().length;
     return `
       <div class="history-folder-nav root">
         <div>
@@ -1075,16 +1282,25 @@ function runCard(run) {
   const active = run.id === state.selectedRunId;
   const params = run.params || {};
   const terrainPreset = run.terrain_preset_id || params.terrain_preset_id || "baseline";
+  const videoState = resolvedVideoStatus(run, video.state);
+  const convLabel = convergenceLabel(run);
+  const pending = Boolean(run.pending_confirmation);
   return `
-    <button class="run-card ${active ? "active" : ""}" data-action="select-run" data-id="${escapeHtml(run.id)}">
+    <button class="run-card ${active ? "active" : ""} ${pending ? "pending-confirmation" : ""}" data-action="select-run" data-id="${escapeHtml(run.id)}">
       <span class="run-card-top">
         <strong>${escapeHtml(run.display_name || run.id)}</strong>
-        <span class="badge ${statusTone(run.status)}">${escapeHtml(run.status || "unknown")}</span>
+        <span class="badge ${statusTone(run.status)}">${escapeHtml(runStatusLabel(run))}</span>
+        ${pending ? `<span class="badge muted">pending mother</span>` : ""}
+        ${convLabel ? `<span class="badge good">${escapeHtml(convLabel)}</span>` : ""}
       </span>
       <small>${escapeHtml(run.folder || "Uncategorized")} - ${escapeHtml(formatRelativeTime(run.created_at))}</small>
-      <small>${run.latest_checkpoint ? "checkpoint ready" : "no checkpoint"} - video ${escapeHtml(video.state)} - terrain ${escapeHtml(terrainPreset)}</small>
+      <small>${pending ? "waiting for mother confirmation" : run.latest_checkpoint ? "checkpoint ready" : "no checkpoint"} - video ${escapeHtml(videoState)} - terrain ${escapeHtml(terrainPreset)}</small>
     </button>
   `;
+}
+
+function runStatusLabel(run) {
+  return statusLabel(run?.synthetic_job ? "job" : "run", run?.status);
 }
 
 function runCardWithOptionalInlineDetails(run) {
@@ -1106,21 +1322,35 @@ function runDetailsGrid(run) {
   const checkpointLabel = run.latest_checkpoint
     ? Number.isFinite(checkpointIter) ? `Iteration ${checkpointIter}` : run.latest_checkpoint.split("/").pop()
     : "Missing";
-  const videoLabel = video.state === "ready"
+  const videoState = resolvedVideoStatus(run, video.state);
+  const videoLabel = videoState === "ready"
     ? "Team video ready"
-    : video.state === "uploading"
-      ? "Uploading to team storage"
-      : video.state === "recordable"
-        ? "Ready to record"
-        : "No checkpoint yet";
+    : videoState === "recording"
+      ? "Recording on mother…"
+      : videoState === "uploading"
+        ? "Uploading to team storage"
+        : videoState === "recordable"
+          ? "Ready to record"
+          : videoState === "failed"
+            ? "Recording failed"
+            : "No checkpoint yet";
   const rewardPreset = run.reward_preset_id || params.reward_preset_id || "baseline";
   const terrainPreset = run.terrain_preset_id || params.terrain_preset_id || "baseline";
+  const statusDesc = statusDescription("run", run.status);
+  const convLabel = convergenceLabel(run);
   return `
     <article class="run-info-card">
       <span>Run State</span>
-      <strong class="${statusTone(run.status)}">${escapeHtml(run.status || "unknown")}</strong>
+      <strong class="${statusTone(run.status)}">${escapeHtml(statusLabel("run", run.status))}</strong>
+      ${statusDesc ? `<small>${escapeHtml(statusDesc)}</small>` : ""}
       <small>Updated ${escapeHtml(formatRelativeTime(run.updated_at || run.created_at))}</small>
     </article>
+    ${convLabel ? `
+    <article class="run-info-card good">
+      <span>Convergence</span>
+      <strong class="good">${escapeHtml(convLabel)}</strong>
+      <small>Reward plateau detected by mother during training.</small>
+    </article>` : ""}
     <article class="run-info-card">
       <span>Artifacts</span>
       <div class="run-info-list">
@@ -1292,7 +1522,14 @@ function relatedJobsForRun(run) {
   return state.snapshot.jobs.filter((job) => {
     const payload = job.payload || {};
     const result = job.result || {};
-    return payload.run_id === run.id || result.local_run_id === run.id || result.process_id === run.id;
+    const resultPayload = result.payload || {};
+    return job.id === run.job_id
+      || payload.run_id === run.id
+      || result.local_run_id === run.id
+      || result.process_id === run.id
+      || resultPayload.id === run.id
+      || (run.linked_run_id && resultPayload.id === run.linked_run_id)
+      || (run.linked_run_id && result.local_run_id === run.linked_run_id);
   }).slice(0, 8);
 }
 
@@ -1302,7 +1539,7 @@ function relatedJobsSection(run) {
     <section id="related-jobs-panel" class="subpanel">
       <h3>Related Jobs</h3>
       ${relatedJobs.length ? `<div class="mini-list">${relatedJobs.map((job) => `
-        <div><strong>${escapeHtml(job.type)}</strong><span class="badge ${statusTone(job.status)}">${escapeHtml(job.status)}</span><small>${escapeHtml(jobQueueLabel(job, state.snapshot.targetMachine || state.snapshot.machine))}</small>${jobExtraLine(job)}<small>${escapeHtml(formatRelativeTime(job.created_at))}</small></div>
+        <div><strong>${escapeHtml(job.type)}</strong><span class="badge ${statusTone(jobDisplayStatus(job))}">${escapeHtml(jobDisplayStatus(job))}</span><small>${escapeHtml(jobQueueLabel(job, state.snapshot.targetMachine || state.snapshot.machine))}</small>${jobExtraLine(job)}<small>${escapeHtml(formatRelativeTime(job.created_at))}</small></div>
       `).join("")}</div>` : empty("No remote jobs linked to this run yet.")}
     </section>
   `;
@@ -1334,7 +1571,7 @@ function teamVideoSection(run) {
     : selectedOption?.label || "Selected checkpoint";
   const checkpointName = checkpoint ? checkpoint.split("/").pop() : "";
   return `
-    <section id="team-video-panel" class="subpanel" data-video-state="${escapeHtml(video.state)}" data-storage-path="${escapeHtml(storagePath)}">
+    <section id="team-video-panel" class="subpanel" data-run-id="${escapeHtml(run.id)}" data-video-state="${escapeHtml(video.state)}" data-storage-path="${escapeHtml(storagePath)}">
       <div class="section-head compact">
         <h3>Team Video</h3>
         <span class="badge ${statusTone(video.state)}">${escapeHtml(video.state)}</span>
@@ -1366,7 +1603,60 @@ function teamVideoSection(run) {
   `;
 }
 
+function tensorboardSummarySection(run) {
+  const summary = tensorboardSummaryStateForRun(run, state.snapshot.artifacts);
+  const storagePath = summary.artifact?.storage_path || "";
+  const signed = storagePath ? signedVideoEntry(storagePath)?.url || "" : "";
+  const url = signed || summary.url;
+  return `
+    <section id="tensorboard-summary-panel" class="subpanel" data-run-id="${escapeHtml(run.id)}" data-state="${escapeHtml(summary.state)}" data-url="${escapeHtml(url)}" data-storage-path="${escapeHtml(storagePath)}">
+      <div class="section-head compact">
+        <h3>TensorBoard Snapshot</h3>
+        <span class="badge ${statusTone(summary.state)}">${escapeHtml(summary.state)}</span>
+      </div>
+      ${url ? `
+        <a class="tensorboard-summary-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">
+          <img class="tensorboard-summary-image" src="${escapeHtml(url)}" alt="TensorBoard scalar summary for ${escapeHtml(run.display_name || run.id)}">
+        </a>
+        ${storagePath ? `<div class="button-row"><button data-action="load-summary" data-path="${escapeHtml(storagePath)}">Refresh Snapshot Link</button></div>` : ""}
+      ` : summary.state === "ready" && storagePath ? `
+        <p class="muted">Preparing a signed team-only TensorBoard snapshot link...</p>
+        <button data-action="load-summary" data-path="${escapeHtml(storagePath)}">Load Snapshot</button>
+      ` : summary.state === "generating" ? `
+        <p class="muted">Mother has TensorBoard scalars for this run. The snapshot image will appear after the next sync.</p>
+      ` : summary.state === "failed" ? `
+        <p class="muted">TensorBoard snapshot generation failed on mother. Open Console on mother for the run log details.</p>
+      ` : `
+        <p class="muted">No TensorBoard snapshot is available for this run yet.</p>
+      `}
+    </section>
+  `;
+}
+
 function runDetails(run, { context = "desktop" } = {}) {
+  if (run.synthetic_job) {
+    const params = run.params || {};
+    return `
+      <div class="section-head run-detail-head ${context === "inline" ? "inline" : ""}">
+        <div>
+          <h2 id="selected-run-title">${escapeHtml(run.display_name || run.id)}</h2>
+          <p id="selected-run-id" class="muted">Job ${escapeHtml(run.job_id || run.id)}</p>
+        </div>
+        <span id="selected-run-status" class="badge ${statusTone(run.status)}">${escapeHtml(runStatusLabel(run))}</span>
+      </div>
+      <section class="subpanel">
+        <h3>Waiting For Mother</h3>
+        <p class="muted">This request has not produced a synced mother run yet. It will be replaced by the real run as soon as mother confirms it.</p>
+        <div class="details-grid">
+          <article class="run-info-card"><span>Task</span><strong>${escapeHtml(params.task || "-")}</strong><small>${escapeHtml(params.device || "cuda:0")}</small></article>
+          <article class="run-info-card"><span>Scale</span><strong>${escapeHtml(params.num_envs || "-")} envs</strong><small>${escapeHtml(params.max_iterations || "-")} iterations</small></article>
+          <article class="run-info-card"><span>Reward</span><strong>${escapeHtml(params.reward_preset_id || "baseline")}</strong><small>${Object.keys(params.reward_overrides || {}).length} overrides</small></article>
+          <article class="run-info-card"><span>Terrain</span><strong>${escapeHtml(params.terrain_preset_id || "baseline")}</strong><small>${Object.keys(params.terrain_overrides || {}).length} overrides</small></article>
+        </div>
+      </section>
+      ${relatedJobsSection(run)}
+    `;
+  }
   const draft = currentRunDraft(run);
   const editable = canEditRun(role());
   const tweakable = canOperate(role()) && canBuildTweakFromRun(run, state.snapshot.presets);
@@ -1376,7 +1666,7 @@ function runDetails(run, { context = "desktop" } = {}) {
         <h2 id="selected-run-title">${escapeHtml(run.display_name || run.id)}</h2>
         <p id="selected-run-id" class="muted">${escapeHtml(run.id)}</p>
       </div>
-      <span id="selected-run-status" class="badge ${statusTone(run.status)}">${escapeHtml(run.status || "unknown")}</span>
+      <span id="selected-run-status" class="badge ${statusTone(run.status)}">${escapeHtml(runStatusLabel(run))}</span>
     </div>
     <div id="run-details-grid" class="details-grid">
       ${runDetailsGrid(run)}
@@ -1390,6 +1680,7 @@ function runDetails(run, { context = "desktop" } = {}) {
       ${editable ? `<div class="autosave-row"><span id="run-autosave-status" class="autosave-status" data-state="${escapeHtml(state.runMetadataSaveStatus)}">${escapeHtml(runMetadataStatusText(state.runMetadataSaveStatus))}</span></div>` : ""}
     </section>
     ${teamVideoSection(run)}
+    ${tensorboardSummarySection(run)}
     <section class="subpanel">
       <h3>Safe Remote Actions</h3>
       <div class="button-row wrap">
@@ -1403,7 +1694,7 @@ function runDetails(run, { context = "desktop" } = {}) {
 }
 
 function notificationSettingsForView() {
-  return normalizeNotificationSettings(state.notificationSettings);
+  return normalizeNotificationSettings(state.notificationSettingsDraft || state.notificationSettings);
 }
 
 function notificationChannelResult(result) {
@@ -1422,6 +1713,10 @@ function notificationChannelResult(result) {
 function notificationSettingsCard() {
   const settings = notificationSettingsForView();
   const testText = state.notificationTestResult ? notificationChannelResult(state.notificationTestResult.results || {}) : "";
+  const missedText = state.notificationMissedResult
+    ? state.notificationMissedResult.message
+      || `checked ${state.notificationMissedResult.checked || 0}, sent ${state.notificationMissedResult.sent || 0}, skipped ${state.notificationMissedResult.skipped_sent || 0}`
+    : "";
   return `
     <article class="panel span-2 notification-card">
       <div class="section-head">
@@ -1452,11 +1747,25 @@ function notificationSettingsCard() {
           </div>
         </section>
       </div>
+      <section class="notification-missed">
+        <h3>Missed notifications</h3>
+        <div class="input-row">
+          <label>Catch-up
+            <select id="missed-notification-mode">
+              <option value="future_only" ${state.missedNotificationMode === "future_only" ? "selected" : ""}>Future only</option>
+              <option value="latest" ${state.missedNotificationMode === "latest" ? "selected" : ""}>Latest missed run</option>
+              <option value="all" ${state.missedNotificationMode === "all" ? "selected" : ""}>All missed runs</option>
+            </select>
+          </label>
+        </div>
+      </section>
       <div class="button-row wrap">
         <button class="primary" data-action="save-notification-settings">Save Notifications</button>
         <button data-action="send-test-notification">Send Test</button>
+        <button data-action="send-missed-notifications">Send Missed</button>
       </div>
       ${testText ? `<p class="muted">${escapeHtml(testText)}</p>` : ""}
+      ${missedText ? `<p class="muted">${escapeHtml(missedText)}</p>` : ""}
     </article>
   `;
 }
@@ -1496,8 +1805,31 @@ function connectionView() {
         <p class="muted">Role: ${escapeHtml(role())}</p>
         <p class="muted">Project: ${escapeHtml(new URL(SUPABASE_URL).host)}</p>
       </article>
+      ${syncDiagnosticsCard()}
       ${notificationSettingsCard()}
     </section>
+  `;
+}
+
+function syncDiagnosticsCard() {
+  const machine = state.snapshot.targetMachine || state.snapshot.machine || {};
+  const summary = machine.last_sync_summary && typeof machine.last_sync_summary === "object"
+    ? machine.last_sync_summary
+    : {};
+  const realtime = state.realtimeDiagnostics || {};
+  return `
+    <article class="panel">
+      <h2>History Sync</h2>
+      <div class="run-info-list">
+        <small>Child refresh <strong>${escapeHtml(refreshModeText())}</strong></small>
+        <small>Last reason <strong>${escapeHtml(state.lastRefreshReason || "-")}</strong></small>
+        <small>Refresh time <strong>${escapeHtml(String(state.lastRefreshDurationMs || 0))} ms</strong></small>
+        <small>Realtime <strong>${escapeHtml(realtime.status || "off")}</strong></small>
+        <small>Worker sync <strong>${escapeHtml(formatRelativeTime(machine.last_sync_at))}</strong></small>
+        <small>Changed <strong>${escapeHtml(String(summary.runs_changed ?? "-"))}</strong> · tombstones <strong>${escapeHtml(String(summary.tombstones ?? "-"))}</strong></small>
+      </div>
+      ${machine.last_sync_error || realtime.error ? `<p class="muted">${escapeHtml(machine.last_sync_error || realtime.error)}</p>` : ""}
+    </article>
   `;
 }
 
@@ -1524,8 +1856,8 @@ function patchShellStatus() {
   );
   setTextAndClass(
     "#refresh-mode-badge",
-    hasActiveRemoteWork(state.snapshot) ? "Auto-refresh 3s" : "Auto-refresh 15s",
-    `badge ${hasActiveRemoteWork(state.snapshot) ? "info" : ""}`.trim(),
+    refreshModeText(),
+    `badge ${hasActiveRemoteWork(state.snapshot) || state.realtimeDiagnostics?.enabled ? "info" : ""}`.trim(),
   );
   const themeToggle = document.querySelector(".theme-toggle");
   if (themeToggle) themeToggle.textContent = state.theme === "dark" ? "Light Mode" : "Dark Mode";
@@ -1534,6 +1866,7 @@ function patchShellStatus() {
   if (message) {
     message.textContent = state.message;
     message.hidden = !state.message;
+    message.classList.toggle("queue-success", Boolean(state.lastQueuedJobId && /^Queued/.test(state.message)));
   }
   const warningSlot = document.querySelector("#schema-warnings");
   if (warningSlot) {
@@ -1572,7 +1905,7 @@ function patchRunList() {
 
 function patchRunCardsInPlace() {
   document.querySelectorAll(".run-card").forEach((card) => {
-    const run = state.snapshot.runs.find((item) => item.id === card.dataset.id);
+    const run = runById(card.dataset.id);
     if (!run) return;
     const video = videoStateForRun(run, state.snapshot.artifacts);
     const active = run.id === state.selectedRunId;
@@ -1582,13 +1915,14 @@ function patchRunCardsInPlace() {
     if (title) title.textContent = run.display_name || run.id;
     const badge = card.querySelector(".run-card-top .badge");
     if (badge) {
-      badge.textContent = run.status || "unknown";
+      badge.textContent = runStatusLabel(run);
       badge.className = `badge ${statusTone(run.status)}`;
     }
     const lines = card.querySelectorAll("small");
     if (lines[0]) lines[0].textContent = `${run.folder || "Uncategorized"} - ${formatRelativeTime(run.created_at)}`;
     const params = run.params || {};
-    if (lines[1]) lines[1].textContent = `${run.latest_checkpoint ? "checkpoint ready" : "no checkpoint"} - video ${video.state} - terrain ${run.terrain_preset_id || params.terrain_preset_id || "baseline"}`;
+    const videoState = resolvedVideoStatus(run, video.state);
+    if (lines[1]) lines[1].textContent = `${run.latest_checkpoint ? "checkpoint ready" : "no checkpoint"} - video ${videoState} - terrain ${run.terrain_preset_id || params.terrain_preset_id || "baseline"}`;
   });
 }
 
@@ -1616,7 +1950,7 @@ function syncHistoryAccordion(card) {
   existingDetails.forEach((details) => details.remove());
   state.selectedRunId = runId;
   patchRunCardsInPlace();
-  const run = state.snapshot.runs.find((item) => item.id === runId);
+  const run = runById(runId);
   if (run) {
     wrapper.insertAdjacentHTML("beforeend", `<article class="inline-run-details">${runDetails(run, { context: "inline" })}</article>`);
   }
@@ -1670,10 +2004,13 @@ function persistActiveRunMetadataDraft({ flush = false } = {}) {
 function patchTeamVideo(run) {
   const panel = document.querySelector("#team-video-panel");
   if (!panel || !run) return;
+  if ((panel.dataset.runId || "") !== String(run.id || "")) {
+    panel.outerHTML = teamVideoSection(run);
+    return;
+  }
   const video = videoStateForCheckpoint(run, state.snapshot.artifacts, selectedVideoCheckpoint(run));
   const nextStorage = video.artifact?.storage_path || "";
   const videoElement = panel.querySelector("video");
-  if (videoElement && panel.dataset.storagePath && !nextStorage) return;
   const signedReady = Boolean(nextStorage && signedVideoEntry(nextStorage)?.url);
   const shouldReplace = (video.state === "ready" && signedReady && !videoElement) || shouldReplaceVideoPanel({
     currentState: panel.dataset.videoState || "",
@@ -1684,6 +2021,22 @@ function patchTeamVideo(run) {
   });
   if (!shouldReplace) return;
   panel.outerHTML = teamVideoSection(run);
+}
+
+function patchTensorboardSummary(run) {
+  const panel = document.querySelector("#tensorboard-summary-panel");
+  if (!panel || !run) return;
+  const summary = tensorboardSummaryStateForRun(run, state.snapshot.artifacts);
+  const storagePath = summary.artifact?.storage_path || "";
+  const nextUrl = (storagePath ? signedVideoEntry(storagePath)?.url || "" : "") || summary.url;
+  if (
+    (panel.dataset.runId || "") !== String(run.id || "")
+    || (panel.dataset.state || "") !== summary.state
+    || (panel.dataset.url || "") !== nextUrl
+    || (panel.dataset.storagePath || "") !== storagePath
+  ) {
+    panel.outerHTML = tensorboardSummarySection(run);
+  }
 }
 
 function patchSelectedRunDetails() {
@@ -1704,7 +2057,7 @@ function patchSelectedRunDetails() {
   if (title) title.textContent = run.display_name || run.id;
   const id = document.querySelector("#selected-run-id");
   if (id) id.textContent = run.id;
-  setTextAndClass("#selected-run-status", run.status || "unknown", `badge ${statusTone(run.status)}`);
+  setTextAndClass("#selected-run-status", runStatusLabel(run), `badge ${statusTone(run.status)}`);
 
   const grid = document.querySelector("#run-details-grid");
   if (grid) grid.innerHTML = runDetailsGrid(run);
@@ -1720,6 +2073,7 @@ function patchSelectedRunDetails() {
   }
 
   patchTeamVideo(run);
+  patchTensorboardSummary(run);
   const related = document.querySelector("#related-jobs-panel");
   if (related) related.outerHTML = relatedJobsSection(run);
 }
@@ -1820,13 +2174,121 @@ function toggleAllGroups(kind) {
 }
 
 async function handleLogin() {
-  const email = document.querySelector("#login-email")?.value || "";
-  const password = document.querySelector("#login-password")?.value || "";
-  await signIn(email, password);
-  state.user = await currentUser();
-  await loadProfile();
-  await refresh();
-  setMessage("Signed in.");
+  const emailEl = document.querySelector("#login-email");
+  const passwordEl = document.querySelector("#login-password");
+  const btn = document.querySelector('[data-action="login"]');
+  const email = emailEl?.value?.trim() || "";
+  const password = passwordEl?.value || "";
+  if (!email || !password) {
+    setLoginError("Please enter your email and password.");
+    return;
+  }
+  // Show loading state so the page doesn't look frozen.
+  if (btn) { btn.disabled = true; btn.textContent = "Signing in…"; }
+  setLoginError("");
+  try {
+    const session = await signIn(email, password);
+    state.user = session?.user || await currentUser();
+    if (!state.user) {
+      throw new Error("Sign in succeeded, but Supabase did not return a user session.");
+    }
+    state.profile = { id: state.user.id, email: state.user.email, role: "viewer" };
+    state.loadError = "";
+    render();
+    try {
+      await loadProfile();
+    } catch (error) {
+      state.loadError = `Signed in, but profile loading failed: ${friendlyErrorMessage(error)}`;
+      render();
+    }
+    await refresh();
+    setMessage("Signed in.");
+  } catch (error) {
+    if (state.user) {
+      state.loadError = friendlyErrorMessage(error);
+      render();
+    } else {
+      setLoginError(friendlyErrorMessage(error));
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Sign In"; }
+  }
+}
+
+function setLoginError(message) {
+  const el = document.querySelector("#login-error");
+  if (el) {
+    el.textContent = message;
+    el.hidden = !message;
+  } else if (message) {
+    // Fallback if the element doesn't exist for some reason.
+    setMessage(message);
+  }
+}
+
+function requesterLabel() {
+  return state.profile?.display_name || state.profile?.email || state.user?.email || "Remote member";
+}
+
+function createClientRequestId() {
+  if (globalThis.crypto?.randomUUID) return `child-${globalThis.crypto.randomUUID()}`;
+  return `child-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function pruneLocalPendingTrainingJobs() {
+  if (!state.localPendingTrainingJobs.length) return;
+  const remoteClientRequestIds = new Set((state.snapshot.jobs || []).map(jobClientRequestId).filter(Boolean));
+  const realRuns = state.snapshot.runs || [];
+  state.localPendingTrainingJobs = state.localPendingTrainingJobs.filter((job) => {
+    const clientRequestId = jobClientRequestId(job);
+    return !(clientRequestId && remoteClientRequestIds.has(clientRequestId)) && !realRunConfirmsJob(job, realRuns);
+  });
+}
+
+function addLocalPendingTrainingJob(job, clientRequestId) {
+  const now = new Date().toISOString();
+  const pending = {
+    ...job,
+    id: `local:${clientRequestId}`,
+    status: "queued",
+    created_at: now,
+    updated_at: now,
+    result: {},
+    error: "",
+    local_pending: true,
+  };
+  state.localPendingTrainingJobs = [
+    pending,
+    ...state.localPendingTrainingJobs.filter((item) => jobClientRequestId(item) !== clientRequestId),
+  ].slice(0, 20);
+  renderRunListOnly();
+  patchShellStatus();
+  return pending;
+}
+
+function removeLocalPendingTrainingJob(clientRequestId) {
+  if (!clientRequestId) return;
+  state.localPendingTrainingJobs = state.localPendingTrainingJobs.filter((job) => jobClientRequestId(job) !== clientRequestId);
+  renderRunListOnly();
+  patchShellStatus();
+}
+
+function rememberQueuedJob(job, rows = []) {
+  const inserted = Array.isArray(rows) && rows[0]
+    ? rows[0]
+    : {
+      ...job,
+      id: `local-${Date.now()}`,
+      status: "queued",
+      created_at: new Date().toISOString(),
+      result: {},
+      error: "",
+    };
+  state.lastQueuedJobId = inserted.id || "";
+  const existing = state.snapshot.jobs || [];
+  state.snapshot.jobs = [inserted, ...existing.filter((item) => item.id !== inserted.id)].slice(0, 60);
+  pruneLocalPendingTrainingJobs();
+  return inserted;
 }
 
 async function queueTraining() {
@@ -1834,6 +2296,8 @@ async function queueTraining() {
   localStorage.setItem("redrhex_machine_id", state.machineId);
   state.trainForm = {
     task: document.querySelector("#task")?.value || "Template-Redrhex-Direct-v0",
+    display_name: String(document.querySelector("#run-display-name")?.value || "").trim(),
+    folder: String(document.querySelector("#run-folder-before-launch")?.value || "").trim(),
     num_envs: Number(document.querySelector("#num-envs")?.value || 4),
     max_iterations: Number(document.querySelector("#max-iterations")?.value || 8),
     device: document.querySelector("#device")?.value || "cuda:0",
@@ -1857,15 +2321,41 @@ async function queueTraining() {
     max_iterations: state.trainForm.max_iterations,
     device: state.trainForm.device,
   };
+  if (state.trainForm.display_name) params.display_name = state.trainForm.display_name;
+  if (state.trainForm.folder) params.folder = state.trainForm.folder;
   if (state.trainForm.seed !== "") params.seed = Number(state.trainForm.seed);
   if (preset.draft) {
     params.tweak_source_run_id = preset.source_run_id || "";
     params.tweak_source_label = preset.source_label || preset.source_run_id || "";
   }
-  const job = buildTrainingJob({ machineId: state.machineId, params, preset, terrainPreset, role: role(), userId: state.user?.id });
-  await insert("jobs", job);
-  await refresh({ silent: true });
-  setMessage(`Queued training with ${preset.name} and ${terrainPreset.name}.`);
+  const clientRequestId = createClientRequestId();
+  params.client_request_id = clientRequestId;
+  const job = buildTrainingJob({
+    machineId: state.machineId,
+    params,
+    preset,
+    terrainPreset,
+    role: role(),
+    userId: state.user?.id,
+    requesterLabel: requesterLabel(),
+    clientRequestId,
+  });
+  addLocalPendingTrainingJob(job, clientRequestId);
+  setTrainQueueNotice("Sending training request to mother...", "info");
+  try {
+    const rows = await insert("jobs", job);
+    rememberQueuedJob(job, rows);
+    state.trainForm.display_name = "";
+    const runNameInput = document.querySelector("#run-display-name");
+    if (runNameInput) runNameInput.value = "";
+    setTrainQueueNotice(`Queued training with ${preset.name} and ${terrainPreset.name}. It will stay gray in History until mother confirms the run.`, "queue-success");
+    refresh({ silent: true, reason: "queue-training" }).catch((error) => {
+      setTrainQueueNotice(friendlyErrorMessage(error), "warning");
+    });
+  } catch (error) {
+    removeLocalPendingTrainingJob(clientRequestId);
+    setTrainQueueNotice(friendlyErrorMessage(error), "danger");
+  }
 }
 
 function applyTweakPayload(payload) {
@@ -1876,6 +2366,8 @@ function applyTweakPayload(payload) {
     max_iterations: Number(params.max_iterations || 8),
     device: params.device || "cuda:0",
     seed: params.seed ?? "",
+    display_name: "",
+    folder: params.folder || "",
   };
   state.tweakDraftPreset = normalizePreset({
     ...payload.reward_preset,
@@ -2286,7 +2778,8 @@ async function queueRunAction(type, message, payload = {}) {
   const run = selectedRun();
   if (!run) return;
   const job = buildActionJob({ machineId: state.machineId, type, runId: run.id, role: role(), userId: state.user?.id, payload });
-  await insert("jobs", job);
+  const rows = await insert("jobs", job);
+  rememberQueuedJob(job, rows);
   await refresh({ silent: true });
   setMessage(message);
 }
@@ -2357,11 +2850,13 @@ function discordWebhookValidationMessage(webhook) {
 
 async function saveNotificationSettings({ silent = false } = {}) {
   const payload = collectNotificationSettings();
+  state.notificationSettingsDraft = normalizeNotificationSettings(payload);
   state.notificationSaveStatus = "saving";
   patchConnection();
   try {
     const rows = await upsert("notification_settings", payload, "user_id,machine_id");
     state.notificationSettings = normalizeNotificationSettings(rows?.[0] || payload);
+    state.notificationSettingsDraft = state.notificationSettings;
     state.notificationSaveStatus = "saved";
     if (!silent) setMessage("Notification settings saved.");
     await refresh({ silent: true });
@@ -2406,18 +2901,61 @@ async function sendTestNotification() {
   }
 }
 
-async function loadVideo(storagePath) {
+async function sendMissedNotifications() {
+  const selectedMode = document.querySelector("#missed-notification-mode")?.value || state.missedNotificationMode;
+  state.missedNotificationMode = selectedMode;
+  if (selectedMode === "future_only") {
+    state.notificationMissedResult = { message: "Future only selected. Choose Latest missed run or All missed runs to catch up." };
+    patchConnection();
+    return setMessage("Choose a missed-notification catch-up mode first.");
+  }
+  state.notificationMissedResult = { message: "Missed notification job queued." };
+  patchConnection();
+  try {
+    if (state.notificationSaveStatus === "dirty") {
+      await saveNotificationSettings({ silent: true });
+    }
+    const job = {
+      machine_id: state.machineId || null,
+      type: "send_missed_notifications",
+      actor_id: state.user?.id || null,
+      actor_role: role() || "viewer",
+      payload: {
+        scope: selectedMode,
+        requester_id: state.user?.id || null,
+        requester_label: requesterLabel(),
+      },
+    };
+    const rows = await insert("jobs", job);
+    rememberQueuedJob(job, rows);
+    state.notificationMissedResult = { message: selectedMode === "latest" ? "Queued latest missed notification catch-up." : "Queued all missed notification catch-up." };
+    await refresh({ silent: true });
+    patchConnection();
+    setMessage(state.notificationMissedResult.message);
+  } catch (error) {
+    const message = friendlyErrorMessage(error);
+    state.notificationMissedResult = { message };
+    patchConnection();
+    setMessage(message);
+  }
+}
+
+async function loadArtifactLink(storagePath) {
   state.signedVideos[storagePath] = {
     url: await createSignedVideoUrl(storagePath),
     expiresAt: Date.now() + 55 * 60_000,
   };
   const run = selectedRun();
   if (state.view === "history" && run) {
-    const panel = document.querySelector("#team-video-panel");
-    if (panel) panel.outerHTML = teamVideoSection(run);
+    patchTeamVideo(run);
+    patchTensorboardSummary(run);
   } else {
     render();
   }
+}
+
+async function loadVideo(storagePath) {
+  return loadArtifactLink(storagePath);
 }
 
 function openHistoryFolder(folderKey) {
@@ -2433,7 +2971,12 @@ function openHistoryFolder(folderKey) {
 }
 
 function render() {
-  app.innerHTML = shell();
+  const target = app || document.querySelector("#app");
+  if (!target) {
+    console.error("RedRHex: #app element not found, cannot render");
+    return;
+  }
+  target.innerHTML = shell();
 }
 
 function handlePhoneModeChange(event) {
@@ -2457,10 +3000,11 @@ document.addEventListener("click", async (event) => {
   try {
     if (action === "toggle-theme") return toggleTheme();
     if (action === "view") return setView(target.dataset.view);
-    if (action === "login") return await handleLogin();
+    if (action === "login") { handleLogin(); return; } // handleLogin manages its own try/catch
     if (action === "refresh") return await refresh({ silent: true });
     if (action === "sign-out") {
       await signOut();
+      await stopRealtime();
       state.user = null;
       state.profile = null;
       if (state.refreshTimer) clearTimeout(state.refreshTimer);
@@ -2471,6 +3015,7 @@ document.addEventListener("click", async (event) => {
       state.machineId = document.querySelector("#connection-machine-id")?.value || state.machineId;
       localStorage.setItem("redrhex_machine_id", state.machineId);
       await refresh({ silent: true });
+      await ensureRealtime();
       return setMessage("Machine target saved.");
     }
     if (action === "queue-training") return await queueTraining();
@@ -2511,6 +3056,7 @@ document.addEventListener("click", async (event) => {
         if (state.isPhone && syncHistoryAccordion(target)) {
           if (opened) {
             await ensureSelectedVideoSigned();
+            await ensureSelectedTensorboardSummarySigned();
             patchSelectedRunDetails();
           }
         } else {
@@ -2519,6 +3065,7 @@ document.addEventListener("click", async (event) => {
             setRunMetadataSaveStatus("saved");
           }
           await ensureSelectedVideoSigned();
+          await ensureSelectedTensorboardSummarySigned();
           patchHistory({ forceList: true });
         }
         patchShellStatus();
@@ -2526,10 +3073,12 @@ document.addEventListener("click", async (event) => {
       }
       state.selectedRunId = target.dataset.id;
       await ensureSelectedVideoSigned();
+      await ensureSelectedTensorboardSummarySigned();
       return render();
     }
     if (action === "save-run") return await saveRun(target.dataset.runId || state.selectedRunId);
     if (action === "load-video") return await loadVideo(target.dataset.path);
+    if (action === "load-summary") return await loadArtifactLink(target.dataset.path);
     if (action === "copy-video-path") {
       await navigator.clipboard.writeText(target.dataset.path || "");
       return setMessage("Video storage path copied.");
@@ -2540,15 +3089,18 @@ document.addEventListener("click", async (event) => {
     if (action === "job-compact-run") return await compactSelectedRun();
     if (action === "save-notification-settings") return await saveNotificationSettings();
     if (action === "send-test-notification") return await sendTestNotification();
+    if (action === "send-missed-notifications") return await sendMissedNotifications();
   } catch (error) {
     setMessage(friendlyErrorMessage(error));
   }
 });
 
 document.addEventListener("change", (event) => {
-  if (["task", "num-envs", "max-iterations", "device", "seed"].includes(event.target.id)) {
+  if (["task", "run-display-name", "run-folder-before-launch", "num-envs", "max-iterations", "device", "seed"].includes(event.target.id)) {
     state.trainForm = {
       task: document.querySelector("#task")?.value || "Template-Redrhex-Direct-v0",
+      display_name: String(document.querySelector("#run-display-name")?.value || "").trim(),
+      folder: String(document.querySelector("#run-folder-before-launch")?.value || "").trim(),
       num_envs: Number(document.querySelector("#num-envs")?.value || 4),
       max_iterations: Number(document.querySelector("#max-iterations")?.value || 8),
       device: document.querySelector("#device")?.value || "cuda:0",
@@ -2587,17 +3139,33 @@ document.addEventListener("change", (event) => {
     state.folderFilter = event.target.value;
     renderRunListOnly();
   }
+  if (event.target.id === "history-sort") {
+    state.historySort = normalizeHistorySort(event.target.value);
+    localStorage.setItem("redrhex_child_history_sort", state.historySort);
+    renderRunListOnly();
+  }
   if (event.target.classList.contains("terrain-input") && state.draftTerrainPreset) {
     state.draftTerrainPreset.values[event.target.dataset.key] = parseTerrainValue(event.target);
   }
+  if (event.target.id === "missed-notification-mode") {
+    state.missedNotificationMode = event.target.value;
+    state.notificationMissedResult = null;
+    patchConnection();
+  }
   if (event.target.id?.startsWith("notify-") || event.target.classList.contains("notify-event-toggle")) {
-    state.notificationSettings = normalizeNotificationSettings(collectNotificationSettings());
+    state.notificationSettingsDraft = normalizeNotificationSettings(collectNotificationSettings());
     state.notificationSaveStatus = "dirty";
     patchConnection();
   }
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.id === "run-display-name") {
+    state.trainForm.display_name = String(event.target.value || "").trim();
+  }
+  if (event.target.id === "run-folder-before-launch") {
+    state.trainForm.folder = String(event.target.value || "").trim();
+  }
   if (event.target.id === "run-search") {
     state.runSearch = event.target.value;
     renderRunListOnly();
@@ -2643,7 +3211,7 @@ document.addEventListener("input", (event) => {
     state.draftTerrainPreset.values[event.target.dataset.key] = parseTerrainValue(event.target);
   }
   if (event.target.id === "notify-discord-webhook") {
-    state.notificationSettings = normalizeNotificationSettings(collectNotificationSettings());
+    state.notificationSettingsDraft = normalizeNotificationSettings(collectNotificationSettings());
     state.notificationSaveStatus = "dirty";
   }
 });
@@ -2695,8 +3263,17 @@ document.addEventListener("keydown", (event) => {
 });
 
 boot().catch((error) => {
+  console.error("RedRHex boot failed:", error);
   state.loadError = friendlyErrorMessage(error);
-  render();
+  try {
+    render();
+  } catch (renderError) {
+    console.error("RedRHex render failed in boot catch:", renderError);
+    const target = document.querySelector("#app");
+    if (target) {
+      target.innerHTML = `<section class="panel loading-panel"><p class="eyebrow">BioRoLa ABAD RHex Team</p><h1>RedRHex To Go</h1><p>App failed to start: ${String(error?.message || error)}</p><p>Hard-refresh the page (Ctrl+Shift+R) to try again.</p></section>`;
+    }
+  }
 });
 
 window.addEventListener("focus", () => {

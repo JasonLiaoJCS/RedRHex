@@ -81,6 +81,8 @@ class TrainingParams:
     requester_id: str | None = None
     requester_label: str | None = None
     display_name: str | None = None
+    folder: str | None = None
+    client_request_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainingParams":
@@ -104,6 +106,8 @@ class TrainingParams:
             requester_id=str(data["requester_id"]) if data.get("requester_id") else None,
             requester_label=str(data["requester_label"]) if data.get("requester_label") else None,
             display_name=str(data["display_name"]).strip() if data.get("display_name") else None,
+            folder=str(data["folder"]).strip() if data.get("folder") else None,
+            client_request_id=str(data["client_request_id"]).strip() if data.get("client_request_id") else None,
         )
         params.validate()
         return params
@@ -121,6 +125,10 @@ class TrainingParams:
             raise ValueError("checkpoint is required when resume is enabled")
         if self.display_name and len(self.display_name) > 120:
             raise ValueError("display_name must be 120 characters or fewer")
+        if self.folder and len(self.folder) > 120:
+            raise ValueError("folder must be 120 characters or fewer")
+        if self.client_request_id and len(self.client_request_id) > 160:
+            raise ValueError("client_request_id must be 160 characters or fewer")
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -134,30 +134,67 @@ function eventEnabled(settings: NotificationSettings, eventType: NotificationEve
 }
 
 function eventSubject(event: NotifyRequest): string {
+  return `RedRHex ${EVENT_LABELS[event.event_type]}`;
+}
+
+function compactValue(value: unknown, fallback = "-"): string {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+}
+
+function durationLabel(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function runtimeLabel(event: NotifyRequest): string {
   const payload = event.payload ?? {};
-  const label = String(payload.display_name ?? event.run_id ?? "RedRHex");
-  return `RedRHex ${EVENT_LABELS[event.event_type]}: ${label}`;
+  const provided = payload.run_time ?? payload.runtime ?? payload.duration;
+  if (provided !== undefined && provided !== null && String(provided).trim()) return String(provided);
+  const seconds = Number(payload.duration_seconds ?? payload.runtime_seconds);
+  if (Number.isFinite(seconds) && seconds >= 0) return durationLabel(seconds * 1000);
+  const started = Date.parse(String(payload.started_at ?? payload.created_at ?? ""));
+  const ended = Date.parse(String(payload.finished_at ?? payload.updated_at ?? event.created_at ?? ""));
+  if (Number.isFinite(started) && Number.isFinite(ended)) return durationLabel(ended - started);
+  return "-";
+}
+
+function statusLabel(event: NotifyRequest): string {
+  const payload = event.payload ?? {};
+  return compactValue(payload.status, EVENT_LABELS[event.event_type].replace(/^Training /, "").toLowerCase());
+}
+
+function requesterLabel(event: NotifyRequest): string {
+  const payload = event.payload ?? {};
+  return compactValue(payload.requester_label ?? payload.run_by ?? event.requester_id, "Remote member");
+}
+
+function runLink(event: NotifyRequest): string {
+  const payload = event.payload ?? {};
+  const url = compactValue(payload.run_url ?? payload.remote_url, "");
+  return url ? `[Open run](${url})` : "-";
 }
 
 function discordPayload(event: NotifyRequest) {
   const payload = event.payload ?? {};
+  const title = compactValue(payload.display_name ?? event.run_id, EVENT_LABELS[event.event_type]);
   const fields = [
-    { name: "Run", value: String(payload.display_name ?? event.run_id ?? "-"), inline: false },
-    { name: "Machine", value: String(event.machine_id ?? "-"), inline: true },
-    { name: "Status", value: String(payload.status ?? "-"), inline: true },
-    { name: "Task", value: String(payload.task ?? "-"), inline: true },
+    { name: "Status", value: statusLabel(event), inline: true },
+    { name: "Runtime", value: runtimeLabel(event), inline: true },
+    { name: "Run by", value: requesterLabel(event), inline: true },
+    { name: "Link", value: runLink(event), inline: false },
   ];
-  if (event.event_type === "training_converged") {
-    fields.push({ name: "Iteration", value: String(payload.iteration ?? "-"), inline: true });
-    fields.push({ name: "Improvement", value: `${payload.improvement_pct ?? "-"}%`, inline: true });
-  }
-  if (event.event_type === "video_ready") {
-    fields.push({ name: "Video", value: String(payload.storage_path ?? payload.latest_video ?? "-"), inline: false });
-  }
-  if (payload.remote_url) fields.push({ name: "Remote", value: String(payload.remote_url), inline: false });
   return {
     content: eventSubject(event),
-    embeds: [{ title: EVENT_LABELS[event.event_type], fields }],
+    embeds: [{ title, fields }],
   };
 }
 

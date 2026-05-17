@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from uuid import UUID
 
 from .activity import category_for_job_type, outcome_for_status, score_activity_event
@@ -21,10 +23,15 @@ from .remote_config import (
     role_allows,
 )
 from .supabase_client import SupabaseClient
+from .tensorboard_summary import ensure_tensorboard_summary, tensorboard_summary_path
 
 VIDEO_BUCKET = "redrhex-videos"
+TENSORBOARD_SUMMARY_CONTENT_TYPE = "image/png"
 GPU_JOB_TYPES = {"start_training", "record_video", "export_onnx"}
 FINISHED_RUN_STATUSES = {"completed", "failed", "interrupted"}
+MEDIA_SYNC_INTERVAL_SECONDS = 3.0
+MEDIA_SYNC_RECENT_SECONDS = 20 * 60
+MEDIA_SYNC_STATUSES = {"recording", "completed", "failed", "missing_checkpoint"}
 NOTIFICATION_SETTING_KEYS = {
     "training_converged": "notify_training_converged",
     "training_completed": "notify_training_completed",
@@ -74,11 +81,15 @@ def run_artifacts(run: dict) -> list[dict]:
         "video": run.get("latest_video"),
         "onnx": run.get("onnx_path"),
         "process_log": run.get("process_log"),
+        "tensorboard_summary": run.get("tensorboard_summary_path"),
     }
     for kind, path in mapping.items():
         add_artifact(kind, path)
     log_dir = Path(str(run.get("log_dir") or ""))
     if log_dir.is_dir():
+        summary = tensorboard_summary_path(log_dir)
+        if summary.is_file():
+            add_artifact("tensorboard_summary", str(summary))
         for _, checkpoint in checkpoint_inventory(log_dir):
             add_artifact("checkpoint", str(checkpoint))
         video_dir = log_dir / "videos" / "play"
@@ -298,15 +309,48 @@ class RemoteJobExecutor:
             raise ValueError(f"No checkpoint found for iteration {target_iteration}")
         return Path(str(run["latest_checkpoint"]))
 
-    def sync_runs_payload(self) -> list[dict]:
+    def sync_runs_payload(self, run_ids: set[str] | None = None) -> list[dict]:
         runs = self.history.list_runs()
-        return [
-            {
+        if run_ids is not None:
+            normalized_ids = {str(run_id) for run_id in run_ids if str(run_id)}
+            runs = [run for run in runs if str(run.get("id") or "") in normalized_ids]
+        result = []
+        for run in runs:
+            run_id = str(run.get("id") or "")
+            log_dir = Path(str(run.get("log_dir") or ""))
+            status = str(run.get("status") or "").lower()
+            if run_id and log_dir.is_dir() and status in FINISHED_RUN_STATUSES:
+                try:
+                    title = str(run.get("display_name") or run_id or log_dir.name)
+                    summary = ensure_tensorboard_summary(log_dir, title=title)
+                    if summary:
+                        run = {
+                            **run,
+                            "tensorboard_summary_path": str(summary),
+                            "tensorboard_summary_status": "completed",
+                            "tensorboard_summary_error": None,
+                        }
+                        self.history.update_run(
+                            run_id,
+                            tensorboard_summary_path=str(summary),
+                            tensorboard_summary_status="completed",
+                            tensorboard_summary_error=None,
+                        )
+                except Exception as exc:
+                    run = {
+                        **run,
+                        "tensorboard_summary_status": "failed",
+                        "tensorboard_summary_error": str(exc),
+                    }
+                    self.history.update_run(
+                        run_id,
+                        tensorboard_summary_status="failed",
+                        tensorboard_summary_error=str(exc),
+                    )
+            notes = self.history.get_note(run_id)
+            record: dict = {
                 "id": run.get("id"),
                 "status": run.get("status"),
-                "display_name": run.get("display_name"),
-                "folder": run.get("folder"),
-                "notes": self.history.get_note(str(run.get("id") or "")),
                 "created_at": run.get("created_at"),
                 "updated_at": run.get("updated_at"),
                 "log_dir": run.get("log_dir"),
@@ -315,10 +359,26 @@ class RemoteJobExecutor:
                 "latest_video": run.get("latest_video"),
                 "onnx_path": run.get("onnx_path"),
                 "created_by": run.get("created_by") or (run.get("params") or {}).get("requester_id"),
+                # Live training state — enables the child to show convergence + recording progress.
+                "convergence_detected": bool(run.get("convergence_detected")),
+                "convergence_iteration": run.get("convergence_iteration"),
+                "convergence_improvement_pct": run.get("convergence_improvement_pct"),
+                "video_status": run.get("video_status"),
+                "returncode": run.get("returncode"),
                 "artifacts": run_artifacts(run),
             }
-            for run in runs
-        ]
+            # Only include user-editable metadata when the mother has a real value.
+            # Omitting a field from the upsert preserves whatever the child set in
+            # Supabase, preventing "updated_at freshened by a training event" from
+            # silently overwriting a folder/name/note that the child assigned.
+            if run.get("display_name"):
+                record["display_name"] = run["display_name"]
+            if run.get("folder"):
+                record["folder"] = run["folder"]
+            if notes:
+                record["notes"] = notes
+            result.append(record)
+        return result
 
 
 class RemoteWorker:
@@ -339,6 +399,11 @@ class RemoteWorker:
         self.active_job_id: str | None = None
         self.last_sync_at = 0.0
         self.last_sync_error = ""
+        self.last_sync_completed_at = ""
+        self.last_sync_duration_ms = 0
+        self.last_sync_summary: dict = {}
+        self.last_media_sync_at = 0.0
+        self._last_synced_run_fingerprints: dict[str, str] = {}
 
     def send_heartbeat(self, queue_depth: int = 0, gpu_locked: bool | None = None) -> dict:
         accept_jobs = self.state_store.effective_accept_jobs(self.config)
@@ -350,6 +415,15 @@ class RemoteWorker:
             gpu_locked=self.executor.gpu_locked() if gpu_locked is None else gpu_locked,
             accept_jobs=accept_jobs,
         )
+        if self.last_sync_completed_at or self.last_sync_error or self.last_sync_summary:
+            payload.update(
+                {
+                    "last_sync_at": self.last_sync_completed_at or None,
+                    "last_sync_duration_ms": int(self.last_sync_duration_ms or 0),
+                    "last_sync_error": self.last_sync_error or "",
+                    "last_sync_summary": self.last_sync_summary or {},
+                }
+            )
         self.client.heartbeat(payload)
         return payload
 
@@ -359,7 +433,7 @@ class RemoteWorker:
                 "runs",
                 query={
                     "machine_id": f"eq.{self.config.machine_id}",
-                    "select": "id,display_name,folder,notes,updated_at",
+                    "select": "id,display_name,folder,notes,log_dir,updated_at",
                 },
             )
         except Exception:
@@ -370,6 +444,9 @@ class RemoteWorker:
         for remote in rows:
             run_id = str(remote.get("id") or "")
             if not run_id:
+                continue
+            canonical_id = self.history.canonical_run_id(run_id, {"log_dir": remote.get("log_dir")})
+            if canonical_id != run_id:
                 continue
             local = self.history.get_run(run_id) or {}
             if _parse_time(str(remote.get("updated_at") or "")) <= _parse_time(str(local.get("updated_at") or "")):
@@ -386,29 +463,87 @@ class RemoteWorker:
             updated += 1
         return updated
 
-    def sync_runs(self) -> list[dict]:
-        self.pull_remote_run_metadata()
-        self.sync_deleted_runs()
+    @staticmethod
+    def _run_fingerprint(run_record: dict, artifacts: list[dict]) -> str:
+        payload = {
+            "run": run_record,
+            "artifacts": sorted(
+                artifacts,
+                key=lambda item: (
+                    str(item.get("run_id") or ""),
+                    str(item.get("kind") or ""),
+                    str(item.get("local_path") or item.get("path") or ""),
+                    str(item.get("storage_path") or ""),
+                    str(item.get("public_url") or ""),
+                ),
+            ),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _executor_sync_payloads(self, run_ids: set[str] | None = None) -> list[dict]:
+        if run_ids is None:
+            return list(self.executor.sync_runs_payload())
+        try:
+            return list(self.executor.sync_runs_payload(run_ids=run_ids))
+        except TypeError:
+            normalized_ids = {str(run_id) for run_id in run_ids if str(run_id)}
+            return [
+                run
+                for run in self.executor.sync_runs_payload()
+                if str(run.get("id") or "") in normalized_ids
+            ]
+
+    def sync_runs(
+        self,
+        *,
+        force: bool = False,
+        run_ids: set[str] | None = None,
+        pull_metadata: bool = True,
+    ) -> dict:
+        started = time.time()
+        if pull_metadata:
+            self.pull_remote_run_metadata()
+        normalized_run_ids = {str(run_id) for run_id in run_ids or set() if str(run_id)}
+        targeted = bool(normalized_run_ids)
+        tombstones = self.history.deleted_run_tombstones(run_ids=normalized_run_ids) if targeted else None
+        deletion_summary = self.sync_deleted_runs(tombstones=tombstones)
+        run_payloads = self._executor_sync_payloads(normalized_run_ids if targeted else None)
+        alias_summary = (
+            {"deleted_remote_alias_rows": 0, "deleted_remote_alias_artifact_rows": 0}
+            if targeted
+            else self.sync_remote_alias_runs(run_payloads)
+        )
         runs = []
         artifacts = []
         artifact_errors = []
-        for run in self.executor.sync_runs_payload():
+        unchanged = 0
+        for run in run_payloads:
             run_record = dict(run)
             artifact_records = run_record.pop("artifacts", []) or []
             now = _now_iso()
             run_record["created_at"] = run_record.get("created_at") or now
             run_record["updated_at"] = run_record.get("updated_at") or run_record["created_at"]
             run_record["params"] = run_record.get("params") or {}
-            runs.append({**run_record, "machine_id": self.config.machine_id})
+            remote_run = {**run_record, "machine_id": self.config.machine_id}
+            fingerprint = self._run_fingerprint(remote_run, artifact_records)
+            run_id = str(remote_run.get("id") or "")
+            if not force and run_id and self._last_synced_run_fingerprints.get(run_id) == fingerprint:
+                unchanged += 1
+                continue
+            runs.append(remote_run)
+            artifact_failed = False
             for artifact in artifact_records:
                 try:
                     record = self._remote_artifact_record(artifact)
                     if record:
                         artifacts.append(record)
                 except Exception as exc:
+                    artifact_failed = True
                     artifact_errors.append(str(exc))
+            if run_id and not artifact_failed:
+                self._last_synced_run_fingerprints[run_id] = fingerprint
         if runs:
-            self.client.upsert("runs", runs)
+            self._upsert_grouped("runs", runs)
         if artifacts:
             self.client.upsert("artifacts", artifacts, query={"on_conflict": "run_id,kind,local_path"})
         notification_errors = self._dispatch_notification_events(runs, artifacts)
@@ -416,7 +551,58 @@ class RemoteWorker:
             artifact_errors.extend(notification_errors)
         if artifact_errors:
             self.last_sync_error = "; ".join(artifact_errors[-3:])
-        return runs
+        else:
+            self.last_sync_error = ""
+        duration_ms = int((time.time() - started) * 1000)
+        self.last_sync_completed_at = _now_iso()
+        self.last_sync_duration_ms = duration_ms
+        self.last_sync_summary = {
+            "runs_changed": len(runs),
+            "runs_unchanged": unchanged,
+            "artifacts": len(artifacts),
+            **deletion_summary,
+            **alias_summary,
+            "targeted_run_ids": sorted(normalized_run_ids),
+            "duration_ms": duration_ms,
+        }
+        return self.last_sync_summary
+
+    def _upsert_grouped(self, table: str, records: list[dict], **kwargs) -> None:
+        groups: dict[tuple[str, ...], list[dict]] = {}
+        for record in records:
+            key = tuple(sorted(str(item) for item in record.keys()))
+            groups.setdefault(key, []).append(record)
+        for group in groups.values():
+            self.client.upsert(table, group, **kwargs)
+
+    def sync_remote_alias_runs(self, local_runs: list[dict]) -> dict:
+        """Remove stale remote aliases that point at a canonical local log_dir."""
+        canonical_by_log_dir: dict[str, str] = {}
+        for run in local_runs:
+            run_id = str(run.get("id") or "").strip()
+            log_dir = str(run.get("log_dir") or "").strip()
+            if run_id and log_dir:
+                canonical_by_log_dir.setdefault(log_dir, run_id)
+        if not canonical_by_log_dir:
+            return {"deleted_remote_alias_rows": 0, "deleted_remote_alias_artifact_rows": 0}
+
+        deleted_runs = 0
+        deleted_artifacts = 0
+        for remote in self._remote_runs():
+            remote_id = str(remote.get("id") or "").strip()
+            log_dir = str(remote.get("log_dir") or "").strip()
+            canonical_id = canonical_by_log_dir.get(log_dir)
+            if not remote_id or not canonical_id or remote_id == canonical_id:
+                continue
+            query = {"machine_id": f"eq.{self.config.machine_id}", "run_id": f"eq.{remote_id}"}
+            self.client.delete("artifacts", query=query)
+            deleted_artifacts += 1
+            self.client.delete("runs", query={"machine_id": f"eq.{self.config.machine_id}", "id": f"eq.{remote_id}"})
+            deleted_runs += 1
+        return {
+            "deleted_remote_alias_rows": deleted_runs,
+            "deleted_remote_alias_artifact_rows": deleted_artifacts,
+        }
 
     def _dispatch_notification_events(self, runs: list[dict], artifacts: list[dict]) -> list[str]:
         errors: list[str] = []
@@ -441,13 +627,68 @@ class RemoteWorker:
                     errors.append(f"notify {event.get('event_type')} {run_id}: {exc}")
         return errors
 
-    def sync_deleted_runs(self, tombstones: list[dict] | None = None) -> int:
+    def sync_deleted_runs(self, tombstones: list[dict] | None = None) -> dict:
         deleted_count = 0
-        for tombstone in self.history.deleted_run_tombstones() if tombstones is None else tombstones:
+        artifact_delete_count = 0
+        tombstone_records = []
+        tombstone_source = self.history.deleted_run_tombstones() if tombstones is None else tombstones
+        for tombstone in tombstone_source:
+            record = self._remote_deletion_record(tombstone)
+            if record:
+                tombstone_records.append(record)
+            for query in self._deleted_artifact_queries(tombstone):
+                self.client.delete("artifacts", query=query)
+                artifact_delete_count += 1
             for query in self._deleted_run_queries(tombstone):
                 self.client.delete("runs", query=query)
                 deleted_count += 1
-        return deleted_count
+        if tombstone_records:
+            self.client.upsert("run_deletions", tombstone_records, query={"on_conflict": "machine_id,id"})
+        return {
+            "tombstones": len(tombstone_records),
+            "deleted_remote_rows": deleted_count,
+            "deleted_remote_artifact_rows": artifact_delete_count,
+        }
+
+    def _remote_deletion_record(self, tombstone: dict) -> dict | None:
+        run_id = str(tombstone.get("id") or tombstone.get("log_dir_name") or "").strip()
+        if not run_id:
+            return None
+        log_dir = str(tombstone.get("log_dir") or "").strip()
+        log_dir_name = str(tombstone.get("log_dir_name") or "").strip()
+        if not log_dir_name and log_dir:
+            log_dir_name = Path(log_dir).name
+        metadata = {
+            key: value
+            for key, value in tombstone.items()
+            if key not in {"id", "log_dir", "log_dir_name", "deleted_at", "deleted_by"}
+        }
+        return {
+            "machine_id": self.config.machine_id,
+            "id": run_id,
+            "log_dir": log_dir or None,
+            "log_dir_name": log_dir_name or None,
+            "deleted_by": _uuid_or_none(str(tombstone.get("deleted_by") or "")),
+            "deleted_at": tombstone.get("deleted_at") or _now_iso(),
+            "metadata": metadata,
+        }
+
+    def _deleted_artifact_queries(self, tombstone: dict) -> list[dict]:
+        queries = []
+        seen: set[str] = set()
+
+        def add(run_id: str) -> None:
+            cleaned = str(run_id or "").strip()
+            if not cleaned or cleaned in seen:
+                return
+            seen.add(cleaned)
+            queries.append({"machine_id": f"eq.{self.config.machine_id}", "run_id": f"eq.{cleaned}"})
+
+        add(str(tombstone.get("id") or ""))
+        log_dir_name = str(tombstone.get("log_dir_name") or "").strip()
+        if log_dir_name:
+            add(log_dir_name)
+        return queries
 
     def _deleted_run_queries(self, tombstone: dict) -> list[dict]:
         queries = []
@@ -476,12 +717,89 @@ class RemoteWorker:
         now = time.time()
         if not force and now - self.last_sync_at < self.config.sync_interval_seconds:
             return self.last_sync_error
-        self.last_sync_at = now
         try:
-            self.sync_runs()
-            self.last_sync_error = ""
+            summary = self.sync_runs(force=force)
+            self.last_sync_summary = summary
         except Exception as exc:
             self.last_sync_error = str(exc)
+            self.last_sync_completed_at = _now_iso()
+            self.last_sync_summary = {**(self.last_sync_summary or {}), "error": self.last_sync_error}
+        finally:
+            self.last_sync_at = time.time()
+        return self.last_sync_error
+
+    def _recent_media_run_ids(self, now: float | None = None) -> set[str]:
+        now = time.time() if now is None else now
+        cutoff = now - MEDIA_SYNC_RECENT_SECONDS
+        run_ids: set[str] = set()
+        for run in self.history.list_runs():
+            run_id = str(run.get("id") or "").strip()
+            if not run_id:
+                continue
+            video_status = str(run.get("video_status") or "").strip().lower()
+            if video_status == "recording":
+                run_ids.add(run_id)
+                continue
+            if (
+                video_status not in MEDIA_SYNC_STATUSES
+                and not run.get("latest_video")
+                and not run.get("tensorboard_summary_path")
+            ):
+                continue
+            timestamp = _parse_time(str(run.get("updated_at") or run.get("created_at") or ""))
+            if timestamp and timestamp >= cutoff:
+                run_ids.add(run_id)
+        return run_ids
+
+    def sync_recent_media_runs_if_due(self) -> str:
+        now = time.time()
+        if now - self.last_media_sync_at < MEDIA_SYNC_INTERVAL_SECONDS:
+            return self.last_sync_error
+        self.last_media_sync_at = now
+        run_ids = self._recent_media_run_ids(now)
+        if not run_ids:
+            return self.last_sync_error
+        try:
+            summary = self.sync_runs(force=False, run_ids=run_ids, pull_metadata=False)
+            self.last_sync_summary = summary
+            if summary.get("runs_changed") or summary.get("artifacts"):
+                self.last_sync_at = time.time()
+        except Exception as exc:
+            self.last_sync_error = str(exc)
+            self.last_sync_completed_at = _now_iso()
+            self.last_sync_summary = {**(self.last_sync_summary or {}), "error": self.last_sync_error}
+        return self.last_sync_error
+
+    @staticmethod
+    def _job_run_ids_for_sync(job: dict, result: dict) -> set[str]:
+        job_type = str(job.get("type") or job.get("job_type") or "")
+        payload = _job_payload(job)
+        result_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        ids = {
+            str(payload.get("run_id") or ""),
+            str(result.get("local_run_id") or ""),
+            str(result_payload.get("run_id") or ""),
+            str(result_payload.get("source_run_id") or ""),
+        }
+        if job_type == "start_training":
+            ids.add(str(result.get("process_id") or ""))
+            ids.add(str(result_payload.get("id") or ""))
+        return {run_id for run_id in ids if run_id}
+
+    def sync_after_job(self, job: dict, result: dict) -> str:
+        if str(job.get("type") or job.get("job_type") or "") == "send_missed_notifications":
+            return ""
+        run_ids = self._job_run_ids_for_sync(job, result)
+        if not run_ids:
+            return self.sync_if_due(force=True)
+        try:
+            summary = self.sync_runs(force=True, run_ids=run_ids, pull_metadata=False)
+            self.last_sync_summary = summary
+            self.last_sync_at = time.time()
+        except Exception as exc:
+            self.last_sync_error = str(exc)
+            self.last_sync_completed_at = _now_iso()
+            self.last_sync_summary = {**(self.last_sync_summary or {}), "error": self.last_sync_error}
         return self.last_sync_error
 
     def _run_record_for_upsert(self, run: dict, requester_id: str | None = None, requester_label: str | None = None) -> dict:
@@ -493,13 +811,10 @@ class RemoteWorker:
         if requester_label:
             params["requester_label"] = requester_label
         created_by = requester_id or run.get("created_by") or params.get("requester_id")
-        return {
+        record = {
             "id": run.get("id"),
             "machine_id": self.config.machine_id,
             "status": run.get("status") or "running",
-            "display_name": run.get("display_name"),
-            "folder": run.get("folder"),
-            "notes": run.get("notes"),
             "created_at": run.get("created_at") or now,
             "updated_at": run.get("updated_at") or now,
             "log_dir": run.get("log_dir"),
@@ -508,7 +823,22 @@ class RemoteWorker:
             "latest_video": run.get("latest_video"),
             "onnx_path": run.get("onnx_path"),
             "created_by": created_by,
+            "convergence_detected": bool(run.get("convergence_detected")),
+            "convergence_iteration": run.get("convergence_iteration"),
+            "convergence_improvement_pct": run.get("convergence_improvement_pct"),
+            "video_status": run.get("video_status"),
+            "returncode": run.get("returncode"),
         }
+        display_name = run.get("display_name") or params.get("display_name")
+        folder = run.get("folder") or params.get("folder")
+        if display_name:
+            record["display_name"] = display_name
+        if folder:
+            record["folder"] = folder
+        notes = run.get("notes")
+        if notes:
+            record["notes"] = notes
+        return record
 
     def _sync_launched_training_run(self, job: dict, result: dict) -> str:
         if str(job.get("type") or job.get("job_type") or "") != "start_training":
@@ -747,10 +1077,21 @@ class RemoteWorker:
             record["bytes"] = int(artifact["bytes"])
         elif Path(local_path).is_file():
             record["bytes"] = Path(local_path).stat().st_size
+        if artifact.get("public_url"):
+            record["public_url"] = str(artifact["public_url"])
         if kind == "video":
             storage_path = self._ensure_video_storage_path(run_id, local_path)
             if storage_path:
                 record["storage_path"] = storage_path
+        elif kind == "tensorboard_summary":
+            storage_path = self._ensure_tensorboard_summary_storage_path(run_id, local_path)
+            if storage_path:
+                record["storage_path"] = storage_path
+            if not record["public_url"] and self.config.cloudflare_tunnel_host:
+                record["public_url"] = (
+                    f"{self.config.cloudflare_tunnel_host.rstrip('/')}"
+                    f"/api/runs/{quote(run_id, safe='')}/tensorboard-summary.png"
+                )
         return record
 
     def _ensure_video_storage_path(self, run_id: str, local_path: str) -> str | None:
@@ -762,6 +1103,22 @@ class RemoteWorker:
             return str(existing["storage_path"])
         storage_path = f"runs/{_storage_safe(run_id)}/videos/{_storage_safe(path.name)}"
         self.client.upload_storage_object(VIDEO_BUCKET, storage_path, path, content_type="video/mp4")
+        return storage_path
+
+    def _ensure_tensorboard_summary_storage_path(self, run_id: str, local_path: str) -> str | None:
+        path = Path(local_path)
+        if not path.is_file():
+            return None
+        existing = self._existing_artifact(run_id, "tensorboard_summary", local_path)
+        if existing and existing.get("storage_path"):
+            return str(existing["storage_path"])
+        storage_path = f"runs/{_storage_safe(run_id)}/tensorboard/{_storage_safe(path.name)}"
+        self.client.upload_storage_object(
+            VIDEO_BUCKET,
+            storage_path,
+            path,
+            content_type=TENSORBOARD_SUMMARY_CONTENT_TYPE,
+        )
         return storage_path
 
     def _existing_artifact(self, run_id: str, kind: str, local_path: str) -> dict | None:
@@ -867,11 +1224,19 @@ class RemoteWorker:
         accept_jobs = self.state_store.effective_accept_jobs(self.config)
         gpu_locked = self.executor.gpu_locked()
         heartbeat = self.send_heartbeat(gpu_locked=gpu_locked)
-        self.sync_if_due()
+        heartbeat_sync_at = heartbeat.get("last_sync_at")
         if not accept_jobs:
+            self.sync_recent_media_runs_if_due()
+            self.sync_if_due()
+            if self.last_sync_completed_at and self.last_sync_completed_at != heartbeat_sync_at:
+                heartbeat = self.send_heartbeat(gpu_locked=gpu_locked)
             return {"status": "disabled", "heartbeat": heartbeat}
         job = self.client.claim_next_job(self.config.machine_id, gpu_locked=gpu_locked)
         if not job:
+            self.sync_recent_media_runs_if_due()
+            self.sync_if_due()
+            if self.last_sync_completed_at and self.last_sync_completed_at != heartbeat_sync_at:
+                heartbeat = self.send_heartbeat(gpu_locked=gpu_locked)
             return {"status": "idle", "heartbeat": heartbeat}
 
         job_id = str(job.get("id"))
@@ -884,8 +1249,7 @@ class RemoteWorker:
         try:
             result = self._execute_job(job).to_dict()
             launch_sync_error = self._sync_launched_training_run(job, result)
-            job_type = str(job.get("type") or job.get("job_type") or "")
-            sync_error = "" if job_type == "send_missed_notifications" else self.sync_if_due(force=True)
+            sync_error = self.sync_after_job(job, result)
             sync_errors = [error for error in (launch_sync_error, sync_error) if error]
             if sync_errors:
                 result.setdefault("payload", {})["sync_error"] = "; ".join(sync_errors)

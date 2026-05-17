@@ -25,6 +25,10 @@ def completion_event_from_run(run: dict, remote_url: str = "") -> dict | None:
         "display_name": run.get("display_name") or run.get("id"),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "payload": {
+            "created_at": run.get("created_at"),
+            "started_at": run.get("started_at"),
+            "updated_at": run.get("updated_at"),
+            "requester_label": run.get("requester_label") or (run.get("params") or {}).get("requester_label"),
             "task": (run.get("params") or {}).get("task"),
             "num_envs": (run.get("params") or {}).get("num_envs"),
             "max_iterations": (run.get("params") or {}).get("max_iterations"),
@@ -37,20 +41,62 @@ def completion_event_from_run(run: dict, remote_url: str = "") -> dict | None:
     }
 
 
+def _parse_time(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _duration_label(seconds: float) -> str:
+    if seconds < 0:
+        return "-"
+    total = max(0, round(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _runtime_label(event: dict) -> str:
+    payload = event.get("payload") or {}
+    provided = payload.get("run_time") or payload.get("runtime") or payload.get("duration")
+    if provided:
+        return str(provided)
+    seconds = payload.get("duration_seconds") or payload.get("runtime_seconds")
+    if isinstance(seconds, (int, float)) and seconds >= 0:
+        return _duration_label(float(seconds))
+    started = _parse_time(payload.get("started_at") or payload.get("created_at"))
+    ended = _parse_time(payload.get("finished_at") or payload.get("updated_at") or event.get("created_at"))
+    if started and ended:
+        return _duration_label((ended - started).total_seconds())
+    return "-"
+
+
 def discord_message(event: dict) -> dict:
     payload = event.get("payload") or {}
     title = "Training completed" if event.get("event_type") == "training_completed" else "Training failed"
+    display_name = str(event.get("display_name") or event.get("run_id") or title)
+    runtime = _runtime_label({**event, "payload": payload})
+    run_by = str(payload.get("requester_label") or payload.get("run_by") or event.get("requester_id") or "Remote member")
+    link = str(payload.get("run_url") or payload.get("remote_url") or "")
     fields = [
-        {"name": "Run", "value": str(event.get("display_name") or event.get("run_id") or "-"), "inline": False},
-        {"name": "Status", "value": str(event.get("status") or "-"), "inline": True},
-        {"name": "Task", "value": str(payload.get("task") or "-"), "inline": True},
-        {"name": "Iterations", "value": str(payload.get("max_iterations") or "-"), "inline": True},
+        {"name": "Status", "value": str(event.get("status") or payload.get("status") or "-"), "inline": True},
+        {"name": "Runtime", "value": runtime, "inline": True},
+        {"name": "Run by", "value": run_by, "inline": True},
+        {"name": "Link", "value": f"[Open run]({link})" if link else "-", "inline": False},
     ]
-    if payload.get("remote_url"):
-        fields.append({"name": "Remote link", "value": str(payload["remote_url"]), "inline": False})
     return {
-        "content": f"{title}: {event.get('display_name') or event.get('run_id')}",
-        "embeds": [{"title": title, "fields": fields}],
+        "content": f"RedRHex {title}",
+        "embeds": [{"title": display_name, "fields": fields}],
     }
 
 
@@ -77,6 +123,10 @@ def _base_run_payload(run: dict, remote_url: str = "") -> dict:
     return {
         "display_name": run.get("display_name") or run.get("id"),
         "status": run.get("status"),
+        "created_at": run.get("created_at"),
+        "started_at": run.get("started_at"),
+        "updated_at": run.get("updated_at"),
+        "requester_label": run.get("requester_label") or params.get("requester_label"),
         "task": params.get("task"),
         "num_envs": params.get("num_envs"),
         "max_iterations": params.get("max_iterations"),

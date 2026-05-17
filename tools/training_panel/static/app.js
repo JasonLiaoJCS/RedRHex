@@ -601,6 +601,9 @@ function formatDuration(createdAt, updatedAt) {
 }
 
 function statusClass(status) {
+  if (window.RedRhexStatus?.className) {
+    return window.RedRhexStatus.className("run", status);
+  }
   const normalized = String(status || "unknown").toLowerCase();
   if (normalized === "completed") return "status-completed";
   if (normalized === "queued") return "status-queued";
@@ -608,6 +611,13 @@ function statusClass(status) {
   if (normalized === "failed") return "status-failed";
   if (normalized === "interrupted" || normalized === "cancelled") return "status-interrupted";
   return "status-unknown";
+}
+
+function statusLabel(kind, status, context) {
+  if (window.RedRhexStatus?.label) {
+    return window.RedRhexStatus.label(kind, status, context);
+  }
+  return String(status || "unknown").toLowerCase() || "unknown";
 }
 
 function runParamSummary(run) {
@@ -811,7 +821,7 @@ function renderRuns() {
               ${unread ? `<span class="unread-dot" data-tooltip="Unread history update"></span>` : ""}
               <strong>${escapeHtml(title)}</strong>
             </div>
-            <span class="pill status-pill ${deleting ? "status-unknown" : statusClass(run.status)}">${deleting ? "deleting" : escapeHtml(run.status || "unknown")}</span>
+            <span class="pill status-pill ${deleting ? statusClass("deleting") : statusClass(run.status)}">${deleting ? "deleting" : escapeHtml(statusLabel("run", run.status))}</span>
           </div>
           ${paramSummary ? `<small>${escapeHtml(paramSummary)}</small>` : ""}
           ${timeSummary ? `<small>${escapeHtml(timeSummary)}</small>` : ""}
