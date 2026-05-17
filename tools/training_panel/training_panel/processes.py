@@ -43,6 +43,17 @@ EXTERNAL_ID_PREFIXES = (
     EXTERNAL_TENSORBOARD_ID_PREFIX,
 )
 GPU_PROCESS_KINDS = {"training", "play", "video", "onnx"}
+DEFAULT_ISAAC_SETTLE_SECONDS = 5.0
+
+
+def _isaac_settle_seconds_from_env() -> float:
+    value = os.environ.get("TRAINING_PANEL_ISAAC_SETTLE_SECONDS")
+    if value is None or value == "":
+        return DEFAULT_ISAAC_SETTLE_SECONDS
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return DEFAULT_ISAAC_SETTLE_SECONDS
 
 @dataclass
 class ProcessInfo:
@@ -73,7 +84,7 @@ class ProcessStartError(RuntimeError):
 
 
 class ProcessRegistry:
-    def __init__(self, paths: PanelPaths, history: HistoryStore):
+    def __init__(self, paths: PanelPaths, history: HistoryStore, isaac_settle_seconds: float | None = None):
         self.paths = paths
         self.history = history
         self._lock = threading.Lock()
@@ -81,6 +92,13 @@ class ProcessRegistry:
         self._processes: dict[str, subprocess.Popen] = {}
         self._infos: dict[str, ProcessInfo] = {}
         self._tensorboards_by_logdir: dict[str, str] = {}
+        self.isaac_settle_seconds = (
+            _isaac_settle_seconds_from_env()
+            if isaac_settle_seconds is None
+            else max(0.0, float(isaac_settle_seconds))
+        )
+        self._last_isaac_exit_at = 0.0
+        self._queued_training_timer: threading.Timer | None = None
 
     def list_processes(self) -> list[dict]:
         with self._lock:
@@ -94,8 +112,12 @@ class ProcessRegistry:
 
     def queue_training(self, params: TrainingParams) -> dict:
         with self._queue_lock:
-            if self._queued_training_runs() or self.running_isaac_processes():
-                return self._create_queued_training_run(params)
+            settle_delay = self._isaac_settle_delay()
+            if self._queued_training_runs() or self.running_isaac_processes() or settle_delay > 0:
+                run = self._create_queued_training_run(params)
+                if settle_delay > 0:
+                    self._schedule_queued_training_start_locked(settle_delay)
+                return run
             return self._start_training_run(params)
 
     def start_training(self, params: TrainingParams) -> dict:
@@ -208,6 +230,10 @@ class ProcessRegistry:
             queued = self._queued_training_runs()
             if not queued:
                 return None
+            settle_delay = self._isaac_settle_delay()
+            if settle_delay > 0:
+                self._schedule_queued_training_start_locked(settle_delay)
+                return None
             run = queued[0]
             try:
                 params = TrainingParams.from_dict(run.get("params") or {})
@@ -220,6 +246,24 @@ class ProcessRegistry:
                     queue_error=str(exc),
                 )
                 return None
+
+    def _mark_isaac_process_finished(self) -> None:
+        self._last_isaac_exit_at = time.time()
+
+    def _isaac_settle_delay(self) -> float:
+        if self.isaac_settle_seconds <= 0 or self._last_isaac_exit_at <= 0:
+            return 0.0
+        return max(0.0, self.isaac_settle_seconds - (time.time() - self._last_isaac_exit_at))
+
+    def _schedule_queued_training_start_locked(self, delay_seconds: float) -> None:
+        if delay_seconds <= 0:
+            return
+        if self._queued_training_timer and self._queued_training_timer.is_alive():
+            return
+        timer = threading.Timer(delay_seconds, self.start_next_queued_training)
+        timer.daemon = True
+        self._queued_training_timer = timer
+        timer.start()
 
     def cancel_queued_training(self, run_id: str) -> bool:
         run = self.history.get_run(run_id)
@@ -1268,6 +1312,7 @@ class ProcessRegistry:
             time.sleep(log_poll_interval)
 
         returncode = proc.wait()
+        self._mark_isaac_process_finished()
         status = "completed" if returncode == 0 else "failed"
         if not log_dir:
             log_dir = self._log_dir_from_process_log(run_id)
@@ -1304,6 +1349,7 @@ class ProcessRegistry:
 
     def _monitor_video(self, source_run_id: str, video_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()
+        self._mark_isaac_process_finished()
         run = self.history.get_run(source_run_id) or {}
         log_dir = Path(run["log_dir"]) if run.get("log_dir") else None
         video = latest_video(log_dir) if log_dir and log_dir.exists() else None
@@ -1345,6 +1391,7 @@ class ProcessRegistry:
 
     def _monitor_onnx(self, source_run_id: str, onnx_id: str, proc: subprocess.Popen) -> None:
         returncode = proc.wait()
+        self._mark_isaac_process_finished()
         run = self.history.get_run(source_run_id) or {}
         log_dir = Path(run["log_dir"]) if run.get("log_dir") else None
         onnx_path = latest_onnx(log_dir) if log_dir and log_dir.exists() else None

@@ -114,6 +114,39 @@ class ProcessRegistryTests(unittest.TestCase):
             self.assertEqual(history.get_run(queued["id"])["status"], "queued")
             self.assertIsNone(history.get_run(queued["id"]).get("pid"))
 
+    def test_queue_training_waits_during_isaac_settle_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history, isaac_settle_seconds=10)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            registry._last_isaac_exit_at = time.time()
+
+            with patch.object(registry, "_schedule_queued_training_start_locked") as schedule:
+                run = registry.queue_training(params)
+
+            self.assertEqual(run["status"], "queued")
+            self.assertIsNone(history.get_run(run["id"]).get("pid"))
+            schedule.assert_called_once()
+
+    def test_start_next_queued_training_respects_isaac_settle_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self.make_paths(root)
+            history = HistoryStore(paths)
+            registry = ProcessRegistry(paths, history, isaac_settle_seconds=10)
+            params = TrainingParams.from_dict({"task": "Template-Redrhex-Direct-v0", "num_envs": 4, "max_iterations": 8})
+            queued = registry._create_queued_training_run(params)
+            registry._last_isaac_exit_at = time.time()
+
+            with patch.object(registry, "_schedule_queued_training_start_locked") as schedule:
+                started = registry.start_next_queued_training()
+
+            self.assertIsNone(started)
+            self.assertEqual(history.get_run(queued["id"])["status"], "queued")
+            schedule.assert_called_once()
+
     def test_cancel_queued_training(self):
         class FakeProcess:
             pid = 12345

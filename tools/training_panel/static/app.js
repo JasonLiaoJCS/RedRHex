@@ -312,6 +312,11 @@ function formData(form) {
   return data;
 }
 
+function clearTrainingRunName(form = $("#train-form")) {
+  const input = form?.querySelector?.('input[name="display_name"]');
+  if (input) input.value = "";
+}
+
 async function loadSystem() {
   const system = await api("/api/system");
   $("#system-info").textContent = JSON.stringify(system, null, 2);
@@ -1012,6 +1017,7 @@ function renderRunDetails() {
     state.renameDirty = false;
     state.renameDraftRunId = null;
     runName.value = "";
+    hideRunConfigPanels();
   } else if (!(state.renameDirty && state.renameDraftRunId === run.id)) {
     runName.value = run.display_name || "";
   }
@@ -1021,7 +1027,9 @@ function renderRunDetails() {
   renderFolderSelect(run);
 
   // Inputs
-  $("#notes-editor").disabled = !run;
+  const notesEditor = $("#notes-editor");
+  notesEditor.disabled = !run;
+  if (!run) notesEditor.value = "";
   $("#save-name").disabled = !run;
   $("#save-notes").disabled = !run;
 
@@ -1086,7 +1094,14 @@ async function loadRuns() {
   }
   const validRunIds = new Set(state.runs.map((run) => run.id));
   state.selectedRunIds = new Set([...state.selectedRunIds].filter((runId) => validRunIds.has(runId)));
-  state.selectedRun = selectedId ? findRun(selectedId) || null : state.selectedRun;
+  if (selectedId) {
+    const selected = findRun(selectedId);
+    if (selected) {
+      state.selectedRun = selected;
+    } else {
+      clearRunDetailState({ render: false });
+    }
+  }
   renderRuns();
   renderRunDetails();
   renderFolderSidebar();
@@ -1308,11 +1323,27 @@ function renderDebug(debug) {
 
 async function refreshDebug() {
   if (!state.debugTarget) return;
+  const target = { ...state.debugTarget };
   try {
-    const debug = await api(debugEndpoint(state.debugTarget));
+    const debug = await api(debugEndpoint(target));
+    if (
+      !state.debugTarget ||
+      state.debugTarget.type !== target.type ||
+      state.debugTarget.id !== target.id ||
+      (target.type === "run" && !findRun(target.id))
+    ) {
+      return;
+    }
     renderDebug(debug);
     if (!isLiveDebug(debug) && state.debugTarget.type === "process") stopDebugPolling();
   } catch (error) {
+    if (
+      !state.debugTarget ||
+      state.debugTarget.type !== target.type ||
+      state.debugTarget.id !== target.id
+    ) {
+      return;
+    }
     $("#debug-live").textContent = "Error";
     $("#debug-live").className = "status-badge error-pill";
     $("#debug-status").innerHTML = `<span class="debug-kv"><strong>Error:</strong> ${escapeHtml(error.message)}</span>`;
@@ -1340,13 +1371,58 @@ function renderDebugPayload(payload) {
   });
 }
 
+function hideRunConfigPanels() {
+  const rewardPanel = $("#reward-config-panel");
+  const rewardContent = $("#reward-config-content");
+  if (rewardPanel) rewardPanel.hidden = true;
+  if (rewardContent) rewardContent.innerHTML = "";
+  const terrainPanel = $("#terrain-config-panel");
+  const terrainContent = $("#terrain-config-content");
+  if (terrainPanel) terrainPanel.hidden = true;
+  if (terrainContent) terrainContent.innerHTML = "";
+}
+
+function clearRunDetailState({ render = true } = {}) {
+  state.selectedRun = null;
+  state.comparisonRun = null;
+  state.comparisonMode = false;
+  state.debugTarget = null;
+  state.lastDebug = null;
+  state.renameDirty = false;
+  state.renameDraftRunId = null;
+  stopDebugPolling();
+  const notesEditor = $("#notes-editor");
+  if (notesEditor) notesEditor.value = "";
+  const debugCommand = $("#debug-command");
+  if (debugCommand) debugCommand.textContent = "";
+  const debugLog = $("#debug-log");
+  if (debugLog) debugLog.textContent = "";
+  const debugCommandBlock = $("#debug-command-block");
+  if (debugCommandBlock) debugCommandBlock.hidden = true;
+  const debugLogBlock = $("#debug-log-block");
+  if (debugLogBlock) debugLogBlock.hidden = true;
+  const debugStatus = $("#debug-status");
+  if (debugStatus) debugStatus.textContent = "";
+  const debugLive = $("#debug-live");
+  if (debugLive) {
+    debugLive.textContent = "Idle";
+    debugLive.className = "status-badge muted-pill";
+  }
+  hideRunConfigPanels();
+  renderVideoPanel(null);
+  if (render) renderRunDetails();
+}
+
 async function startTraining(event) {
   event.preventDefault();
+  const form = $("#train-form");
   $("#train-status").textContent = "Starting training...";
   try {
+    const payload = formData(form);
+    clearTrainingRunName(form);
     const run = await api("/api/training/start", {
       method: "POST",
-      body: JSON.stringify(formData($("#train-form"))),
+      body: JSON.stringify(payload),
     });
     const runLabel = run.display_name ? `${run.display_name} (${run.id})` : run.id;
     $("#train-status").textContent =
@@ -1658,21 +1734,13 @@ async function deleteSelectedRun() {
       method: "POST",
       body: JSON.stringify({ confirm: true, delete_logs: true }),
     });
-    state.runs = state.runs.filter((run) => run.id !== result.run_id);
-    state.selectedRun = null;
-    state.debugTarget = null;
-    state.lastDebug = null;
-    $("#notes-editor").value = "";
-    $("#debug-command").textContent = "";
-    $("#debug-log").textContent = "";
-    $("#debug-command-block").hidden = true;
-    $("#debug-log-block").hidden = true;
-    $("#debug-status").textContent = "";
-    renderVideoPanel(null);
+    const deletedRunId = result.run_id || runId;
+    state.runs = state.runs.filter((run) => run.id !== deletedRunId);
+    clearRunDetailState();
     renderRuns();
     await loadRuns();
     await loadActivity();
-    setStatus(`Deleted ${result.run_id}. Removed ${result.deleted_paths.length} log/note path(s).`);
+    setStatus(`Deleted ${deletedRunId}. Removed ${result.deleted_paths.length} log/note path(s).`);
   } catch (error) {
     throw error;
   } finally {
@@ -1728,19 +1796,14 @@ async function deleteSelectedRuns() {
       body: JSON.stringify({ run_ids: runIds, delete_logs: true, confirm: true }),
     });
     state.selectedRunIds.clear();
-    const affectedRunIds = result.run_ids || [];
-    state.runs = state.runs.filter((run) => !affectedRunIds.includes(run.id));
-    if (state.selectedRun && affectedRunIds.includes(state.selectedRun.id)) {
-      state.selectedRun = null;
-      state.debugTarget = null;
-      state.lastDebug = null;
-      $("#notes-editor").value = "";
-      $("#debug-command").textContent = "";
-      $("#debug-log").textContent = "";
-      $("#debug-command-block").hidden = true;
-      $("#debug-log-block").hidden = true;
-      $("#debug-status").textContent = "";
-      renderVideoPanel(null);
+    const affectedRunIds = new Set([
+      ...(result.run_ids || []),
+      ...(result.deleted_run_ids || []),
+      ...runIds,
+    ]);
+    state.runs = state.runs.filter((run) => !affectedRunIds.has(run.id));
+    if (state.selectedRun && affectedRunIds.has(state.selectedRun.id)) {
+      clearRunDetailState();
     }
     renderRuns();
     await loadRuns();
@@ -2310,6 +2373,8 @@ function renderTerrainEditor(preset, defaults, schema, isEditable) {
     if (!rows.length) return "";
     const rowsHtml = rows.map(({ key, meta, value, isOverridden }) => {
       const overrideMark = isOverridden ? ` <span style="color:var(--amber);font-size:11px;">●</span>` : "";
+      const valueLabel = isOverridden ? "Preset" : "Default";
+      const valueText = terrainValueString(value);
       return `
         <div class="reward-row terrain-row">
           <div class="reward-row-meta">
@@ -2317,8 +2382,13 @@ function renderTerrainEditor(preset, defaults, schema, isEditable) {
             <div class="reward-row-desc">${escapeHtml(meta.description || "")}</div>
             <div class="reward-row-varname">${escapeHtml(key)}</div>
           </div>
-          <code class="terrain-value-code">${escapeHtml(terrainValueString(value))}</code>
-          <div>${terrainInputHtml(key, value, meta, isEditable)}</div>
+          <div class="terrain-control-cell">
+            ${terrainInputHtml(key, value, meta, isEditable)}
+            <div class="terrain-default-line">
+              <span>${escapeHtml(valueLabel)}</span>
+              <code class="terrain-value-code">${escapeHtml(valueText)}</code>
+            </div>
+          </div>
         </div>`;
     }).join("");
     return `
@@ -2538,9 +2608,15 @@ async function loadRewardConfigForRun(runId) {
   const panel = $("#reward-config-panel");
   const content = $("#reward-config-content");
   if (!panel || !content) return;
+  if (!state.selectedRun || state.selectedRun.id !== runId) return;
   updateRewardCompareToggle();
   try {
     const data = await api(`/api/runs/${encodeURIComponent(runId)}/reward-config?compare=${encodeURIComponent(state.rewardCompareMode)}`);
+    if (!state.selectedRun || state.selectedRun.id !== runId || !findRun(runId)) {
+      panel.hidden = true;
+      content.innerHTML = "";
+      return;
+    }
     const baselineKind = data.baseline_kind || "default";
     const baselineLabel = data.baseline_label || (baselineKind === "previous" ? "last run" : "default");
     const baselineLine = baselineKind === "previous" && data.baseline_run_id
@@ -2585,8 +2661,14 @@ async function loadTerrainConfigForRun(runId) {
   const panel = $("#terrain-config-panel");
   const content = $("#terrain-config-content");
   if (!panel || !content) return;
+  if (!state.selectedRun || state.selectedRun.id !== runId) return;
   try {
     const data = await api(`/api/runs/${encodeURIComponent(runId)}/terrain-config`);
+    if (!state.selectedRun || state.selectedRun.id !== runId || !findRun(runId)) {
+      panel.hidden = true;
+      content.innerHTML = "";
+      return;
+    }
     if (!data.changed || data.changed.length === 0) {
       content.innerHTML = `<p class="muted-copy">All terrain values are at default for this run.</p>`;
       panel.hidden = false;

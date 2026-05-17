@@ -2108,6 +2108,8 @@ pre {
   font-size: 11px;
   font-family: monospace;
   margin-top: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .reward-bar-wrap {
@@ -2175,7 +2177,8 @@ pre {
 }
 
 .terrain-row {
-  grid-template-columns: minmax(180px, 0.46fr) minmax(150px, 0.28fr) minmax(120px, 0.26fr);
+  grid-template-columns: minmax(0, 1fr) minmax(170px, 220px);
+  align-items: start;
 }
 
 .terrain-value-code {
@@ -2184,16 +2187,42 @@ pre {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  padding: 6px 8px;
+  white-space: nowrap;
   border-radius: 6px;
   background: var(--surface-2);
   color: var(--text);
   font-size: 12px;
+  padding: 3px 6px;
+}
+
+.terrain-control-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+  justify-self: stretch;
+}
+
+.terrain-default-line {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+
+.terrain-default-line .terrain-value-code {
+  max-width: min(150px, 100%);
 }
 
 .terrain-row-input {
-  width: 120px;
+  width: 100%;
   max-width: 100%;
+  min-width: 0;
   padding: 6px 8px;
   font-size: 13px;
 }
@@ -2202,8 +2231,13 @@ pre {
   text-align: right;
 }
 
+.terrain-row-input[type="checkbox"] {
+  width: 18px;
+  justify-self: end;
+}
+
 .terrain-wide-input {
-  width: 180px;
+  width: 100%;
 }
 
 .reference-section {
